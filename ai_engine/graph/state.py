@@ -7,27 +7,34 @@
 #
 # The state contains:
 #
-#   User input
-#   Conversation state
-#   AI understanding
-#   Checkout state
-#   Resolved product
-#   Address/payment selection
-#   Tool execution
-#   Order state
-#   Billing state
-#   Final AI response
-#   Frontend metadata
+#   - User input
+#   - Conversation state
+#   - AI understanding
+#   - Checkout state
+#   - Transaction state
+#   - Resolved product
+#   - Quantity
+#   - Address/payment selection
+#   - Tool execution
+#   - Order state
+#   - Authoritative billing state
+#   - Final AI response
+#   - Frontend metadata
 #
 # IMPORTANT:
 #
-# AI may UNDERSTAND and EXPLAIN billing information.
+# The AI may UNDERSTAND and EXPLAIN transaction information.
 #
-# Transactional billing values must come from the backend/order
-# service/database. The AI must never invent:
+# The AI must NOT invent authoritative transactional values.
 #
+# Authoritative values such as:
+#
+#   - product_id
 #   - product price
-#   - quantity
+#   - stock
+#   - quantity accepted by backend
+#   - address ownership
+#   - payment availability
 #   - subtotal
 #   - delivery charge
 #   - tax
@@ -35,8 +42,11 @@
 #   - final total
 #   - order ID
 #
-# The backend calculates authoritative values.
-# The AI interprets/presents those values.
+# must come from backend/database/business logic.
+#
+# The graph state stores those values so that subsequent nodes
+# can use the same authoritative information without repeatedly
+# asking the LLM to reconstruct it.
 #
 # =========================================================
 
@@ -51,79 +61,191 @@ from typing_extensions import TypedDict
 class GraphState(TypedDict, total=False):
 
     # =====================================================
-    # User Input
+    # USER INPUT
     # =====================================================
 
+    # Current user message.
     message: str
 
+    # Conversation/session identifier.
+    #
+    # This identifies the conversation across HTTP requests.
     session_id: str
 
+    # Authenticated/application-level user identifier.
     user_id: int
 
     # =====================================================
-    # Checkout Selection - Frontend Authoritative
+    # CHECKOUT / TRANSACTION IDENTITY
     # =====================================================
-
-    # Selected saved address from frontend.
     #
-    # This should contain the database ID of the address.
-    selected_address_id: int | None
-
-    # Selected payment method from frontend.
+    # checkout_id identifies ONE checkout transaction.
     #
     # IMPORTANT:
-    # Do not use this field as the source of truth for the
-    # available payment methods.
     #
-    # The actual available methods should come from the
-    # backend/payment system.
+    # checkout_id is NOT the order ID.
+    #
+    # checkout_id exists before an order is created.
+    #
+    # Example:
+    #
+    # checkout_id = "checkout-abc123"
+    #
+    # After successful order creation:
+    #
+    # checkout_id -> order_id
+    #
+    # This allows the system to distinguish:
+    #
+    #   "I am continuing the same checkout"
+    #
+    # from:
+    #
+    #   "I am starting a new order."
+    #
+    # This is important for idempotency and for preventing:
+    #
+    #   "Thank you"
+    #
+    # from creating another order.
+    #
+    # =====================================================
+
+    checkout_id: str | None
+
+    # =====================================================
+    # CHECKOUT STATUS
+    # =====================================================
+    #
+    # Represents the lifecycle of the current checkout.
+    #
+    # Typical lifecycle:
+    #
+    #   collecting
+    #       ↓
+    #   ready
+    #       ↓
+    #   creating
+    #       ↓
+    #   completed
+    #
+    # Possible terminal/error states may include:
+    #
+    #   failed
+    #   cancelled
+    #
+    # The actual transition logic belongs to the decision/tool
+    # layer, not to the LLM.
+    #
+    # =====================================================
+
+    checkout_status: str | None
+
+    # =====================================================
+    # CHECKOUT SELECTION - FRONTEND AUTHORITATIVE
+    # =====================================================
+
+    # Selected saved address from the frontend.
+    #
+    # This should contain the database ID of the address.
+    #
+    # The backend must still verify that the address belongs
+    # to the current user.
+    selected_address_id: int | None
+
+    # Selected payment method from the frontend.
+    #
+    # This is the user's selected value.
+    #
+    # It is NOT the authoritative source of which payment
+    # methods are available.
+    #
+    # Available methods must come from backend/payment logic.
     selected_payment_method: str | None
 
     # Backward-compatible alias used by older nodes.
+    #
+    # Nodes should gradually migrate toward:
+    #
+    #     selected_payment_method
+    #
+    # but this field remains available so existing code does
+    # not immediately break.
     payment_method: str | None
 
     # =====================================================
-    # Database
+    # DATABASE
     # =====================================================
 
+    # SQLAlchemy database session when required by the graph.
     db: Any
 
     # =====================================================
-    # Conversation
+    # CONVERSATION
     # =====================================================
 
+    # Previous conversation messages/context.
+    #
+    # This is conversational context, not authoritative
+    # transaction data.
     conversation_history: list[dict[str, Any]]
 
     # =====================================================
-    # AI Understanding
+    # AI UNDERSTANDING
     # =====================================================
 
+    # Current semantic intent.
+    #
+    # Examples may include:
+    #
+    #   general
+    #   product_search
+    #   order_create
+    #   order_tracking
+    #   order_cancel
+    #   customer_support
+    #
+    # The decision node must combine intent with transaction
+    # state rather than blindly trusting the current LLM intent.
     intent: str
 
     # =====================================================
-    # Accumulated Transaction Entities
+    # ACCUMULATED TRANSACTION ENTITIES
     # =====================================================
     #
-    # This dictionary contains the accumulated information
-    # understood from the conversation.
+    # This contains information accumulated from multiple
+    # conversation turns.
     #
     # Example:
     #
     # {
-    #     "product_id": 1,
-    #     "product_name": "Amul Milk",
+    #     "product_id": 9,
+    #     "product_name": "Maggi 2-Minute Noodles",
     #     "quantity": 3,
-    #     "address_id": 5,
+    #     "address_id": 1,
     #     "payment_method": "cod"
     # }
     #
-    # Additional AI/backend information may be stored here
-    # without requiring the graph state schema to change.
+    # IMPORTANT:
+    #
+    # This dictionary is NOT the only authoritative source.
+    #
+    # Once the backend resolves authoritative values, those
+    # values should also be copied into their dedicated state
+    # fields below.
     #
     # =====================================================
 
     entities: dict[str, Any]
 
+    # Fields that are still required before checkout can
+    # proceed.
+    #
+    # Examples:
+    #
+    #   ["quantity"]
+    #   ["address_selection", "payment_method"]
+    #
     missing_fields: list[str]
 
     # =====================================================
@@ -131,14 +253,14 @@ class GraphState(TypedDict, total=False):
     # =====================================================
     #
     # product_name:
-    #     Natural-language/product value understood by AI.
+    #     Natural-language/product reference understood from
+    #     the conversation.
     #
     # product_id:
     #     Authoritative database product ID.
     #
-    # Once product_id has been resolved, the order workflow
-    # should use product_id rather than repeatedly searching
-    # by product_name.
+    # Once product_id is resolved, order creation must use
+    # product_id rather than repeatedly trusting product_name.
     #
     # =====================================================
 
@@ -147,40 +269,59 @@ class GraphState(TypedDict, total=False):
     product_name: str | None
 
     # =====================================================
-    # Checkout Quantity
+    # CHECKOUT QUANTITY
     # =====================================================
 
+    # Quantity requested/understood for the current checkout.
+    #
+    # The backend must validate the final quantity against
+    # product availability/stock before creating the order.
     quantity: int | None
 
     # =====================================================
-    # Selected Address
+    # SELECTED ADDRESS
     # =====================================================
 
+    # Authoritative database address ID selected for the
+    # current checkout.
     address_id: int | None
 
     # =====================================================
-    # Selected Payment
+    # SELECTED PAYMENT
     # =====================================================
 
-    # Explicitly selected payment method.
+    # Backend-normalized/accepted payment method.
+    #
+    # This can differ from the exact wording used by the user.
+    #
+    # Example:
+    #
+    # User:
+    #     "cash on delivery"
+    #
+    # Backend-normalized value:
+    #     "cod"
+    #
     selected_payment_method: str | None
 
     # =====================================================
-    # Tool Execution
+    # TOOL EXECUTION
     # =====================================================
 
+    # Tool selected by the decision layer.
     tool_name: str | None
 
     # Raw authoritative result returned by the backend tool.
     #
     # This may contain:
     #
-    #   product information
-    #   order information
-    #   billing information
-    #   tracking information
-    #   support information
-    #   errors
+    #   - product information
+    #   - search results
+    #   - order information
+    #   - billing information
+    #   - tracking information
+    #   - support information
+    #   - validation errors
     #
     tool_result: Any
 
@@ -188,8 +329,22 @@ class GraphState(TypedDict, total=False):
     # ORDER STATE
     # =====================================================
 
-    # Created order ID.
+    # Backend-created order ID.
+    #
+    # This MUST come from the backend/database.
+    #
+    # The AI must never generate an order ID.
     order_id: int | None
+
+    # Indicates that an order has successfully been created
+    # for the current checkout.
+    #
+    # This is one of the safeguards against duplicate order
+    # creation.
+    #
+    # Once True, create_order must not blindly create another
+    # order for the same checkout_id.
+    order_created: bool
 
     # True after an order has successfully been created and
     # the AI is waiting for the user to answer whether they
@@ -200,22 +355,12 @@ class GraphState(TypedDict, total=False):
     # BILLING
     # =====================================================
     #
-    # Billing is deliberately represented as dynamic data.
+    # Billing values are backend-authoritative.
     #
-    # Do NOT hardcode:
+    # The AI can explain the bill but must never calculate
+    # or invent these values independently.
     #
-    #   product names
-    #   unit prices
-    #   delivery fees
-    #   taxes
-    #   discounts
-    #   payment methods
-    #   totals
-    #
-    # The order service/tool should populate these values from
-    # the authoritative database/business logic.
-    #
-    # Example backend result:
+    # Example authoritative backend result:
     #
     # {
     #     "items": [
@@ -235,44 +380,37 @@ class GraphState(TypedDict, total=False):
     #     "currency": "INR"
     # }
     #
-    # The schema intentionally uses Any/dynamic structures so
-    # the AI can understand different billing structures
-    # without hardcoding individual products or charges.
+    # No product, price, tax, discount, delivery fee or total
+    # should be hardcoded in the AI layer.
     #
     # =====================================================
 
-    # Complete authoritative bill returned by the backend.
+    # Primary authoritative billing object.
     #
-    # This is the primary billing object consumed by the
-    # response node / AI.
+    # This should be populated from the order service/tool.
     billing: dict[str, Any]
 
-    # Backward/alternate naming for systems that refer to the
-    # bill rather than billing.
+    # Backward-compatible alias.
+    #
+    # New code should prefer `billing`.
+    #
+    # If both exist, `billing` is considered the primary
+    # authoritative object.
     bill: dict[str, Any]
 
-    # Individual purchased items.
-    #
-    # Each item can dynamically contain:
-    #
-    #   product_id
-    #   product_name
-    #   quantity
-    #   unit_price
-    #   line_total
-    #
-    # and any future pricing information.
+    # Purchased line items returned by backend billing logic.
     billing_items: list[dict[str, Any]]
 
     # =====================================================
-    # Billing Amounts
+    # BILLING AMOUNTS
     # =====================================================
     #
-    # These are optional because not every tool result needs
-    # to contain every monetary component.
+    # These fields are convenience projections of the
+    # authoritative billing object.
     #
-    # They must be populated from backend/business logic.
-    # They must NOT be guessed by the AI.
+    # They MUST be copied from backend results.
+    #
+    # The AI must never calculate these values.
     #
     # =====================================================
 
@@ -286,42 +424,109 @@ class GraphState(TypedDict, total=False):
 
     total_amount: float | None
 
-    # Currency returned by the backend.
-    #
-    # No currency should be assumed by the AI when this field
-    # is available.
+    # Currency returned by backend/business logic.
     currency: str | None
 
     # =====================================================
-    # Payment/Billing Summary
+    # BILLING / PAYMENT SUMMARY
     # =====================================================
 
-    # Payment method actually associated with the order.
+    # Payment method actually associated with the created
+    # transaction/order.
     #
-    # This may be different from the user's initial selection
-    # if the backend normalizes the value.
+    # This may be backend-normalized.
+    #
+    # Example:
+    #
+    #     "cod"
+    #
     billing_payment_method: str | None
 
     # =====================================================
-    # Final Response
+    # TRANSACTION / IDEMPOTENCY INFORMATION
+    # =====================================================
+    #
+    # These fields allow the graph/tool layer to distinguish
+    # a new transaction from a repeated request.
+    #
+    # IMPORTANT:
+    #
+    # These fields do NOT replace database-level uniqueness or
+    # transactional protection.
+    #
+    # The backend/order service remains responsible for the
+    # final idempotency guarantee.
+    #
     # =====================================================
 
+    # Indicates whether an order creation attempt has already
+    # been made for the current checkout.
+    order_creation_attempted: bool
+
+    # Indicates that the current checkout has reached a
+    # terminal state and should not create another order.
+    #
+    # This is different from `order_created` because a checkout
+    # may also become terminal due to cancellation/failure.
+    checkout_completed: bool
+
+    # Optional structured transaction error.
+    #
+    # Example:
+    #
+    # {
+    #     "code": "OUT_OF_STOCK",
+    #     "message": "...",
+    #     "retryable": True
+    # }
+    #
+    # The AI may explain this to the user, but should not
+    # invent the error information.
+    transaction_error: dict[str, Any] | None
+
+    # =====================================================
+    # FINAL RESPONSE
+    # =====================================================
+
+    # Final natural-language response generated for the user.
+    #
+    # The response node may use authoritative backend data
+    # stored in:
+    #
+    #   billing
+    #   order_id
+    #   tool_result
+    #
+    # but must not invent transactional values.
     response: str
 
     # =====================================================
-    # Metadata
+    # FRONTEND / GRAPH METADATA
     # =====================================================
     #
-    # Used by the frontend and other graph layers.
+    # Metadata is used to communicate structured UI state.
     #
     # Examples:
     #
-    #   {
-    #       "type": "order_success",
-    #       "order_id": 1,
-    #       "bill": {...},
-    #       "can_track": True
-    #   }
+    # {
+    #     "type": "address_selection",
+    #     "addresses": [...]
+    # }
+    #
+    # {
+    #     "type": "payment_selection",
+    #     "methods": [...]
+    # }
+    #
+    # {
+    #     "type": "order_success",
+    #     "order_id": 1,
+    #     "bill": {...},
+    #     "can_track": True
+    # }
+    #
+    # Metadata must be generated from actual graph/backend
+    # state and should not contain fabricated transaction data.
     #
     # =====================================================
 
