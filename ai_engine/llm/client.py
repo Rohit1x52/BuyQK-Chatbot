@@ -54,7 +54,7 @@ GROQ_API_KEY = os.getenv(
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile",
+    "qwen/qwen3.6-27b",
 )
 
 LLM_TEMPERATURE = float(
