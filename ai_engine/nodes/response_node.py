@@ -1816,212 +1816,202 @@ def _tool_metadata(
     }
 
 
+
+# =========================================================
+# Cart Presentation Helpers
+# =========================================================
+
+def _get_cart(tool_result: Any) -> dict[str, Any] | None:
+    """Return the authoritative cart payload from a tool result."""
+    if not isinstance(tool_result, dict):
+        return None
+
+    cart = tool_result.get("cart")
+    if isinstance(cart, dict):
+        return cart
+
+    return None
+
+
+def _cart_metadata(
+    tool_result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build frontend cart metadata exclusively from authoritative
+    Tool Node / Cart Service output.
+
+    This function never calculates totals, prices, or quantities.
+    """
+    cart = _get_cart(tool_result)
+
+    metadata: dict[str, Any] = {
+        "type": "cart",
+        "action": tool_result.get("action"),
+    }
+
+    if cart is not None:
+        metadata["cart"] = cart
+
+    # Preserve checkout information when checkout_cart was used.
+    if tool_result.get("type") == "cart_checkout_ready":
+        metadata.update(
+            {
+                "type": "cart_checkout_ready",
+                "checkout_id": tool_result.get("checkout_id"),
+                "checkout_status": tool_result.get(
+                    "checkout_status"
+                ),
+                "order_created": False,
+            }
+        )
+
+    return metadata
+
+
+def _cart_fallback(
+    tool_result: dict[str, Any],
+) -> str:
+    """
+    Deterministic fallback for cart operations.
+
+    Every transactional/cart value comes from the Tool Node result.
+    No totals or quantities are calculated here.
+    """
+    success = tool_result.get("success")
+    result_type = tool_result.get("type")
+    action = tool_result.get("action")
+    cart = _get_cart(tool_result)
+
+    if success is False:
+        return str(
+            tool_result.get("error")
+            or tool_result.get("message")
+            or "I couldn't complete that cart request."
+        )
+
+    if result_type == "cart_checkout_ready":
+        return (
+            "Your cart is ready for checkout. "
+            "Let's continue with checkout."
+        )
+
+    if result_type == "cart_cleared":
+        return "Your cart has been cleared."
+
+    if result_type == "cart":
+        if isinstance(cart, dict):
+            items = cart.get("items")
+            if isinstance(items, list) and not items:
+                return "Your cart is empty."
+        return "Here is your current cart."
+
+    if result_type == "cart_updated":
+        messages = {
+            "add_item": "The item has been added to your cart.",
+            "remove_item": "The item has been removed from your cart.",
+            "update_quantity": "Your cart quantity has been updated.",
+        }
+        return messages.get(
+            action,
+            "Your cart has been updated.",
+        )
+
+    return "Your cart request was completed."
+
+
+def _cart_tool_metadata(
+    tool_result: dict[str, Any],
+    missing_fields: list[str],
+) -> dict[str, Any]:
+    """Return cart metadata while preserving graph checkout fields."""
+    metadata = _cart_metadata(tool_result)
+    metadata["missing_fields"] = missing_fields
+    return metadata
+
+
+
 # =========================================================
 # Response Node
 # =========================================================
-
 
 def response_node(
     state: GraphState,
 ) -> GraphState:
     """
-    Final Phase-2 LangGraph response node.
+    Final presentation node.
 
-    ========================================================
-    RESPONSIBILITY
-    ========================================================
+    The Response Node:
+        - consumes graph/tool state
+        - presents authoritative backend results
+        - generates user-facing wording
+        - builds frontend metadata
 
-    1. Read graph-produced state.
-    2. Read authoritative tool/backend result.
-    3. Render checkout UI metadata when the graph requests it.
-    4. Generate natural language.
-    5. Return presentation state.
+    It does NOT:
+        - select tools
+        - enforce policy
+        - calculate checkout state
+        - calculate prices/taxes/fees/totals
+        - resolve products
+        - validate business facts
+        - create orders
+        - mutate backend state
 
-    ========================================================
-    DOES NOT
-    ========================================================
-
-    This function does NOT:
-
-    - calculate checkout state
-    - choose next checkout step
-    - choose a tool
-    - override policy
-    - modify orders
-    - calculate bills
-    - resolve products
-    - validate addresses
-    - validate payments
-    - invent business values
-
-    ========================================================
+    Phase 3 addition:
+        Cart operations are presentation-only here. Cart truth comes
+        exclusively from Tool Node / Cart Service output.
     """
 
-    # =====================================================
-    # Read state
-    # =====================================================
+    intent = state.get("intent", "general")
+    tool_name = state.get("tool_name")
+    message = str(state.get("message", "") or "")
+    tool_result = _get_tool_result(state)
 
-    intent = state.get(
-        "intent",
-        "general",
-    )
-
-    tool_name = state.get(
-        "tool_name"
-    )
-
-    message = str(
-        state.get(
-            "message",
-            "",
-        )
-        or ""
-    )
-
-    tool_result = _get_tool_result(
-        state
-    )
-
-    missing_fields = _get_missing_fields(
-        state
-    )
-
+    missing_fields = _get_missing_fields(state)
     next_missing = _get_next_missing(
         state,
         missing_fields,
     )
 
-    # =====================================================
-    # Existing metadata
-    # =====================================================
-
     metadata = dict(
-        state.get(
-            "metadata",
-            {},
-        )
-        or {}
+        state.get("metadata", {}) or {}
     )
 
-    # =====================================================
-    # Keep graph-produced checkout metadata
-    # =====================================================
-    #
-    # We do not calculate it.
-    #
-    # We only expose the graph's state to the frontend.
-    # =====================================================
-
-    metadata[
-        "missing_fields"
-    ] = missing_fields
+    # ---------------------------------------------------------
+    # Preserve graph-controlled checkout state.
+    # ---------------------------------------------------------
+    metadata["missing_fields"] = missing_fields
 
     if next_missing is not None:
-
-        metadata[
-            "next_missing"
-        ] = next_missing
-
+        metadata["next_missing"] = next_missing
     else:
+        metadata.pop("next_missing", None)
 
-        metadata.pop(
-            "next_missing",
-            None,
-        )
-
-    # =====================================================
-    # 1. Checkout UI
-    # =====================================================
+    # ---------------------------------------------------------
+    # 1. Successful order
     #
-    # The graph has already selected next_missing.
-    #
-    # Response Node only renders it.
-    # =====================================================
-
-    checkout_metadata = (
-        _checkout_metadata(
-            state,
-            missing_fields,
-            next_missing,
-        )
-    )
-
-    if checkout_metadata is not None:
-
-        checkout_metadata = (
-            _clean_checkout_metadata(
-                checkout_metadata,
-                next_missing,
-            )
-        )
-
-        metadata.update(
-            checkout_metadata
-        )
-
-        response = (
-            _generate_checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-                metadata,
-            )
-        )
-
-        return {
-            "response": response,
-            "metadata": metadata,
-            "missing_fields": missing_fields,
-            "next_missing": next_missing,
-        }
-
-    # =====================================================
-    # 2. Successful Order
-    # =====================================================
-
+    # Must be handled before any checkout UI so an already-created
+    # order can never be presented as an unfinished checkout.
+    # ---------------------------------------------------------
     if (
-        isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is True
-        and tool_result.get(
-            "type"
-        ) == "order_success"
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is True
+        and tool_result.get("type") == "order_success"
     ):
+        order_id = tool_result.get("order_id")
 
-        order_id = tool_result.get(
-            "order_id"
-        )
-
-        metadata = _order_success_metadata(
+        order_metadata = _order_success_metadata(
             state,
             tool_result,
         )
 
-        # -------------------------------------------------
-        # Generate user-facing response
-        # -------------------------------------------------
-
-        response = _generate_tool_response(
-            state
-        )
+        response = _generate_tool_response(state)
 
         if not response:
-
-            response = _generate_llm_response(
-                state
-            )
-
-        # -------------------------------------------------
-        # Transaction complete
-        # -------------------------------------------------
+            response = _generate_llm_response(state)
 
         return {
             "response": response,
-            "metadata": metadata,
+            "metadata": order_metadata,
             "missing_fields": [],
             "next_missing": None,
             "order_id": order_id,
@@ -2032,36 +2022,104 @@ def response_node(
             ),
         }
 
-    # =====================================================
-    # 3. Tracking
-    # =====================================================
+    # ---------------------------------------------------------
+    # 2. Phase 3 cart results
+    #
+    # These MUST be handled before generic tool rendering so the
+    # frontend receives the cart itself and checkout transition
+    # metadata.
+    # ---------------------------------------------------------
+    cart_result_types = {
+        "cart_updated",
+        "cart_cleared",
+        "cart",
+        "cart_checkout_ready",
+    }
 
     if (
-        isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is True
-        and tool_result.get(
-            "type"
-        ) == "tracking"
+        isinstance(tool_result, dict)
+        and tool_result.get("type") in cart_result_types
     ):
+        if tool_result.get("success") is False:
+            response = _cart_fallback(tool_result)
+            cart_metadata = _cart_tool_metadata(
+                tool_result,
+                missing_fields,
+            )
+        else:
+            response = _generate_tool_response(state)
 
-        response = _generate_tool_response(
-            state
-        )
+            if not response:
+                response = _cart_fallback(tool_result)
 
-        if not response:
-
-            response = _tool_fallback(
-                tool_result
+            cart_metadata = _cart_tool_metadata(
+                tool_result,
+                missing_fields,
             )
 
-        metadata = _tool_metadata(
+        # A cart operation must not leave stale address/payment UI
+        # from a previous checkout presentation.
+        cart_metadata = _clean_checkout_metadata(
+            cart_metadata,
+            next_missing,
+        )
+
+        cart_metadata["missing_fields"] = missing_fields
+
+        if next_missing is not None:
+            cart_metadata["next_missing"] = next_missing
+        else:
+            cart_metadata.pop("next_missing", None)
+
+        result: dict[str, Any] = {
+            "response": response,
+            "metadata": cart_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+        # checkout_cart starts checkout but does not create an order.
+        if tool_result.get("type") == "cart_checkout_ready":
+            result.update(
+                {
+                    "checkout_id": tool_result.get(
+                        "checkout_id"
+                    ),
+                    "checkout_status": tool_result.get(
+                        "checkout_status",
+                        "active",
+                    ),
+                    "order_created": False,
+                }
+            )
+
+        return result
+
+    # ---------------------------------------------------------
+    # 3. Checkout UI
+    #
+    # The graph has already selected next_missing.
+    # Response Node only renders it.
+    # ---------------------------------------------------------
+    checkout_metadata = _checkout_metadata(
+        state,
+        missing_fields,
+        next_missing,
+    )
+
+    if checkout_metadata is not None:
+        checkout_metadata = _clean_checkout_metadata(
+            checkout_metadata,
+            next_missing,
+        )
+
+        metadata.update(checkout_metadata)
+
+        response = _generate_checkout_response(
             state,
             missing_fields,
+            next_missing,
+            metadata,
         )
 
         return {
@@ -2069,189 +2127,164 @@ def response_node(
             "metadata": metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
-            "order_id": tool_result.get(
-                "order_id"
-            ),
+        }
+
+    # ---------------------------------------------------------
+    # 4. Tracking
+    # ---------------------------------------------------------
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is True
+        and tool_result.get("type") == "tracking"
+    ):
+        response = _generate_tool_response(state)
+
+        if not response:
+            response = _tool_fallback(tool_result)
+
+        tracking_metadata = _tool_metadata(
+            state,
+            missing_fields,
+        )
+
+        return {
+            "response": response,
+            "metadata": tracking_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+            "order_id": tool_result.get("order_id"),
             "awaiting_order_tracking_confirmation": False,
         }
 
-    # =====================================================
-    # 4. Other successful tool result
-    # =====================================================
+    # ---------------------------------------------------------
+    # 7. Product search
+    #
+    # Kept explicit because product results have dedicated UI
+    # metadata.
+    # ---------------------------------------------------------
+    if tool_name == "search_products":
+        products: list[Any] = []
 
+        if isinstance(tool_result, dict):
+            raw_products = tool_result.get(
+                "products",
+                [],
+            )
+            if isinstance(raw_products, list):
+                products = raw_products
+
+        if isinstance(tool_result, dict):
+            product_metadata = _product_metadata(
+                tool_result,
+                missing_fields,
+            )
+        else:
+            product_metadata = {
+                "type": "product_results",
+                "products": [],
+                "missing_fields": missing_fields,
+            }
+
+        if products:
+            response = _generate_tool_response(state)
+            if not response:
+                response = "I found these products for you."
+        else:
+            response = "I couldn't find matching products."
+
+        return {
+            "response": response,
+            "metadata": product_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+
+    # ---------------------------------------------------------
+    # 5. Tool failure
+    #
+    # Never ask the LLM to rewrite a transactional failure into
+    # an apparent success.
+    # ---------------------------------------------------------
     if (
-        isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is True
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is False
     ):
+        if tool_result.get("type") in cart_result_types:
+            response = _cart_fallback(tool_result)
+        else:
+            error = (
+                tool_result.get("error")
+                or tool_result.get("message")
+            )
+            response = (
+                str(error)
+                if error
+                else "I couldn't complete that request."
+            )
 
-        response = _generate_tool_response(
-            state
+        failure_metadata = _clean_checkout_metadata(
+            metadata,
+            next_missing,
         )
+
+        failure_metadata["missing_fields"] = missing_fields
+
+        if next_missing is not None:
+            failure_metadata["next_missing"] = next_missing
+        else:
+            failure_metadata.pop("next_missing", None)
+
+        return {
+            "response": response,
+            "metadata": failure_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+    # ---------------------------------------------------------
+    # 6. Other successful tool results
+    # ---------------------------------------------------------
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is True
+    ):
+        response = _generate_tool_response(state)
 
         if not response:
-
-            response = _tool_fallback(
-                tool_result
-            )
+            response = _tool_fallback(tool_result)
 
         tool_metadata = _tool_metadata(
             state,
             missing_fields,
         )
 
-        metadata = _clean_checkout_metadata(
+        tool_metadata = _clean_checkout_metadata(
             tool_metadata,
             next_missing,
         )
 
-        metadata[
-            "missing_fields"
-        ] = missing_fields
+        tool_metadata["missing_fields"] = missing_fields
 
         if next_missing is not None:
-
-            metadata[
-                "next_missing"
-            ] = next_missing
-
-        return {
-            "response": response,
-            "metadata": metadata,
-            "missing_fields": missing_fields,
-            "next_missing": next_missing,
-        }
-
-    # =====================================================
-    # 5. Tool Failure
-    # =====================================================
-
-    if (
-        isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is False
-    ):
-
-        error = (
-            tool_result.get(
-                "error"
-            )
-            or tool_result.get(
-                "message"
-            )
-        )
-
-        # -------------------------------------------------
-        # Prefer backend error directly when available.
-        #
-        # This avoids the LLM accidentally rewriting a
-        # transactional error into a false success.
-        # -------------------------------------------------
-
-        if error:
-
-            response = str(
-                error
-            )
-
+            tool_metadata["next_missing"] = next_missing
         else:
-
-            response = (
-                "I couldn't complete that request."
-            )
-
-        metadata = _clean_checkout_metadata(
-            metadata,
-            next_missing,
-        )
-
-        metadata[
-            "missing_fields"
-        ] = missing_fields
+            tool_metadata.pop("next_missing", None)
 
         return {
             "response": response,
-            "metadata": metadata,
+            "metadata": tool_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
         }
 
-    # =====================================================
-    # 6. Product Search
-    # =====================================================
-
-    if (
-        tool_name == "search_products"
-        and isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is True
-    ):
-
-        products = tool_result.get(
-            "products",
-            [],
-        )
-
-        if not isinstance(
-            products,
-            list,
-        ):
-            products = []
-
-        metadata = _product_metadata(
-            tool_result,
-            missing_fields,
-        )
-
-        if products:
-
-            response = _generate_tool_response(
-                state
-            )
-
-            if not response:
-
-                response = (
-                    "I found these products "
-                    "for you."
-                )
-
-        else:
-
-            response = (
-                "I couldn't find matching products."
-            )
-
-        return {
-            "response": response,
-            "metadata": metadata,
-            "missing_fields": missing_fields,
-            "next_missing": next_missing,
-        }
-
-    # =====================================================
-    # 7. Greeting
-    # =====================================================
-
+    # ---------------------------------------------------------
+    # 8. Greeting
+    # ---------------------------------------------------------
     if (
         intent == "general"
-        and _is_greeting(
-            message
-        )
+        and _is_greeting(message)
     ):
-
         return {
             "response": (
                 "Hello! I'm BuyQK AI. "
@@ -2262,39 +2295,22 @@ def response_node(
             "next_missing": None,
         }
 
-    # =====================================================
-    # 8. General Conversation
-    # =====================================================
-
-    response = _generate_llm_response(
-        state
-    )
+    # ---------------------------------------------------------
+    # 9. General conversation
+    # ---------------------------------------------------------
+    response = _generate_llm_response(state)
 
     metadata = _clean_checkout_metadata(
         metadata,
         next_missing,
     )
 
-    metadata[
-        "missing_fields"
-    ] = missing_fields
+    metadata["missing_fields"] = missing_fields
 
     if next_missing is not None:
-
-        metadata[
-            "next_missing"
-        ] = next_missing
-
+        metadata["next_missing"] = next_missing
     else:
-
-        metadata.pop(
-            "next_missing",
-            None,
-        )
-
-    # =====================================================
-    # 9. Return
-    # =====================================================
+        metadata.pop("next_missing", None)
 
     return {
         "response": response,
