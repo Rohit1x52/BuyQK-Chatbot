@@ -451,13 +451,9 @@ def _get_planner_llm():
     # Existing project model factory
     # -----------------------------------------------------
 
-    try:
-        from ai_engine.llm.factory import get_llm
+    from ai_engine.llm.client import get_llm
 
-        return get_llm()
-
-    except ImportError:
-        pass
+    return get_llm()
 
     # -----------------------------------------------------
     # LangChain Groq fallback
@@ -479,7 +475,7 @@ def _get_planner_llm():
 
         model = os.getenv(
             "GROQ_MODEL",
-            "llama-3.3-70b-versatile",
+            "qwen/qwen3.6-27b",
         )
 
         return ChatGroq(
