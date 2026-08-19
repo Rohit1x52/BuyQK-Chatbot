@@ -2,7 +2,7 @@
 # BuyQK AI - Graph Builder
 # =========================================================
 #
-# Phase 2 Architecture
+# Phase 3 Architecture
 #
 # Workflow:
 #
@@ -19,85 +19,46 @@
 # policy
 #   ↓
 # decision
-#   ├───────────────┐
-#   │               │
-#   │ tool_name     │ no tool
-#   ↓               ↓
-# tool           response
-#   ↓               ↓
-# response         END
+#   ├──────────────────────┐
+#   │                      │
+#   │ tool_name            │ no tool
+#   ↓                      ↓
+# tool                  response
+#   ↓                      ↓
+# response               END
 #   ↓
 #  END
 #
 #
-# =========================================================
+# Phase 3 cart operations use the SAME graph pipeline:
 #
-# ARCHITECTURAL RESPONSIBILITIES
+# User
+#   ↓
+# Entity
+#   ↓
+# Planner
+#   ↓
+# Policy
+#   ↓
+# Decision
+#   ↓
+# Tool
+#   ↓
+# Cart Service
+#   ↓
+# Response
 #
-# Context Node:
-#     Loads/normalizes conversation context.
+# The graph does NOT contain business logic for:
 #
-# Intent Node:
-#     Understands the user's high-level intent.
+#   - adding cart items
+#   - removing cart items
+#   - changing quantities
+#   - calculating totals
+#   - validating stock
+#   - creating orders
 #
-# Entity Node:
-#     Extracts/updates entities from the user's message.
-#
-# Planner Node:
-#     Determines the proposed next action/capability.
-#
-# Policy Node:
-#     Validates whether the proposed action is allowed.
-#
-# Decision Node:
-#     Converts the approved plan into executable routing state.
-#
-# Tool Node:
-#     Executes the selected backend capability.
-#
-# Response Node:
-#     Presents the result to the user.
-#
-#
-# =========================================================
-#
-# IMPORTANT
-#
-# The graph itself does NOT:
-#
-#     - interpret user language
-#     - infer intent
-#     - extract entities
-#     - decide what the user wants
-#     - decide whether an order should be created
-#     - validate payment
-#     - validate stock
-#     - calculate billing
-#     - decide business authorization
-#     - invent transaction state
-#
-# Those responsibilities belong to the appropriate AI,
-# policy, tool, and backend layers.
-#
-#
-# =========================================================
-#
-# TRANSACTIONAL TRUTH
-#
-# Backend/tool results remain authoritative for:
-#
-#     - product price
-#     - stock
-#     - payment validity
-#     - address validity
-#     - order ID
-#     - order status
-#     - bill
-#     - total
-#     - delivery charge
-#     - tax
-#     - discount
-#
+# Those responsibilities remain in the appropriate service/tool
+# layers.
 #
 # =========================================================
 
@@ -158,19 +119,21 @@ def _route_after_decision(
     """
     Route the workflow after decision_node.
 
-    The decision node is responsible for converting the
-    approved planning/policy state into executable routing
-    information.
+    The decision node converts the approved planner/policy
+    state into executable routing information.
 
-    The graph only performs structural routing.
+    The graph itself does not determine which capability
+    should execute.
+
+    It only checks whether decision_node produced a valid
+    tool_name.
 
     Returns:
+        "tool":
+            A backend capability should execute.
 
-        "tool"
-            when a tool has been selected.
-
-        "response"
-            when no backend operation is required.
+        "response":
+            No backend capability is required.
     """
 
     tool_name = state.get(
@@ -181,9 +144,7 @@ def _route_after_decision(
         tool_name,
         str,
     ):
-
         if tool_name.strip():
-
             return "tool"
 
     return "response"
@@ -198,13 +159,16 @@ def _create_tool_wrapper(
     default_db: Any = None,
 ):
     """
-    Create the tool-node wrapper.
+    Create the Tool Node wrapper.
 
-    The runtime database session should normally come from
-    GraphState.
+    Runtime database sessions should come from GraphState.
 
-    default_db exists only for backwards compatibility with
-    callers that still construct the graph with build_graph(db).
+    default_db exists for backwards compatibility with callers
+    that construct the graph using build_graph(db).
+
+    Phase 3 cart operations continue to use the same Tool Node.
+    The Tool Node delegates actual cart mutations to
+    backend/services/cart_service.py.
     """
 
     def _tool_wrapper(
@@ -215,7 +179,6 @@ def _create_tool_wrapper(
         )
 
         if db is None:
-
             db = default_db
 
         return tool_node(
@@ -235,7 +198,26 @@ def build_graph(
     db: Any = None,
 ):
     """
-    Build and compile the BuyQK Phase-2 LangGraph workflow.
+    Build and compile the BuyQK LangGraph workflow.
+
+    Supports:
+        Phase 2:
+            - checkout
+            - order creation
+            - tracking
+            - cancellation
+            - address
+            - payment
+            - product search
+            - conversation actions
+
+        Phase 3:
+            - add_to_cart
+            - remove_from_cart
+            - update_cart_item
+            - clear_cart
+            - show_cart
+            - checkout_cart
 
     Parameters
     ----------
@@ -250,12 +232,34 @@ def build_graph(
     Compiled LangGraph application.
     """
 
+    # =====================================================
+    # Create State Graph
+    # =====================================================
+
     graph = StateGraph(
         GraphState
     )
 
     # =====================================================
-    # Register Phase-2 Nodes
+    # Register Nodes
+    # =====================================================
+    #
+    # Phase 3 does NOT require separate cart graph nodes.
+    #
+    # Cart behavior travels through:
+    #
+    #     Entity
+    #       ↓
+    #     Planner
+    #       ↓
+    #     Policy
+    #       ↓
+    #     Decision
+    #       ↓
+    #     Tool
+    #
+    # This prevents duplicated routing logic.
+    #
     # =====================================================
 
     graph.add_node(
@@ -301,14 +305,7 @@ def build_graph(
     )
 
     # =====================================================
-    # Context
-    # =====================================================
-    #
     # START → Context
-    #
-    # Context is responsible for loading/normalizing the
-    # information required by the AI understanding layer.
-    #
     # =====================================================
 
     graph.add_edge(
@@ -338,15 +335,21 @@ def build_graph(
     # Entity → Planner
     # =====================================================
     #
-    # At this point the graph should contain:
+    # Entity Node may now produce Phase 3 information such as:
     #
-    #     context
-    #     intent
-    #     entities
-    #     conversation history
+    #     intent = "cart"
     #
-    # The planner uses these inputs to propose the next
-    # capability/action.
+    #     cart_action = "add_item"
+    #
+    #     product_name = "Maggi"
+    #
+    #     quantity = 2
+    #
+    # or:
+    #
+    #     cart_action = "clear_cart"
+    #
+    # The graph does not interpret these values.
     #
     # =====================================================
 
@@ -359,11 +362,18 @@ def build_graph(
     # Planner → Policy
     # =====================================================
     #
-    # Planner proposes.
+    # Planner proposes a capability.
     #
-    # Policy validates.
+    # Examples:
     #
-    # The planner does not directly execute a backend action.
+    #     add_to_cart
+    #     remove_from_cart
+    #     update_cart_item
+    #     clear_cart
+    #     show_cart
+    #     checkout_cart
+    #
+    # The planner does NOT execute them.
     #
     # =====================================================
 
@@ -376,16 +386,11 @@ def build_graph(
     # Policy → Decision
     # =====================================================
     #
-    # Decision receives:
+    # Policy determines whether the proposed capability is
+    # allowed.
     #
-    #     - intent
-    #     - entities
-    #     - planner state
-    #     - policy state
-    #     - checkout state
-    #     - conversation context
-    #
-    # It converts the approved state into executable routing.
+    # Decision then converts the approved state into the
+    # executable routing state.
     #
     # =====================================================
 
@@ -398,10 +403,17 @@ def build_graph(
     # Decision → Tool OR Response
     # =====================================================
     #
-    # The graph does not decide which tool to use.
+    # The graph only performs structural routing.
     #
-    # It only checks the routing value produced by
-    # decision_node.
+    # If decision_node produces:
+    #
+    #     tool_name = "add_to_cart"
+    #
+    # the graph routes to Tool Node.
+    #
+    # If decision_node produces no tool_name:
+    #
+    #     Response Node
     #
     # =====================================================
 
@@ -418,18 +430,35 @@ def build_graph(
     # Tool → Response
     # =====================================================
     #
-    # Tool execution produces authoritative backend state.
+    # Tool Node executes the approved capability.
     #
-    # Examples:
+    # Phase 3 examples:
     #
-    #     checkout_id
-    #     checkout_status
-    #     order_created
-    #     order_id
-    #     bill
-    #     tool_result
+    #     add_to_cart
+    #          ↓
+    #     cart_service.add_item()
     #
-    # Response then presents that result.
+    #     remove_from_cart
+    #          ↓
+    #     cart_service.remove_item()
+    #
+    #     update_cart_item
+    #          ↓
+    #     cart_service.update_quantity()
+    #
+    #     clear_cart
+    #          ↓
+    #     cart_service.clear_cart()
+    #
+    #     show_cart
+    #          ↓
+    #     cart_service.get_cart()
+    #
+    #     checkout_cart
+    #          ↓
+    #     cart validation / checkout preparation
+    #
+    # Tool results remain authoritative.
     #
     # =====================================================
 
@@ -460,8 +489,23 @@ def build_graph(
 #
 # The default graph does not own a database session.
 #
-# Runtime callers should inject db into GraphState.
+# Runtime callers should inject the SQLAlchemy session into
+# GraphState:
+#
+#     state["db"] = db
+#
+# This preserves request-level database ownership.
 #
 # =========================================================
 
 app = build_graph()
+
+
+# =========================================================
+# Public API
+# =========================================================
+
+__all__ = [
+    "app",
+    "build_graph",
+]
