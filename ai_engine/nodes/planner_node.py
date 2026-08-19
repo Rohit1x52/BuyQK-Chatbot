@@ -1,248 +1,230 @@
 # =========================================================
-# BuyQK AI - Planner Node
+# BuyQK - AI Planner Node
 # =========================================================
 #
 # Purpose:
-# Convert AI understanding + conversation context +
-# transaction state into a structured action proposal.
 #
-# Phase 2 architecture:
+# Convert AI-understood conversation state into a structured
+# execution plan.
 #
-# User
-#   ↓
+# Architecture:
+#
+# User Message
+#       ↓
 # Context
-#   ↓
-# Understanding
-#   ↓
+#       ↓
+# Entity / Understanding
+#       ↓
 # Planner
-#   ↓
+#       ↓
 # Policy
-#   ↓
+#       ↓
+# Decision
+#       ↓
 # Tool
 #
 # IMPORTANT:
 #
-# The planner is an AI decision layer.
+# The planner is an AI reasoning layer.
 #
-# It determines:
+# It may determine:
 #
-#   - user's current goal
-#   - appropriate next action
-#   - whether clarification is required
-#   - appropriate capability/tool
-#   - proposed tool arguments
+#   - user's goal
+#   - conversational action
+#   - required capability
+#   - missing information
+#   - checkout modification
+#   - tracking request
+#   - cancellation request
+#   - support request
 #
-# The planner DOES NOT:
+# It must NOT:
 #
-#   - create database records
 #   - calculate prices
 #   - calculate bills
-#   - validate stock
-#   - authorize users
-#   - validate payment
-#   - generate order IDs
-#   - bypass checkout state
+#   - invent stock
+#   - invent order IDs
+#   - invent payment results
+#   - authorize transactions
+#   - mutate the database
 #
-# The planner produces a PROPOSAL.
-#
-# Policy validation + backend services remain authoritative.
-#
+# Backend services remain authoritative for all
+# transactional/business facts.
 # =========================================================
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
-from ai_engine.graph.state import GraphState
-
-
-# =========================================================
-# Planner Capabilities
-# =========================================================
+# IMPORTANT:
 #
-# These are generic capabilities, not product-specific
-# business rules.
+# Import get_llm directly into THIS module.
 #
-# The AI chooses the appropriate capability based on
-# conversation/context.
+# Tests and other Phase-2 components intentionally patch:
 #
-# =========================================================
-
-PLANNER_ACTIONS = {
-    "SEARCH_PRODUCT",
-    "START_CHECKOUT",
-    "CONTINUE_CHECKOUT",
-    "SELECT_ADDRESS",
-    "SELECT_PAYMENT",
-    "CREATE_ORDER",
-    "TRACK_ORDER",
-    "CANCEL_ORDER",
-    "MODIFY_ORDER",
-    "SUPPORT",
-    "ANSWER",
-    "ASK_CLARIFICATION",
-    "CONFIRM",
-    "END_CONVERSATION",
-}
+#     planner_node.get_llm
+#
+# Therefore this symbol must exist at module level.
+#
+from ai_engine.llm.client import get_llm
 
 
 # =========================================================
-# Supported Backend Capabilities
+# Planner Actions
 # =========================================================
 
-SUPPORTED_TOOLS = {
+PLANNER_ACTIONS: set[str] = {
+    "answer",
+    "end_conversation",
+    "ask_clarification",
+    "start_checkout",
+    "modify_checkout",
     "search_products",
+    "add_to_checkout",
     "create_order",
     "track_order",
     "cancel_order",
-    "create_support_ticket",
-    "list_saved_addresses",
+    "request_support",
 }
 
 
 # =========================================================
-# Planner System Prompt
+# Utility: Extract Response Content
 # =========================================================
 
-PLANNER_SYSTEM_PROMPT = """
-You are the BuyQK AI planning layer.
-
-Your responsibility is to understand the user's current
-goal and propose the most appropriate NEXT ACTION.
-
-You receive:
-- current user message
-- conversation context
-- previous AI understanding
-- accumulated entities
-- checkout state
-- transaction state
-- previous backend results
-- billing information when available
-
-You must reason about the conversation and choose an
-appropriate action.
-
-You may:
-- identify the user's goal
-- continue an existing workflow
-- start a new workflow
-- recognize a modification
-- recognize tracking intent
-- recognize cancellation intent
-- recognize support intent
-- ask for clarification
-- decide that no backend tool is necessary
-- select the appropriate capability/tool
-
-You must NOT invent authoritative business information.
-
-Never invent:
-- product prices
-- stock
-- order IDs
-- bills
-- taxes
-- delivery charges
-- discounts
-- payment availability
-- order status
-- cancellation eligibility
-- refund eligibility
-
-Backend results are authoritative.
-
-If a transaction has already been successfully created,
-do NOT propose creating another order merely because the
-user sends a conversational message such as:
-- thank you
-- thanks
-- okay
-- great
-- got it
-- bye
-
-If the current conversation is already a completed
-transaction, understand subsequent conversational messages
-in that context.
-
-Use the conversation history to resolve references such as:
-- "that one"
-- "the other one"
-- "make it five"
-- "same address"
-- "change that"
-- "track it"
-
-Do not guess when the reference is genuinely ambiguous.
-Use ASK_CLARIFICATION.
-
-Return ONLY valid JSON.
-
-The JSON must contain:
-
-{
-  "action": "...",
-  "intent": "...",
-  "user_goal": "...",
-  "missing_information": [],
-  "tool": null,
-  "tool_arguments": {},
-  "confidence": 0.0
-}
-
-Rules:
-- action must be one of the supported planner actions.
-- tool must be null when no backend tool is required.
-- tool must be one of the supported tools when a tool is required.
-- missing_information must contain only information genuinely
-  required for the proposed action.
-- tool_arguments must contain only information already
-  understood or available in context.
-- confidence must be a number between 0 and 1.
-"""
-
-
-# =========================================================
-# Generic JSON Extraction
-# =========================================================
-
-def _extract_json(
-    content: Any,
-) -> dict[str, Any]:
+def _get_content(response: Any) -> Any:
     """
-    Convert an LLM response into a JSON dictionary.
+    Extract content from a LangChain response.
 
-    Handles:
-    - plain JSON
-    - markdown JSON fences
+    Supports:
+        - AIMessage-like objects
+        - dictionaries
+        - strings
+        - structured content blocks
     """
 
-    if isinstance(
-        content,
-        dict,
-    ):
+    if isinstance(response, dict):
+        return response
+
+    content = getattr(response, "content", None)
+
+    if content is not None:
         return content
 
-    if not isinstance(
-        content,
-        str,
-    ):
-        raise ValueError(
-            "Planner returned an invalid response."
+    return response
+
+
+# =========================================================
+# Utility: Extract JSON
+# =========================================================
+
+def _extract_json(content: Any) -> dict[str, Any]:
+    """
+    Extract a JSON object from an LLM response.
+
+    Handles:
+        direct JSON
+        markdown JSON fences
+        Qwen <think>...</think> output
+        explanatory text surrounding JSON
+        structured LangChain content
+    """
+
+    # -----------------------------------------------------
+    # Dictionary already returned
+    # -----------------------------------------------------
+
+    if isinstance(content, dict):
+        return content
+
+    # -----------------------------------------------------
+    # LangChain message object
+    # -----------------------------------------------------
+
+    if not isinstance(content, str):
+
+        message_content = getattr(
+            content,
+            "content",
+            None,
         )
+
+        if isinstance(message_content, str):
+
+            content = message_content
+
+        elif isinstance(message_content, list):
+
+            text_parts: list[str] = []
+
+            for block in message_content:
+
+                if isinstance(block, str):
+                    text_parts.append(block)
+
+                elif isinstance(block, dict):
+
+                    text = block.get("text")
+
+                    if isinstance(text, str):
+                        text_parts.append(text)
+
+            content = "\n".join(text_parts)
+
+        else:
+
+            raise ValueError(
+                "Planner returned an unsupported response type."
+            )
+
+    # -----------------------------------------------------
+    # Validate text
+    # -----------------------------------------------------
 
     text = content.strip()
 
-    if text.startswith(
-        "```"
-    ):
+    if not text:
+        raise ValueError(
+            "Planner returned an empty response."
+        )
+
+    # -----------------------------------------------------
+    # Remove Qwen reasoning blocks
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
+    # -----------------------------------------------------
+    # Remove unmatched <think>
+    # -----------------------------------------------------
+
+    if "<think>" in text.lower():
+
+        text = re.sub(
+            r"<think>.*",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    # -----------------------------------------------------
+    # Remove markdown fences
+    # -----------------------------------------------------
+
+    if text.startswith("```"):
+
         lines = text.splitlines()
 
         if (
             lines
-            and lines[0].startswith("```")
+            and lines[0].strip().startswith("```")
         ):
             lines = lines[1:]
 
@@ -252,313 +234,394 @@ def _extract_json(
         ):
             lines = lines[:-1]
 
-        text = "\n".join(
-            lines
-        ).strip()
+        text = "\n".join(lines).strip()
+
+    # -----------------------------------------------------
+    # Direct JSON
+    # -----------------------------------------------------
 
     try:
-        parsed = json.loads(
-            text
-        )
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Planner returned invalid JSON."
-        ) from exc
 
-    if not isinstance(
-        parsed,
-        dict,
-    ):
-        raise ValueError(
-            "Planner response must be a JSON object."
-        )
+        parsed = json.loads(text)
 
-    return parsed
+        if isinstance(parsed, dict):
+            return parsed
+
+    except json.JSONDecodeError:
+        pass
+
+    # -----------------------------------------------------
+    # Embedded JSON
+    # -----------------------------------------------------
+
+    decoder = json.JSONDecoder()
+
+    for index, character in enumerate(text):
+
+        if character != "{":
+            continue
+
+        candidate = text[index:]
+
+        try:
+
+            parsed, _ = decoder.raw_decode(candidate)
+
+            if isinstance(parsed, dict):
+                return parsed
+
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError(
+        "Planner returned invalid JSON."
+    )
 
 
 # =========================================================
-# Normalize Planner Decision
+# Utility: Normalize Action
 # =========================================================
 
-def _normalize_decision(
-    decision: dict[str, Any],
+def _normalize_action(
+    action: Any,
+) -> str | None:
+    """
+    Normalize equivalent action field names.
+
+    The AI may return:
+
+        action
+        capability
+        tool
+        tool_name
+        intent
+
+    No conversational decision is made here.
+    """
+
+    if not isinstance(action, str):
+        return None
+
+    normalized = (
+        action
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    return normalized or None
+
+
+# =========================================================
+# Utility: Normalize Planner Output
+# =========================================================
+
+def _normalize_plan(
+    plan: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Normalize the planner output without changing its
-    semantic decision.
-
-    This function performs schema validation only.
-    It does not make conversational decisions.
+    Convert raw LLM output into the canonical planner
+    contract.
     """
 
-    action = decision.get(
-        "action"
+    # -----------------------------------------------------
+    # Action
+    # -----------------------------------------------------
+
+    action = _normalize_action(
+        plan.get("action")
+    )
+
+    if action is None:
+
+        for field in (
+            "capability",
+            "tool",
+            "tool_name",
+            "intent",
+        ):
+
+            action = _normalize_action(
+                plan.get(field)
+            )
+
+            if action is not None:
+                break
+
+    # -----------------------------------------------------
+    # Arguments
+    # -----------------------------------------------------
+
+    arguments = plan.get("arguments")
+
+    if not isinstance(arguments, dict):
+
+        arguments = plan.get(
+            "tool_arguments"
+        )
+
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    # -----------------------------------------------------
+    # Missing fields
+    # -----------------------------------------------------
+
+    missing_fields = plan.get(
+        "missing_fields"
     )
 
     if not isinstance(
-        action,
-        str,
-    ):
-        raise ValueError(
-            "Planner did not provide an action."
-        )
-
-    action = action.strip().upper()
-
-    if action not in PLANNER_ACTIONS:
-        raise ValueError(
-            f"Planner returned unsupported action: {action}"
-        )
-
-    intent = decision.get(
-        "intent"
-    )
-
-    if intent is None:
-        intent = ""
-
-    if not isinstance(
-        intent,
-        str,
-    ):
-        intent = str(
-            intent
-        )
-
-    user_goal = decision.get(
-        "user_goal"
-    )
-
-    if user_goal is not None and not isinstance(
-        user_goal,
-        str,
-    ):
-        user_goal = str(
-            user_goal
-        )
-
-    missing_information = decision.get(
-        "missing_information",
-        [],
-    )
-
-    if not isinstance(
-        missing_information,
+        missing_fields,
         list,
     ):
-        missing_information = []
+        missing_fields = []
 
-    missing_information = [
-        str(item)
-        for item in missing_information
-        if item is not None
+    # Keep only strings.
+    missing_fields = [
+        str(value)
+        for value in missing_fields
+        if value is not None
     ]
 
-    tool = decision.get(
-        "tool"
-    )
+    # -----------------------------------------------------
+    # Confidence
+    # -----------------------------------------------------
 
-    if tool is not None:
-        if not isinstance(
-            tool,
-            str,
-        ):
-            raise ValueError(
-                "Planner tool must be a string or null."
-            )
-
-        tool = tool.strip()
-
-        if tool and tool not in SUPPORTED_TOOLS:
-            raise ValueError(
-                f"Planner returned unsupported tool: {tool}"
-            )
-
-    tool_arguments = decision.get(
-        "tool_arguments",
-        {},
-    )
-
-    if not isinstance(
-        tool_arguments,
-        dict,
-    ):
-        tool_arguments = {}
-
-    confidence = decision.get(
+    confidence = plan.get(
         "confidence"
     )
 
-    if confidence is not None:
-        try:
-            confidence = float(
-                confidence
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            confidence = None
+    if isinstance(
+        confidence,
+        (int, float),
+    ):
 
-    if confidence is not None:
         confidence = max(
             0.0,
             min(
                 1.0,
-                confidence,
+                float(confidence),
             ),
         )
 
+    else:
+
+        confidence = None
+
+    # -----------------------------------------------------
+    # Reason
+    # -----------------------------------------------------
+
+    reason = plan.get("reason")
+
+    if not isinstance(reason, str):
+        reason = None
+
+    # -----------------------------------------------------
+    # Canonical contract
+    # -----------------------------------------------------
+
     return {
         "action": action,
-        "intent": intent,
-        "user_goal": user_goal,
-        "missing_information": missing_information,
-        "tool": tool,
-        "tool_arguments": tool_arguments,
+        "tool_name": action,
+        "arguments": arguments,
+        "missing_fields": missing_fields,
         "confidence": confidence,
+        "reason": reason,
     }
 
 
 # =========================================================
-# LLM Provider
+# Planner Prompt
 # =========================================================
 
-def _get_planner_llm():
+def _build_planner_prompt(
+    state: dict[str, Any],
+) -> str:
     """
-    Create the LLM used by the planner.
+    Build the planner prompt from GraphState.
 
-    The planner intentionally uses the application's existing
-    AI provider configuration rather than introducing a new
-    provider or hardcoding credentials here.
-
-    Supported project configurations are attempted in order.
+    Only conversational reasoning is delegated to the LLM.
     """
 
-    # -----------------------------------------------------
-    # Existing project LLM factory
-    # -----------------------------------------------------
+    message = state.get(
+        "message",
+        "",
+    )
 
-    try:
-        from ai_engine.llm import get_llm
+    conversation_history = state.get(
+        "conversation_history",
+        [],
+    )
 
-        return get_llm()
+    entities = state.get(
+        "entities",
+        {},
+    )
 
-    except ImportError:
-        pass
+    intent = state.get(
+        "intent"
+    )
 
-    # -----------------------------------------------------
-    # Existing project model factory
-    # -----------------------------------------------------
-
-    from ai_engine.llm.client import get_llm
-
-    return get_llm()
-
-    # -----------------------------------------------------
-    # LangChain Groq fallback
-    # -----------------------------------------------------
-
-    try:
-        from langchain_groq import ChatGroq
-
-        import os
-
-        api_key = os.getenv(
-            "GROQ_API_KEY"
-        )
-
-        if not api_key:
-            raise RuntimeError(
-                "GROQ_API_KEY is not configured."
-            )
-
-        model = os.getenv(
-            "GROQ_MODEL",
-            "qwen/qwen3.6-27b",
-        )
-
-        return ChatGroq(
-            model=model,
-            temperature=0,
-        )
-
-    except ImportError as exc:
-        raise RuntimeError(
-            "No supported planner LLM provider is configured."
-        ) from exc
-
-
-# =========================================================
-# Invoke Planner LLM
-# =========================================================
-
-def _invoke_planner_llm(
-    context: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Ask the LLM to produce a structured planning proposal.
-    """
-
-    llm = _get_planner_llm()
-
-    prompt = (
-        PLANNER_SYSTEM_PROMPT
-        + "\n\n"
-        + "CURRENT BUYQK CONTEXT:\n"
-        + json.dumps(
-            context,
-            ensure_ascii=False,
-            default=str,
-        )
-        + "\n\n"
-        + "Return ONLY the JSON planner decision."
+    missing_fields = state.get(
+        "missing_fields",
+        [],
     )
 
     # -----------------------------------------------------
-    # LangChain-style LLM
+    # Authoritative checkout state
     # -----------------------------------------------------
 
-    if hasattr(
-        llm,
-        "invoke",
-    ):
-        result = llm.invoke(
-            prompt
-        )
-
-        content = getattr(
-            result,
-            "content",
-            result,
-        )
-
-        return _extract_json(
-            content
-        )
+    checkout_state = {
+        "checkout_id": state.get(
+            "checkout_id"
+        ),
+        "checkout_status": state.get(
+            "checkout_status"
+        ),
+        "order_created": state.get(
+            "order_created"
+        ),
+        "order_id": state.get(
+            "order_id"
+        ),
+        "bill": state.get(
+            "bill"
+        ),
+    }
 
     # -----------------------------------------------------
-    # Generic callable
+    # Frontend selection
     # -----------------------------------------------------
 
-    if callable(llm):
-        result = llm(
-            prompt
-        )
+    frontend_state = {
+        "selected_address_id": state.get(
+            "selected_address_id"
+        ),
+        "payment_method": state.get(
+            "payment_method"
+        ),
+        "selected_payment_method": state.get(
+            "selected_payment_method"
+        ),
+    }
 
-        content = getattr(
-            result,
-            "content",
-            result,
-        )
+    # -----------------------------------------------------
+    # Safe context
+    # -----------------------------------------------------
 
-        return _extract_json(
-            content
-        )
+    context = {
+        "current_message": message,
+        "conversation_history": conversation_history,
+        "intent": intent,
+        "entities": entities,
+        "missing_fields": missing_fields,
+        "checkout": checkout_state,
+        "frontend_selection": frontend_state,
+    }
 
-    raise RuntimeError(
-        "Configured planner LLM cannot be invoked."
-    )
+    return f"""
+You are the BuyQK AI Planner.
+
+Your job is to understand the user's CURRENT goal and
+produce exactly ONE structured execution plan.
+
+You are a conversational reasoning layer.
+
+You may decide:
+
+- what the user means
+- the user's current goal
+- whether the user wants to start a checkout
+- whether the user wants to modify an existing checkout
+- whether the user wants product search
+- whether the user wants tracking
+- whether the user wants cancellation
+- whether the user wants support
+- whether clarification is required
+- whether the message is ordinary conversation
+- which backend capability is appropriate
+
+You must NOT:
+
+- calculate prices
+- calculate bills
+- invent stock
+- invent order IDs
+- invent payment results
+- invent transaction success
+- decide backend authorization
+- decide cancellation eligibility
+- mutate the database
+- claim an order was created without authoritative backend state
+
+The backend is authoritative for transactional facts.
+
+IMPORTANT CHECKOUT RULE:
+
+The supplied checkout state is authoritative.
+
+If:
+
+checkout_status = "completed"
+and
+order_created = true
+
+then a normal acknowledgement such as "Thank you",
+"Thanks", "Okay", "Alright", or "Got it" must NOT
+be interpreted as another purchase.
+
+If the user explicitly expresses a NEW shopping goal,
+that is a new conversational goal.
+
+If the user wants to change an active checkout,
+use modify_checkout.
+
+If the user's reference cannot be resolved from the
+available context, use ask_clarification.
+
+Available capabilities:
+
+answer
+end_conversation
+ask_clarification
+start_checkout
+modify_checkout
+search_products
+add_to_checkout
+create_order
+track_order
+cancel_order
+request_support
+
+Return ONLY JSON.
+
+Required structure:
+
+{{
+  "action": "<one action>",
+  "arguments": {{}},
+  "missing_fields": [],
+  "confidence": 0.0,
+  "reason": "<short explanation>"
+}}
+
+The arguments object may contain only information
+supported by the supplied context.
+
+Do not invent transactional values.
+
+CURRENT GRAPH STATE:
+
+{json.dumps(
+    context,
+    ensure_ascii=False,
+    default=str,
+    indent=2,
+)}
+""".strip()
 
 
 # =========================================================
@@ -566,66 +629,198 @@ def _invoke_planner_llm(
 # =========================================================
 
 def planner_node(
-    state: GraphState,
-) -> GraphState:
+    state: dict[str, Any],
+) -> dict[str, Any]:
     """
-    Phase 2 AI Planner.
+    Execute the AI planner.
 
     Input:
-        GraphState containing context + AI understanding +
-        transaction state.
+        GraphState
 
     Output:
-        GraphState containing planner_decision and its
-        normalized projections.
+        planner
+        planner_args
+        missing_fields
 
-    IMPORTANT:
-    This node proposes an action.
-
-    It does NOT execute tools.
+    This node does NOT execute backend operations.
     """
 
-    context = state.get(
-        "context",
-        {},
+    # -----------------------------------------------------
+    # Build prompt
+    # -----------------------------------------------------
+
+    prompt = _build_planner_prompt(
+        state
     )
 
-    if not context:
-        raise ValueError(
-            "Planner requires context from context_node."
+    # -----------------------------------------------------
+    # IMPORTANT
+    #
+    # get_llm is deliberately resolved through the module
+    # namespace.
+    #
+    # This allows:
+    #
+    # monkeypatch.setattr(
+    #     planner_module,
+    #     "get_llm",
+    #     ...
+    # )
+    #
+    # and keeps production configuration centralized.
+    # -----------------------------------------------------
+
+    llm = get_llm()
+
+    # -----------------------------------------------------
+    # Invoke model
+    # -----------------------------------------------------
+
+    response = llm.invoke(
+        prompt
+    )
+
+    # -----------------------------------------------------
+    # Extract response
+    # -----------------------------------------------------
+
+    content = _get_content(
+        response
+    )
+
+    # -----------------------------------------------------
+    # Parse JSON
+    # -----------------------------------------------------
+
+    raw_plan = _extract_json(
+        content
+    )
+
+    # -----------------------------------------------------
+    # Normalize
+    # -----------------------------------------------------
+
+    plan = _normalize_plan(
+        raw_plan
+    )
+
+    # -----------------------------------------------------
+    # Validate capability
+    # -----------------------------------------------------
+
+    action = plan.get(
+        "action"
+    )
+
+    if (
+        action is not None
+        and action not in PLANNER_ACTIONS
+    ):
+
+        plan["action"] = None
+        plan["tool_name"] = None
+
+        plan["reason"] = (
+            "Planner returned an unsupported capability."
         )
 
-    decision = _invoke_planner_llm(
-        context
-    )
+    # -----------------------------------------------------
+    # Preserve backend transaction state
+    # -----------------------------------------------------
+    #
+    # IMPORTANT:
+    #
+    # Do NOT return replacements for:
+    #
+    # checkout_id
+    # checkout_status
+    # order_created
+    # order_id
+    # bill
+    #
+    # The planner cannot mutate authoritative transaction
+    # state.
+    # -----------------------------------------------------
 
-    normalized = _normalize_decision(
-        decision
-    )
+    result: dict[str, Any] = {
+        "planner": plan,
 
-    return {
-        "planner_decision": normalized,
+        "planner_args": dict(
+            plan.get(
+                "arguments",
+                {},
+            )
+        ),
 
-        "planned_action": normalized[
-            "action"
-        ],
-
-        "planned_tool": normalized[
-            "tool"
-        ],
-
-        "planned_arguments": normalized[
-            "tool_arguments"
-        ],
-
-        "planner_confidence": normalized[
-            "confidence"
-        ],
-
-        # The planner may refine semantic understanding.
-        # These values are still AI interpretation, not
-        # authoritative backend transaction values.
-        "user_goal": normalized[
-            "user_goal"
-        ],
+        "missing_fields": list(
+            plan.get(
+                "missing_fields",
+                state.get(
+                    "missing_fields",
+                    [],
+                ),
+            )
+        ),
     }
+
+    # -----------------------------------------------------
+    # Debug logging
+    # -----------------------------------------------------
+
+    print(
+        "\n"
+        + "=" * 60
+        + "\n"
+        + "[AI PLANNER NODE]"
+        + "\n"
+        + "=" * 60
+    )
+
+    print(
+        f"message         = "
+        f"{state.get('message')!r}"
+    )
+
+    print(
+        f"action          = "
+        f"{plan.get('action')!r}"
+    )
+
+    print(
+        f"arguments       = "
+        f"{plan.get('arguments')!r}"
+    )
+
+    print(
+        f"missing_fields  = "
+        f"{plan.get('missing_fields')!r}"
+    )
+
+    print(
+        f"confidence      = "
+        f"{plan.get('confidence')!r}"
+    )
+
+    print(
+        f"checkout_id     = "
+        f"{state.get('checkout_id')!r}"
+    )
+
+    print(
+        f"checkout_status = "
+        f"{state.get('checkout_status')!r}"
+    )
+
+    print(
+        f"order_created   = "
+        f"{state.get('order_created')!r}"
+    )
+
+    print(
+        f"order_id        = "
+        f"{state.get('order_id')!r}"
+    )
+
+    print("=" * 60)
+
+    return result
