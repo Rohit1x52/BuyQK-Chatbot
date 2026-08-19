@@ -30,6 +30,7 @@
 #
 # - Product
 # - Product name
+# - Product ID
 # - Product price
 # - Product stock
 # - Product availability
@@ -48,7 +49,6 @@
 # - Total
 #
 # The AI understands the user's request.
-#
 # This service validates and executes the transaction.
 #
 # =========================================================
@@ -60,6 +60,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.models.address import Address
@@ -73,11 +74,10 @@ from backend.models.payment import Payment
 # Supported Payment Methods
 # =========================================================
 #
-# These are backend-supported payment identifiers.
+# These are backend-supported identifiers.
 #
-# The AI may understand different natural-language forms,
-# but the backend decides whether a normalized method is
-# actually supported.
+# The AI can understand natural-language payment requests.
+# The backend validates the normalized result.
 #
 # =========================================================
 
@@ -88,17 +88,14 @@ SUPPORTED_PAYMENT_METHODS = {
 
 
 # =========================================================
-# MVP Delivery Charge
+# Delivery Charge
 # =========================================================
 #
-# Delivery is free in the current MVP.
+# Current MVP policy:
+# delivery is free.
 #
-# This value belongs to backend business logic.
-#
-# The AI must never calculate or invent delivery charges.
-#
-# Future implementation can replace this with a dynamic
-# delivery/pricing service.
+# This is backend business logic.
+# The AI never calculates this value.
 #
 # =========================================================
 
@@ -106,13 +103,10 @@ MVP_DELIVERY_CHARGE = Decimal("0.00")
 
 
 # =========================================================
-# Utility - Checkout ID
+# Checkout ID
 # =========================================================
 
-
-def _normalize_checkout_id(
-    checkout_id: Any,
-) -> str:
+def _normalize_checkout_id(checkout_id: Any) -> str:
     """
     Validate and normalize checkout_id.
 
@@ -120,7 +114,8 @@ def _normalize_checkout_id(
 
     It is NOT the order ID.
 
-    The same checkout_id must never create two orders.
+    The same user + checkout_id must never create
+    two orders.
     """
 
     if checkout_id is None:
@@ -144,16 +139,11 @@ def _normalize_checkout_id(
 
 
 # =========================================================
-# Utility - User ID
+# User ID
 # =========================================================
 
-
-def _normalize_user_id(
-    user_id: Any,
-) -> int:
-    """
-    Validate user ID.
-    """
+def _normalize_user_id(user_id: Any) -> int:
+    """Validate user ID."""
 
     if user_id is None:
         raise ValueError(
@@ -162,11 +152,7 @@ def _normalize_user_id(
 
     try:
         normalized = int(user_id)
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         raise ValueError(
             "Invalid user ID."
         )
@@ -180,16 +166,11 @@ def _normalize_user_id(
 
 
 # =========================================================
-# Utility - Address ID
+# Address ID
 # =========================================================
 
-
-def _normalize_address_id(
-    address_id: Any,
-) -> int:
-    """
-    Validate address ID.
-    """
+def _normalize_address_id(address_id: Any) -> int:
+    """Validate address ID."""
 
     if address_id is None:
         raise ValueError(
@@ -198,11 +179,7 @@ def _normalize_address_id(
 
     try:
         normalized = int(address_id)
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         raise ValueError(
             "Invalid address ID."
         )
@@ -219,22 +196,16 @@ def _normalize_address_id(
 # Address Validation
 # =========================================================
 
-
 def _validate_user_address(
     db: Session,
     user_id: int,
     address_id: int,
 ) -> Address:
     """
-    Ensure the selected address exists and belongs
-    to the current user.
-
-    Frontend selection is never trusted without
-    backend ownership validation.
+    Ensure the address exists and belongs to the user.
     """
 
     user_id = _normalize_user_id(user_id)
-
     address_id = _normalize_address_id(address_id)
 
     address = (
@@ -259,7 +230,6 @@ def _validate_user_address(
 # Payment Validation
 # =========================================================
 
-
 def _validate_payment_method(
     payment_method: Any,
 ) -> str:
@@ -278,9 +248,6 @@ def _validate_payment_method(
     become:
 
         cod
-
-    The backend still decides whether the normalized method
-    is supported.
     """
 
     if payment_method is None:
@@ -325,27 +292,34 @@ def _validate_payment_method(
 # Available Payment Methods
 # =========================================================
 
-
 def get_available_payment_methods() -> list[dict[str, str]]:
     """
-    Return backend-supported payment methods.
+    Return payment methods supported by the backend.
 
-    Frontend should use this rather than hardcoding payment
-    methods independently.
+    The frontend should consume this rather than
+    maintaining its own independent list.
     """
+
+    labels = {
+        "cod": "Cash on Delivery",
+        "upi": "UPI",
+    }
+
+    descriptions = {
+        "cod": "Pay when your order is delivered.",
+        "upi": "Pay using UPI.",
+    }
 
     return [
         {
             "id": method,
-            "label": (
-                "Cash on Delivery"
-                if method == "cod"
-                else "UPI"
+            "label": labels.get(
+                method,
+                method.replace("_", " ").title(),
             ),
-            "description": (
-                "Pay when your order is delivered."
-                if method == "cod"
-                else "Pay using UPI."
+            "description": descriptions.get(
+                method,
+                "",
             ),
         }
         for method in sorted(
@@ -355,19 +329,15 @@ def get_available_payment_methods() -> list[dict[str, str]]:
 
 
 # =========================================================
-# Quantity Normalization
+# Quantity
 # =========================================================
 
-
-def _normalize_quantity(
-    quantity: Any,
-) -> int:
+def _normalize_quantity(quantity: Any) -> int:
     """
-    Convert extracted quantity into a positive integer.
+    Validate extracted quantity.
 
-    Natural-language understanding belongs to the AI layer.
-
-    This service only validates the resulting value.
+    Natural-language understanding belongs to AI.
+    This service validates the resulting value.
     """
 
     if isinstance(quantity, bool):
@@ -377,11 +347,7 @@ def _normalize_quantity(
 
     try:
         normalized = int(quantity)
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         raise ValueError(
             "Quantity must be a positive integer."
         )
@@ -395,16 +361,11 @@ def _normalize_quantity(
 
 
 # =========================================================
-# Product Name Normalization
+# Product Name
 # =========================================================
 
-
-def _normalize_product_name(
-    product_name: Any,
-) -> str:
-    """
-    Normalize product name for database lookup.
-    """
+def _normalize_product_name(product_name: Any) -> str:
+    """Normalize product name for database lookup."""
 
     if product_name is None:
         raise ValueError(
@@ -429,14 +390,13 @@ def _normalize_product_name(
 # Resolve Product
 # =========================================================
 
-
 def _resolve_product(
     db: Session,
     product_id: Any = None,
     product_name: Any = None,
 ) -> Product:
     """
-    Resolve product from the database.
+    Resolve product from database.
 
     Priority:
 
@@ -444,7 +404,7 @@ def _resolve_product(
         2. exact product name
         3. unique partial product name
 
-    Price is ALWAYS read from Product.price.
+    Price always comes from Product.price.
     """
 
     # -----------------------------------------------------
@@ -452,16 +412,9 @@ def _resolve_product(
     # -----------------------------------------------------
 
     if product_id is not None:
-
         try:
-            normalized_id = int(
-                product_id
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
+            normalized_id = int(product_id)
+        except (TypeError, ValueError):
             raise ValueError(
                 "Product ID must be a valid integer."
             )
@@ -490,10 +443,8 @@ def _resolve_product(
     # Product Name
     # -----------------------------------------------------
 
-    normalized_name = (
-        _normalize_product_name(
-            product_name
-        )
+    normalized_name = _normalize_product_name(
+        product_name
     )
 
     # Exact case-insensitive match
@@ -524,7 +475,6 @@ def _resolve_product(
         return partial_matches[0]
 
     if len(partial_matches) > 1:
-
         names = [
             product.name
             for product in partial_matches[:5]
@@ -544,16 +494,11 @@ def _resolve_product(
 
 
 # =========================================================
-# Decimal Conversion
+# Decimal
 # =========================================================
 
-
-def _to_decimal(
-    value: Any,
-) -> Decimal:
-    """
-    Convert monetary value to Decimal.
-    """
+def _to_decimal(value: Any) -> Decimal:
+    """Convert monetary value to Decimal."""
 
     if value is None:
         raise ValueError(
@@ -561,10 +506,7 @@ def _to_decimal(
         )
 
     try:
-        return Decimal(
-            str(value)
-        )
-
+        return Decimal(str(value))
     except (
         InvalidOperation,
         ValueError,
@@ -575,21 +517,12 @@ def _to_decimal(
         )
 
 
-# =========================================================
-# Money Conversion
-# =========================================================
-
-
 def _money(
     value: Decimal | float | int,
 ) -> float:
-    """
-    Convert Decimal into JSON-friendly float.
-    """
+    """Convert Decimal to JSON-friendly float."""
 
-    decimal_value = _to_decimal(
-        value
-    )
+    decimal_value = _to_decimal(value)
 
     return float(
         decimal_value.quantize(
@@ -602,29 +535,20 @@ def _money(
 # Existing Checkout Lookup
 # =========================================================
 
-
 def _get_existing_checkout_order(
     db: Session,
     user_id: int,
     checkout_id: str,
 ) -> Order | None:
     """
-    Find an order already created for this checkout.
+    Find an already-created order for this checkout.
 
-    This is the core idempotency lookup.
+    This is the first layer of idempotency.
 
     IMPORTANT:
-
-    The Order model must contain:
-
-        checkout_id
-
-    and that field should have a database index/unique
-    constraint where possible.
+    Order.checkout_id must exist in the model and database.
     """
 
-    # Explicitly require the model field so that a missing
-    # migration cannot silently disable idempotency.
     if not hasattr(
         Order,
         "checkout_id",
@@ -632,8 +556,8 @@ def _get_existing_checkout_order(
         raise RuntimeError(
             "Order model is missing the "
             "'checkout_id' field. "
-            "Add checkout_id to backend.models.order.Order "
-            "before using idempotent order creation."
+            "Add checkout_id to Order and "
+            "apply the database schema change."
         )
 
     return (
@@ -650,7 +574,6 @@ def _get_existing_checkout_order(
 # Build Order Items
 # =========================================================
 
-
 def _build_order_items(
     db: Session,
     items: list[dict[str, Any]],
@@ -660,34 +583,23 @@ def _build_order_items(
     list[dict[str, Any]],
 ]:
     """
-    Resolve products, validate stock, calculate line totals,
-    and reserve inventory.
-
-    Prices come exclusively from the database.
-
-    Returns:
-
-        order_items
-        subtotal
-        bill_items
+    Resolve products, validate stock, reserve inventory,
+    calculate line totals and construct bill items.
     """
+
+    if not isinstance(items, list):
+        raise ValueError(
+            "Order items must be provided as a list."
+        )
 
     if not items:
         raise ValueError(
             "At least one order item is required."
         )
 
-    if not isinstance(
-        items,
-        list,
-    ):
-        raise ValueError(
-            "Order items must be provided as a list."
-        )
-
-    # =====================================================
+    # -----------------------------------------------------
     # Aggregate duplicate products
-    # =====================================================
+    # -----------------------------------------------------
 
     aggregated_items: dict[
         tuple[str, Any],
@@ -695,11 +607,7 @@ def _build_order_items(
     ] = {}
 
     for entry in items:
-
-        if not isinstance(
-            entry,
-            dict,
-        ):
+        if not isinstance(entry, dict):
             raise ValueError(
                 "Each order item must be an object."
             )
@@ -717,14 +625,12 @@ def _build_order_items(
         )
 
         if product_id is not None:
-
             key = (
                 "id",
                 product_id,
             )
 
         elif product_name is not None:
-
             key = (
                 "name",
                 _normalize_product_name(
@@ -746,9 +652,9 @@ def _build_order_items(
             + quantity
         )
 
-    # =====================================================
-    # Resolve / validate products
-    # =====================================================
+    # -----------------------------------------------------
+    # Resolve products
+    # -----------------------------------------------------
 
     order_items: list[OrderItem] = []
 
@@ -766,14 +672,11 @@ def _build_order_items(
         identifier_type, value = identifier
 
         if identifier_type == "id":
-
             product = _resolve_product(
                 db=db,
                 product_id=value,
             )
-
         else:
-
             product = _resolve_product(
                 db=db,
                 product_name=value,
@@ -811,23 +714,6 @@ def _build_order_items(
         # -------------------------------------------------
         # Atomic stock reservation
         # -------------------------------------------------
-        #
-        # Instead of:
-        #
-        #     read stock
-        #     calculate
-        #     write stock
-        #
-        # we perform:
-        #
-        #     stock = stock - quantity
-        #
-        # only when enough stock exists.
-        #
-        # This reduces race-condition risk when multiple
-        # orders are being created concurrently.
-        #
-        # -------------------------------------------------
 
         stock_update = (
             update(Product)
@@ -846,8 +732,6 @@ def _build_order_items(
         )
 
         if result.rowcount != 1:
-
-            # Refresh product state for an accurate error.
             db.refresh(product)
 
             current_stock = (
@@ -857,7 +741,6 @@ def _build_order_items(
             )
 
             if current_stock < quantity:
-
                 raise ValueError(
                     f"Insufficient stock for "
                     f"'{product.name}'. "
@@ -939,7 +822,6 @@ def _build_order_items(
 # Calculate Bill
 # =========================================================
 
-
 def _calculate_bill(
     bill_items: list[dict[str, Any]],
     subtotal: Decimal,
@@ -948,9 +830,12 @@ def _calculate_bill(
     """
     Calculate authoritative backend billing.
 
-    MVP delivery policy is currently free.
+    Current MVP:
+        delivery = 0
+        discount = 0
+        tax = 0
 
-    All values returned here are backend-generated.
+    These values belong to backend business logic.
     """
 
     delivery_charge = (
@@ -972,7 +857,9 @@ def _calculate_bill(
 
     return {
         "items": bill_items,
-        "subtotal": _money(subtotal),
+        "subtotal": _money(
+            subtotal
+        ),
         "delivery_charge": _money(
             delivery_charge
         ),
@@ -991,9 +878,8 @@ def _calculate_bill(
 
 
 # =========================================================
-# Create Payment Record
+# Create Payment
 # =========================================================
-
 
 def _create_payment_record(
     db: Session,
@@ -1002,9 +888,9 @@ def _create_payment_record(
     amount: float,
 ) -> Payment:
     """
-    Create the MVP payment record.
+    Create MVP payment record.
 
-    This does not process an external payment gateway.
+    External payment processing is outside this function.
     """
 
     payment = Payment(
@@ -1015,26 +901,22 @@ def _create_payment_record(
         amount=amount,
     )
 
-    db.add(
-        payment
-    )
+    db.add(payment)
 
     return payment
 
 
 # =========================================================
-# Attach Bill To Order
+# Attach Bill
 # =========================================================
-
 
 def _attach_bill(
     order: Order,
     bill: dict[str, Any],
 ) -> None:
     """
-    Attach transient billing information for the tool layer.
-
-    Billing remains authoritative in the backend result.
+    Attach authoritative billing information to the
+    transient order object for the tool layer.
     """
 
     order._buyqk_bill = {
@@ -1075,7 +957,6 @@ def _attach_bill(
 # Create Order
 # =========================================================
 
-
 def create_order(
     db: Session,
     user_id: int,
@@ -1089,29 +970,23 @@ def create_order(
 
     Idempotency contract:
 
-        Same user_id + same checkout_id
-        --------------------------------
-                 ↓
-        return existing order
+        user_id + checkout_id
+                |
+                v
+        Existing order?
+          /          \
+        yes           no
+         |             |
+         v             v
+      return       create order
 
-    instead of creating another order.
+    The database UNIQUE constraint on checkout_id
+    provides the second line of defense against
+    concurrent requests.
 
-    This is what prevents:
-
-        user:
-            "Thank you"
-
-    from accidentally generating another order when the
-    graph incorrectly reaches create_order again.
-
-    The service is intentionally defensive:
-
-        - checkout_id is required
-        - existing checkout is checked
-        - order creation is transactional
-        - inventory is reserved inside the transaction
-        - payment is created inside the transaction
-        - rollback restores the transaction state
+    This prevents duplicate orders when, for example,
+    the same checkout request is submitted twice or
+    two requests race each other.
     """
 
     # =====================================================
@@ -1131,7 +1006,7 @@ def create_order(
     )
 
     # =====================================================
-    # Verify model support
+    # Verify checkout_id support
     # =====================================================
 
     if not hasattr(
@@ -1140,12 +1015,12 @@ def create_order(
     ):
         raise RuntimeError(
             "Order model is missing checkout_id. "
-            "Add checkout_id to Order and create/apply "
-            "the corresponding database migration."
+            "Add checkout_id to Order and apply "
+            "the database schema change."
         )
 
     # =====================================================
-    # Idempotency check
+    # First idempotency check
     # =====================================================
 
     existing_order = (
@@ -1157,12 +1032,9 @@ def create_order(
     )
 
     if existing_order is not None:
-
-        existing_bill = (
-            build_order_bill(
-                db=db,
-                order=existing_order,
-            )
+        existing_bill = build_order_bill(
+            db=db,
+            order=existing_order,
         )
 
         _attach_bill(
@@ -1197,22 +1069,8 @@ def create_order(
     # =====================================================
     # Transaction
     # =====================================================
-    #
-    # Everything below must succeed together.
-    #
-    # If anything fails:
-    #
-    #     stock update
-    #     order
-    #     order items
-    #     payment
-    #
-    # are rolled back together.
-    #
-    # =====================================================
 
     try:
-
         # -------------------------------------------------
         # Build items / reserve inventory
         # -------------------------------------------------
@@ -1259,12 +1117,10 @@ def create_order(
             order_items
         )
 
-        db.add(
-            order
-        )
+        db.add(order)
 
         # -------------------------------------------------
-        # Get generated order ID
+        # Generate order ID
         # -------------------------------------------------
 
         db.flush()
@@ -1283,22 +1139,67 @@ def create_order(
         )
 
         # -------------------------------------------------
-        # Commit entire transaction
+        # Commit
         # -------------------------------------------------
 
         db.commit()
 
+    except IntegrityError:
+        """
+        A concurrent request may have created the same
+        checkout between our initial lookup and INSERT.
+
+        IMPORTANT:
+
+        Do NOT blindly swallow IntegrityError.
+
+        First rollback the failed transaction.
+        Then check whether the checkout now exists.
+
+        If it exists, this was an idempotency race.
+
+        If it does not exist, the IntegrityError came from
+        some other database constraint and must propagate.
+        """
+
+        db.rollback()
+
+        existing_order = (
+            _get_existing_checkout_order(
+                db=db,
+                user_id=user_id,
+                checkout_id=checkout_id,
+            )
+        )
+
+        if existing_order is None:
+            raise
+
+        existing_bill = build_order_bill(
+            db=db,
+            order=existing_order,
+        )
+
+        _attach_bill(
+            order=existing_order,
+            bill=existing_bill,
+        )
+
+        existing_order._buyqk_idempotent = True
+
+        return existing_order
+
     except Exception:
+        # Any validation/business/database error means the
+        # complete transaction must be rolled back.
         db.rollback()
         raise
 
     # =====================================================
-    # Refresh
+    # Refresh authoritative order
     # =====================================================
 
-    db.refresh(
-        order
-    )
+    db.refresh(order)
 
     # =====================================================
     # Attach authoritative bill
@@ -1320,36 +1221,29 @@ def create_order(
 # Get Order
 # =========================================================
 
-
 def get_order(
     db: Session,
     order_id: int,
 ) -> Order | None:
-    """
-    Return a single order by ID.
-    """
+    """Return a single order by ID."""
 
     if order_id is None:
         return None
 
     try:
-        order_id = int(
+        normalized_id = int(
             order_id
         )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return None
 
-    if order_id <= 0:
+    if normalized_id <= 0:
         return None
 
     return (
         db.query(Order)
         .filter(
-            Order.id == order_id
+            Order.id == normalized_id
         )
         .first()
     )
@@ -1359,29 +1253,20 @@ def get_order(
 # Get User Orders
 # =========================================================
 
-
 def get_user_orders(
     db: Session,
     user_id: int,
     limit: int = 20,
 ) -> list[Order]:
-    """
-    Return recent orders belonging to a user.
-    """
+    """Return recent orders belonging to a user."""
 
     user_id = _normalize_user_id(
         user_id
     )
 
     try:
-        limit = int(
-            limit
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+        limit = int(limit)
+    except (TypeError, ValueError):
         limit = 20
 
     limit = max(
@@ -1409,7 +1294,6 @@ def get_user_orders(
 # Build Bill From Existing Order
 # =========================================================
 
-
 def build_order_bill(
     db: Session,
     order: Order,
@@ -1417,12 +1301,11 @@ def build_order_bill(
     """
     Build authoritative bill from an existing order.
 
-    IMPORTANT:
+    Historical OrderItem.unit_price and total_price
+    are used.
 
-    Historical OrderItem.unit_price is used.
-
-    We do NOT read current Product.price because the product
-    price may have changed after the order was created.
+    Current Product.price is NOT used for historical
+    billing because the product price may have changed.
     """
 
     if order is None:
@@ -1525,6 +1408,11 @@ def build_order_bill(
 
     return {
         "order_id": order.id,
+        "checkout_id": getattr(
+            order,
+            "checkout_id",
+            None,
+        ),
         "items": bill_items,
         "subtotal": _money(
             subtotal
@@ -1550,14 +1438,13 @@ def build_order_bill(
 # Get Order Bill
 # =========================================================
 
-
 def get_order_bill(
     db: Session,
     order_id: int,
     user_id: int,
 ) -> dict[str, Any]:
     """
-    Safely retrieve an order bill for the authenticated user.
+    Safely retrieve an order bill for the user.
     """
 
     user_id = _normalize_user_id(
@@ -1590,7 +1477,6 @@ def get_order_bill(
 # Cancel Order
 # =========================================================
 
-
 def cancel_order(
     db: Session,
     order_id: int,
@@ -1602,17 +1488,17 @@ def cancel_order(
     Flow:
 
         validate order
-            ↓
+             ↓
         validate ownership
-            ↓
+             ↓
         validate status
-            ↓
+             ↓
         restore inventory
-            ↓
+             ↓
         update order
-            ↓
+             ↓
         update payment
-            ↓
+             ↓
         commit
     """
 
@@ -1626,14 +1512,8 @@ def cancel_order(
         )
 
     try:
-        order_id = int(
-            order_id
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+        order_id = int(order_id)
+    except (TypeError, ValueError):
         raise ValueError(
             "Invalid order ID."
         )
@@ -1659,6 +1539,7 @@ def cancel_order(
             "this order."
         )
 
+    # Already cancelled = idempotent cancellation
     if order.status == "cancelled":
         return order
 
@@ -1676,10 +1557,9 @@ def cancel_order(
         )
 
     try:
-
-        # =================================================
+        # -------------------------------------------------
         # Restore inventory
-        # =================================================
+        # -------------------------------------------------
 
         for item in order.items:
 
@@ -1707,23 +1587,17 @@ def cancel_order(
                 + int(item.quantity)
             )
 
-        # =================================================
+        # -------------------------------------------------
         # Update order
-        # =================================================
+        # -------------------------------------------------
 
         order.status = "cancelled"
 
-        if hasattr(
-            order,
-            "payment_status",
-        ):
-            order.payment_status = (
-                "cancelled"
-            )
+        order.payment_status = "cancelled"
 
-        # =================================================
+        # -------------------------------------------------
         # Update payment
-        # =================================================
+        # -------------------------------------------------
 
         payment = (
             db.query(Payment)
@@ -1743,25 +1617,21 @@ def cancel_order(
                 payment.payment_status = (
                     "refunded"
                 )
-
             else:
                 payment.payment_status = (
                     "cancelled"
                 )
 
-        # =================================================
+        # -------------------------------------------------
         # Commit
-        # =================================================
+        # -------------------------------------------------
 
         db.commit()
 
     except Exception:
-
         db.rollback()
         raise
 
-    db.refresh(
-        order
-    )
+    db.refresh(order)
 
     return order
