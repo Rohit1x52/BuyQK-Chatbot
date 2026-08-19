@@ -10,6 +10,7 @@
 // - Maintain session ID
 // - Maintain user ID
 // - Maintain authoritative frontend checkout representation
+// - Maintain authoritative frontend cart representation
 // - Call the typed chat API
 // - Clear/reset conversation
 //
@@ -17,16 +18,19 @@
 //
 // The backend remains authoritative for:
 //
+// - cart state
+// - cart quantities
+// - product resolution
+// - product price
+// - stock
+// - product availability
 // - checkout status
 // - order creation
 // - order ID
-// - product resolution
-// - quantity accepted by backend
 // - address selection
 // - payment method
 // - billing
 // - prices
-// - stock
 // - totals
 //
 // Zustand is only a frontend representation of backend state.
@@ -34,7 +38,6 @@
 // UI components should use this store instead of calling the
 // FastAPI API directly.
 // ============================================================
-
 
 import { create } from "zustand";
 
@@ -44,6 +47,9 @@ import {
 
 import type {
   Bill,
+  Cart,
+  CartItem,
+  CartSummary,
   ChatMessage,
   ChatMetadata,
   ChatResponse,
@@ -78,6 +84,15 @@ interface ChatStore {
    * This is populated only from backend metadata.
    */
   checkout: CheckoutState | null;
+
+  /**
+   * Current authoritative cart representation.
+   *
+   * This is populated only from backend responses.
+   *
+   * The frontend must never calculate or invent cart state.
+   */
+  cart: Cart | null;
 
 
   // ----------------------------------------------------------
@@ -160,7 +175,7 @@ const INITIAL_USER_ID: number | null = null;
 // - tax
 // - grand total
 //
-// It only validates/preserves the structured values returned
+// It only validates/preserves structured values returned
 // by the backend.
 // ============================================================
 
@@ -225,6 +240,199 @@ function normalizePurchaseSummary(
 
 
 // ============================================================
+// Cart Item Normalization
+// ============================================================
+//
+// The backend Cart Service serializes each cart item with:
+//
+// - id
+// - product_id
+// - product_name
+// - quantity
+// - unit_price
+// - line_total
+// - stock
+// - is_available
+//
+// We validate the required fields here.
+//
+// We do NOT calculate line_total.
+// ============================================================
+
+function normalizeCartItem(
+  item: unknown,
+): CartItem | null {
+
+  if (
+    !item ||
+    typeof item !== "object" ||
+    Array.isArray(item)
+  ) {
+    return null;
+  }
+
+  const value =
+    item as Record<string, unknown>;
+
+  if (
+    typeof value.id !== "number" ||
+    typeof value.product_id !== "number" ||
+    typeof value.product_name !== "string" ||
+    typeof value.quantity !== "number" ||
+    typeof value.unit_price !== "number" ||
+    typeof value.line_total !== "number"
+  ) {
+    return null;
+  }
+
+  return value as unknown as CartItem;
+}
+
+
+// ============================================================
+// Cart Summary Normalization
+// ============================================================
+//
+// The backend is responsible for calculating these values.
+//
+// The frontend only validates the shape.
+// ============================================================
+
+function normalizeCartSummary(
+  summary: unknown,
+): CartSummary | null {
+
+  if (
+    !summary ||
+    typeof summary !== "object" ||
+    Array.isArray(summary)
+  ) {
+    return null;
+  }
+
+  const value =
+    summary as Record<string, unknown>;
+
+  if (
+    typeof value.item_count !== "number" ||
+    typeof value.total_quantity !== "number" ||
+    typeof value.subtotal !== "number" ||
+    typeof value.total !== "number" ||
+    typeof value.currency !== "string"
+  ) {
+    return null;
+  }
+
+  if (
+    value.delivery_charge !== null &&
+    typeof value.delivery_charge !== "number"
+  ) {
+    return null;
+  }
+
+  if (
+    value.discount !== null &&
+    typeof value.discount !== "number"
+  ) {
+    return null;
+  }
+
+  if (
+    value.tax !== null &&
+    typeof value.tax !== "number"
+  ) {
+    return null;
+  }
+
+  return value as unknown as CartSummary;
+}
+
+
+// ============================================================
+// Cart Normalization
+// ============================================================
+//
+// IMPORTANT:
+//
+// This function only accepts authoritative backend cart data.
+//
+// It does NOT:
+//
+// - calculate totals
+// - calculate quantities
+// - create cart IDs
+// - modify items
+// - determine stock
+// - determine availability
+// ============================================================
+
+function normalizeCart(
+  cart: unknown,
+): Cart | null {
+
+  if (
+    !cart ||
+    typeof cart !== "object" ||
+    Array.isArray(cart)
+  ) {
+    return null;
+  }
+
+  const value =
+    cart as Record<string, unknown>;
+
+  if (
+    typeof value.cart_id !== "number" ||
+    typeof value.user_id !== "number" ||
+    typeof value.status !== "string" ||
+    !Array.isArray(value.items)
+  ) {
+    return null;
+  }
+
+  const items: CartItem[] = [];
+
+  for (const item of value.items) {
+
+    const normalizedItem =
+      normalizeCartItem(item);
+
+    if (!normalizedItem) {
+      return null;
+    }
+
+    items.push(normalizedItem);
+  }
+
+  const summary =
+    normalizeCartSummary(
+      value.summary
+    );
+
+  if (!summary) {
+    return null;
+  }
+
+  return {
+    ...value,
+
+    cart_id:
+      value.cart_id,
+
+    user_id:
+      value.user_id,
+
+    status:
+      value.status,
+
+    items,
+
+    summary,
+  } as Cart;
+}
+
+
+// ============================================================
 // Checkout State Normalization
 // ============================================================
 //
@@ -266,6 +474,7 @@ function normalizeCheckoutState(
       );
 
     return {
+
       checkout_id:
         backendCheckout.checkout_id ??
         metadata.checkout_id ??
@@ -289,6 +498,17 @@ function normalizeCheckoutState(
         backendCheckout.order_id ??
         metadata.order_id ??
         previous?.order_id ??
+        null,
+
+      /**
+       * Cart associated with this checkout.
+       *
+       * Backend remains authoritative.
+       */
+      cart_id:
+        backendCheckout.cart_id ??
+        metadata.cart_id ??
+        previous?.cart_id ??
         null,
 
       product_id:
@@ -338,6 +558,7 @@ function normalizeCheckoutState(
     metadata.checkout_status !== undefined ||
     metadata.order_created !== undefined ||
     metadata.order_id !== undefined ||
+    metadata.cart_id !== undefined ||
     metadata.bill !== undefined ||
     metadata.payment_method !== undefined;
 
@@ -347,6 +568,7 @@ function normalizeCheckoutState(
 
 
   return {
+
     checkout_id:
       metadata.checkout_id ??
       previous?.checkout_id ??
@@ -365,6 +587,11 @@ function normalizeCheckoutState(
     order_id:
       metadata.order_id ??
       previous?.order_id ??
+      null,
+
+    cart_id:
+      metadata.cart_id ??
+      previous?.cart_id ??
       null,
 
     product_id:
@@ -465,6 +692,33 @@ function normalizeResponseMetadata(
   }
 
 
+  // ----------------------------------------------------------
+  // Normalize cart
+  // ----------------------------------------------------------
+  //
+  // Cart metadata is optional.
+  //
+  // If invalid, we do not replace the existing cart.
+  //
+  // The actual preservation logic is handled by
+  // applyBackendState().
+  // ----------------------------------------------------------
+
+  if (metadata.cart !== undefined) {
+
+    const cart =
+      normalizeCart(
+        metadata.cart,
+      );
+
+    if (cart) {
+      metadata.cart = cart;
+    } else {
+      delete metadata.cart;
+    }
+  }
+
+
   return metadata;
 }
 
@@ -478,9 +732,12 @@ function createAssistantMessage(
 ): ChatMessage {
 
   return {
-    id: createMessageId(),
 
-    role: "assistant",
+    id:
+      createMessageId(),
+
+    role:
+      "assistant",
 
     content:
       response.response,
@@ -497,7 +754,7 @@ function createAssistantMessage(
 
 
 // ============================================================
-// Apply Backend Checkout State
+// Apply Backend Checkout + Cart State
 // ============================================================
 //
 // Centralized state update.
@@ -506,9 +763,24 @@ function createAssistantMessage(
 // function.
 //
 // No frontend business decision is made here.
+//
+// The important rule is:
+//
+//     response contains cart
+//         ↓
+//     validate cart
+//         ↓
+//     store cart
+//
+// If the response does not contain cart:
+//
+//     keep existing cart
+//
+// This prevents unrelated chat responses from accidentally
+// deleting the user's current cart.
 // ============================================================
 
-function applyBackendCheckoutState(
+function applyBackendState(
   set: (
     updater:
       | Partial<ChatStore>
@@ -522,13 +794,43 @@ function applyBackendCheckoutState(
       response,
     );
 
-  set((state) => ({
-    checkout:
-      normalizeCheckoutState(
-        metadata,
-        state.checkout,
-      ),
-  }));
+  set((state) => {
+
+    let nextCart =
+      state.cart;
+
+    // --------------------------------------------------------
+    // Only replace cart when backend actually returned one.
+    // --------------------------------------------------------
+
+    if (
+      metadata &&
+      metadata.cart !== undefined
+    ) {
+
+      const normalizedCart =
+        normalizeCart(
+          metadata.cart,
+        );
+
+      if (normalizedCart) {
+        nextCart =
+          normalizedCart;
+      }
+    }
+
+    return {
+
+      checkout:
+        normalizeCheckoutState(
+          metadata,
+          state.checkout,
+        ),
+
+      cart:
+        nextCart,
+    };
+  });
 }
 
 
@@ -558,6 +860,13 @@ export const useChatStore =
     checkout:
       null,
 
+    /**
+     * No cart exists in the frontend until the backend
+     * provides authoritative cart state.
+     */
+    cart:
+      null,
+
 
     // ========================================================
     // Set User ID
@@ -566,6 +875,19 @@ export const useChatStore =
     setUserId: (
       userId: number
     ) => {
+
+      if (
+        !Number.isInteger(userId) ||
+        userId <= 0
+      ) {
+
+        set({
+          error:
+            "Invalid user ID.",
+        });
+
+        return;
+      }
 
       set({
         userId,
@@ -613,9 +935,12 @@ export const useChatStore =
       // ------------------------------------------------------
 
       const userMessage: ChatMessage = {
-        id: createMessageId(),
 
-        role: "user",
+        id:
+          createMessageId(),
+
+        role:
+          "user",
 
         content:
           trimmedMessage,
@@ -624,15 +949,19 @@ export const useChatStore =
           new Date().toISOString(),
       };
 
+
       set((state) => ({
+
         messages: [
           ...state.messages,
           userMessage,
         ],
 
-        isLoading: true,
+        isLoading:
+          true,
 
-        error: null,
+        error:
+          null,
       }));
 
 
@@ -644,6 +973,7 @@ export const useChatStore =
 
         const response =
           await sendChatMessage({
+
             message:
               trimmedMessage,
 
@@ -670,22 +1000,33 @@ export const useChatStore =
         // ----------------------------------------------------
 
         set((state) => ({
+
           messages: [
             ...state.messages,
             assistantMessage,
           ],
 
-          isLoading: false,
+          isLoading:
+            false,
 
-          error: null,
+          error:
+            null,
         }));
 
 
         // ----------------------------------------------------
-        // Update authoritative checkout state
+        // Update authoritative backend state
+        // ----------------------------------------------------
+        //
+        // This includes:
+        //
+        // - checkout
+        // - cart
+        //
+        // The frontend does not calculate either.
         // ----------------------------------------------------
 
-        applyBackendCheckoutState(
+        applyBackendState(
           set,
           response,
         );
@@ -698,8 +1039,11 @@ export const useChatStore =
             ? error.message
             : "Something went wrong while contacting BuyQK AI.";
 
+
         set({
-          isLoading: false,
+
+          isLoading:
+            false,
 
           error:
             errorMessage,
@@ -720,6 +1064,7 @@ export const useChatStore =
         return false;
       }
 
+
       if (
         !Number.isInteger(addressId) ||
         addressId <= 0
@@ -739,6 +1084,7 @@ export const useChatStore =
         userId,
       } = get();
 
+
       if (userId === null) {
 
         set({
@@ -751,9 +1097,12 @@ export const useChatStore =
 
 
       const userMessage: ChatMessage = {
-        id: createMessageId(),
 
-        role: "user",
+        id:
+          createMessageId(),
+
+        role:
+          "user",
 
         content:
           "Use the selected delivery address.",
@@ -764,14 +1113,17 @@ export const useChatStore =
 
 
       set((state) => ({
+
         messages: [
           ...state.messages,
           userMessage,
         ],
 
-        isLoading: true,
+        isLoading:
+          true,
 
-        error: null,
+        error:
+          null,
       }));
 
 
@@ -779,6 +1131,7 @@ export const useChatStore =
 
         const response =
           await sendChatMessage({
+
             message:
               "Use the selected delivery address.",
 
@@ -800,14 +1153,17 @@ export const useChatStore =
 
 
         set((state) => ({
+
           messages: [
             ...state.messages,
             assistantMessage,
           ],
 
-          isLoading: false,
+          isLoading:
+            false,
 
-          error: null,
+          error:
+            null,
         }));
 
 
@@ -815,11 +1171,13 @@ export const useChatStore =
         // Backend remains authoritative.
         //
         // The selected address is NOT directly written into
-        // checkout here. It is accepted only through the
-        // backend response.
+        // checkout here.
+        //
+        // Cart is also updated only if the backend returns
+        // authoritative cart metadata.
         // ----------------------------------------------------
 
-        applyBackendCheckoutState(
+        applyBackendState(
           set,
           response,
         );
@@ -835,12 +1193,16 @@ export const useChatStore =
             ? error.message
             : "Something went wrong while contacting BuyQK AI.";
 
+
         set({
-          isLoading: false,
+
+          isLoading:
+            false,
 
           error:
             errorMessage,
         });
+
 
         return false;
       }
@@ -863,6 +1225,7 @@ export const useChatStore =
       const normalizedMethod =
         methodId.trim();
 
+
       if (!normalizedMethod) {
 
         set({
@@ -879,6 +1242,7 @@ export const useChatStore =
         userId,
       } = get();
 
+
       if (userId === null) {
 
         set({
@@ -891,9 +1255,12 @@ export const useChatStore =
 
 
       const userMessage: ChatMessage = {
-        id: createMessageId(),
 
-        role: "user",
+        id:
+          createMessageId(),
+
+        role:
+          "user",
 
         // Do not expose assumptions about the method.
         // The selected ID comes from backend-provided UI
@@ -907,14 +1274,17 @@ export const useChatStore =
 
 
       set((state) => ({
+
         messages: [
           ...state.messages,
           userMessage,
         ],
 
-        isLoading: true,
+        isLoading:
+          true,
 
-        error: null,
+        error:
+          null,
       }));
 
 
@@ -922,6 +1292,7 @@ export const useChatStore =
 
         const response =
           await sendChatMessage({
+
             message:
               "Use the selected payment method.",
 
@@ -943,14 +1314,17 @@ export const useChatStore =
 
 
         set((state) => ({
+
           messages: [
             ...state.messages,
             assistantMessage,
           ],
 
-          isLoading: false,
+          isLoading:
+            false,
 
-          error: null,
+          error:
+            null,
         }));
 
 
@@ -960,9 +1334,11 @@ export const useChatStore =
         // The backend decides whether the supplied method is
         // valid and what payment method is actually associated
         // with the checkout/order.
+        //
+        // Cart is likewise updated only from backend metadata.
         // ----------------------------------------------------
 
-        applyBackendCheckoutState(
+        applyBackendState(
           set,
           response,
         );
@@ -978,12 +1354,16 @@ export const useChatStore =
             ? error.message
             : "Something went wrong while contacting BuyQK AI.";
 
+
         set({
-          isLoading: false,
+
+          isLoading:
+            false,
 
           error:
             errorMessage,
         });
+
 
         return false;
       }
@@ -993,21 +1373,46 @@ export const useChatStore =
     // ========================================================
     // Clear Chat
     // ========================================================
+    //
+    // A new session means a new frontend conversation state.
+    //
+    // Therefore:
+    //
+    // messages  -> reset
+    // sessionId -> regenerate
+    // checkout  -> reset
+    // cart      -> reset
+    //
+    // The backend cart itself is NOT deleted here.
+    //
+    // This is important:
+    //
+    // `clearChat()` only clears frontend conversation state.
+    //
+    // Actual cart deletion must happen through the dedicated
+    // Cart API.
+    // ========================================================
 
     clearChat: () => {
 
       set({
 
-        messages: [],
+        messages:
+          [],
 
-        isLoading: false,
+        isLoading:
+          false,
 
-        error: null,
+        error:
+          null,
 
         sessionId:
           createSessionId(),
 
         checkout:
+          null,
+
+        cart:
           null,
       });
     },
