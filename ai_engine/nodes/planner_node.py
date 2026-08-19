@@ -87,6 +87,14 @@ PLANNER_ACTIONS: set[str] = {
     "track_order",
     "cancel_order",
     "request_support",
+
+    # Phase 3 cart capabilities.
+    "add_to_cart",
+    "remove_from_cart",
+    "update_cart_item",
+    "clear_cart",
+    "show_cart",
+    "checkout_cart",
 }
 
 
@@ -314,6 +322,101 @@ def _normalize_action(
 
 
 # =========================================================
+# Phase 3: Cart Action → Planner Capability
+# =========================================================
+
+
+CART_ACTION_TO_CAPABILITY: dict[str, str] = {
+    "add_item": "add_to_cart",
+    "remove_item": "remove_from_cart",
+    "update_quantity": "update_cart_item",
+    "clear_cart": "clear_cart",
+    "show_cart": "show_cart",
+    "checkout": "checkout_cart",
+}
+
+
+def _cart_capability_from_state(
+    state: dict[str, Any],
+) -> str | None:
+    """Map explicit entity understanding to a cart capability."""
+
+    intent = str(
+        state.get("intent") or ""
+    ).strip().lower()
+
+    if intent != "cart":
+        return None
+
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    cart_action = entities.get("cart_action")
+
+    if not isinstance(cart_action, str):
+        cart_action = state.get("cart_action")
+
+    if not isinstance(cart_action, str):
+        return None
+
+    cart_action = (
+        cart_action.strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    return CART_ACTION_TO_CAPABILITY.get(cart_action)
+
+
+def _build_cart_arguments(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build safe arguments from already-understood state.
+
+    No database lookup, stock check, price calculation, or
+    cart mutation occurs here.
+    """
+
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    arguments: dict[str, Any] = {}
+
+    product_name = entities.get("product_name")
+    if product_name:
+        arguments["product_name"] = product_name
+
+    quantity = entities.get("quantity")
+    if quantity is not None:
+        try:
+            quantity = int(quantity)
+            if quantity > 0:
+                arguments["quantity"] = quantity
+        except (TypeError, ValueError):
+            pass
+
+    # Preserve only already-resolved backend values.
+    product_id = entities.get("product_id")
+    if product_id is not None:
+        try:
+            product_id = int(product_id)
+            if product_id > 0:
+                arguments["product_id"] = product_id
+        except (TypeError, ValueError):
+            pass
+
+    cart_id = state.get("cart_id")
+    if cart_id is not None:
+        arguments["cart_id"] = cart_id
+
+    return arguments
+
+
+# =========================================================
 # Utility: Normalize Planner Output
 # =========================================================
 
@@ -470,6 +573,22 @@ def _build_planner_prompt(
         [],
     )
 
+    cart_state = {
+        "cart_id": state.get("cart_id"),
+        "cart_status": state.get("cart_status"),
+        "cart_items": state.get("cart_items", []),
+        "cart_summary": state.get("cart_summary"),
+        "cart_action": (
+            entities.get("cart_action")
+            if isinstance(entities, dict)
+            else state.get("cart_action")
+        ),
+        "cart_checkout_ready": state.get(
+            "cart_checkout_ready",
+            False,
+        ),
+    }
+
     # -----------------------------------------------------
     # Authoritative checkout state
     # -----------------------------------------------------
@@ -519,6 +638,7 @@ def _build_planner_prompt(
         "entities": entities,
         "missing_fields": missing_fields,
         "checkout": checkout_state,
+        "cart": cart_state,
         "frontend_selection": frontend_state,
     }
 
@@ -596,7 +716,54 @@ track_order
 cancel_order
 request_support
 
+- request_support
+
+Phase 3 cart capabilities:
+
+- add_to_cart
+- remove_from_cart
+- update_cart_item
+- clear_cart
+- show_cart
+- checkout_cart
+
+CART PLANNING RULE:
+
+When intent is "cart", map cart_action as follows:
+
+add_item
+→ add_to_cart
+
+remove_item
+→ remove_from_cart
+
+update_quantity
+→ update_cart_item
+
+clear_cart
+→ clear_cart
+
+show_cart
+→ show_cart
+
+checkout
+→ checkout_cart
+
+For cart operations:
+- pass product_name only when already understood.
+- pass quantity only when already understood.
+- pass product_id only when already backend-resolved.
+- pass cart_id only when already present.
+- never invent product_id or cart_id.
+- never calculate prices, totals, stock, or discounts.
+- never execute the cart operation.
+- never claim that the cart was modified.
+
+If intent is "cart" but cart_action is missing or ambiguous,
+use ask_clarification.
+
 Return ONLY JSON.
+
 
 Required structure:
 
@@ -703,6 +870,69 @@ def planner_node(
     plan = _normalize_plan(
         raw_plan
     )
+
+    # -----------------------------------------------------
+    # Phase 3 cart capability enforcement
+    # -----------------------------------------------------
+    #
+    # Explicit cart understanding from entity_node takes
+    # precedence over a generic LLM planner action.
+    # This prevents cart requests from becoming checkout/order
+    # operations accidentally.
+    #
+    # No cart operation is executed here.
+    # -----------------------------------------------------
+
+    cart_capability = _cart_capability_from_state(
+        state
+    )
+
+    if cart_capability is not None:
+
+        llm_arguments = plan.get(
+            "arguments",
+            {},
+        )
+
+        if not isinstance(
+            llm_arguments,
+            dict,
+        ):
+            llm_arguments = {}
+
+        cart_arguments = _build_cart_arguments(
+            state
+        )
+
+        merged_arguments = dict(
+            llm_arguments
+        )
+
+        for key, value in cart_arguments.items():
+            merged_arguments[key] = value
+
+        plan["action"] = cart_capability
+        plan["tool_name"] = cart_capability
+        plan["arguments"] = merged_arguments
+        plan["reason"] = (
+            "Mapped explicit cart understanding to the "
+            "canonical cart capability."
+        )
+
+    elif (
+        str(state.get("intent") or "").strip().lower()
+        == "cart"
+    ):
+        plan["action"] = "ask_clarification"
+        plan["tool_name"] = "ask_clarification"
+        plan["arguments"] = {}
+        plan["missing_fields"] = [
+            "cart_action"
+        ]
+        plan["reason"] = (
+            "Cart intent was understood, but the requested "
+            "cart operation is ambiguous."
+        )
 
     # -----------------------------------------------------
     # Validate capability
@@ -819,6 +1049,16 @@ def planner_node(
     print(
         f"order_id        = "
         f"{state.get('order_id')!r}"
+    )
+
+    print(
+        f"cart_action     = "
+        f"{state.get('cart_action')!r}"
+    )
+
+    print(
+        f"cart_capability = "
+        f"{_cart_capability_from_state(state)!r}"
     )
 
     print("=" * 60)
