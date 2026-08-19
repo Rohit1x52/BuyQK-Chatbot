@@ -134,3 +134,9 @@ class Product(Base):
         "OrderItem",
         back_populates="product"
     )
+
+    ## relationship with cart items
+    cart_items = relationship(
+    "CartItem",
+    back_populates="product",
+    )
