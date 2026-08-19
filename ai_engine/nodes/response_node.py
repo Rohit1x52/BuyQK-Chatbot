@@ -2,40 +2,79 @@
 # BuyQK AI - Response Node
 # =========================================================
 #
-# Purpose:
-# Generate the final user-facing BuyQK response.
+# Phase 2
 #
-# Responsibilities:
-# - Enforce sequential checkout
-# - Generate natural language for general conversation
-# - Keep backend/tool results authoritative
-# - Generate frontend metadata
-# - Prevent stale address/payment UI
+# =========================================================
 #
-# Checkout:
+# ARCHITECTURE
 #
-# Product
-#    ↓
-# Quantity
-#    ↓
-# Address
-#    ↓
-# Payment
-#    ↓
-# Create Order
-#    ↓
-# Order ID
-#    ↓
-# Track confirmation
+#     User Message
+#          ↓
+#     Context Node
+#          ↓
+#     Entity Node
+#          ↓
+#     Planner Node
+#          ↓
+#     Policy Node
+#          ↓
+#     Decision Node
+#          ↓
+#     Tool Node
+#          ↓
+#     Response Node
 #
-# IMPORTANT:
+# =========================================================
 #
-# The response node controls PRESENTATION.
-# The graph controls WORKFLOW.
-# The backend controls TRANSACTIONAL TRUTH.
+# RESPONSIBILITY
 #
-# Checkout questions are deterministic.
-# The LLM is NOT allowed to decide checkout sequencing.
+# The Response Node is a PRESENTATION layer.
+#
+# It:
+#
+#   - interprets already-approved graph state
+#   - presents backend/tool results
+#   - generates natural language
+#   - generates frontend metadata
+#   - preserves authoritative transactional values
+#   - renders checkout UI metadata
+#
+# It does NOT:
+#
+#   - decide intent
+#   - select tools
+#   - enforce policy
+#   - choose checkout sequence
+#   - calculate prices
+#   - calculate taxes
+#   - calculate discounts
+#   - calculate delivery charges
+#   - create orders
+#   - modify backend state
+#   - invent transactional facts
+#
+# =========================================================
+#
+# SOURCE OF TRUTH
+#
+# Planner:
+#     decides WHAT should happen.
+#
+# Policy:
+#     decides WHETHER it is allowed.
+#
+# Decision:
+#     routes the approved action.
+#
+# Tool:
+#     executes the capability.
+#
+# Backend:
+#     owns transactional truth.
+#
+# Response:
+#     explains what happened.
+#
 # =========================================================
 
 
@@ -44,7 +83,10 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+)
 
 from ai_engine.graph.state import GraphState
 from ai_engine.llm.client import get_llm
@@ -61,10 +103,6 @@ llm = get_llm()
 # Constants
 # =========================================================
 
-# These are workflow field keys, not business values.
-# Product names, prices, payment methods, statuses, fees,
-# addresses, and billing values are always supplied dynamically
-# by the graph/backend/AI context.
 CHECKOUT_FIELDS = (
     "product_name",
     "quantity",
@@ -78,254 +116,308 @@ CHECKOUT_FIELDS = (
 # =========================================================
 
 
-def _has_value(value: Any) -> bool:
+def _has_value(
+    value: Any,
+) -> bool:
     """
     Return True when a value is actually present.
 
-    None and empty strings are missing.
-    Numeric zero is considered a real value.
+    None and empty strings are considered missing.
+
+    Numeric zero is considered present here because this helper
+    is only checking presence, not business validity.
     """
 
     if value is None:
         return False
 
-    if isinstance(value, str):
-        return bool(value.strip())
+    if isinstance(
+        value,
+        str,
+    ):
+        return bool(
+            value.strip()
+        )
 
     return True
 
 
-def _safe_int(value: Any) -> int | None:
+def _safe_int(
+    value: Any,
+) -> int | None:
     """
-    Safely convert a value to an integer.
+    Safely convert a value to integer.
     """
 
     if value is None:
         return None
 
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
+
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        return int(
+            value
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
         return None
 
 
 def _serialize_data(
-    data: Optional[dict[str, Any]],
+    data: Any,
 ) -> str:
     """
-    Safely serialize graph state for the LLM.
+    Safely serialize arbitrary graph state for the LLM.
+
+    Graph state can contain ORM objects or other values that are
+    not directly JSON serializable.
     """
 
-    if not data:
+    if data is None:
         return "{}"
 
     try:
+
         return json.dumps(
             data,
             default=str,
             ensure_ascii=False,
         )
+
     except Exception:
+
         return "{}"
 
 
-# =========================================================
-# Address Resolution
-# =========================================================
-
-
-def _get_selected_address_id(
+def _get_entities(
     state: GraphState,
-    entities: dict[str, Any],
-) -> int | None:
+) -> dict[str, Any]:
     """
-    Resolve the currently selected delivery address.
-
-    Priority:
-
-        1. Explicit frontend selected_address_id
-        2. entities.address_id
+    Return entity state safely.
     """
 
-    selected_address_id = _safe_int(
-        state.get("selected_address_id")
+    entities = state.get(
+        "entities",
+        {},
     )
 
-    if selected_address_id is not None:
-        return selected_address_id
+    if not isinstance(
+        entities,
+        dict,
+    ):
+        return {}
 
-    entity_address_id = _safe_int(
-        entities.get("address_id")
+    return dict(
+        entities
     )
 
-    if entity_address_id is not None:
-        return entity_address_id
 
-    return None
+def _get_tool_result(
+    state: GraphState,
+) -> dict[str, Any] | None:
+    """
+    Return tool result when it is a dictionary.
+    """
+
+    result = state.get(
+        "tool_result"
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return None
+
+    return result
 
 
 # =========================================================
-# Checkout State
+# Graph-Controlled Checkout State
+# =========================================================
+#
+# IMPORTANT:
+#
+# Phase 1 allowed Response Node to calculate checkout state.
+#
+# Phase 2 does NOT.
+#
+# Planner / policy / decision / graph orchestration is responsible
+# for determining workflow state.
+#
+# Response Node only consumes:
+#
+#     missing_fields
+#     next_missing
+#
+# supplied by the graph.
+#
 # =========================================================
 
 
-def _calculate_checkout_missing_fields(
+def _get_missing_fields(
     state: GraphState,
 ) -> list[str]:
     """
-    Calculate the real checkout state.
+    Read graph-produced missing fields.
 
-    NEVER trust stale state["missing_fields"] for order_create.
-
-    Required order:
-
-        product
-        quantity
-        address
-        payment
+    The Response Node does not recompute checkout requirements.
     """
 
-    entities = (
-        state.get("entities", {})
-        or {}
+    raw = state.get(
+        "missing_fields",
+        [],
     )
 
-    missing: list[str] = []
+    if not isinstance(
+        raw,
+        (list, tuple),
+    ):
+        return []
 
-    # -----------------------------------------------------
-    # Product
-    # -----------------------------------------------------
+    result: list[str] = []
 
-    product_name = entities.get(
-        "product_name"
-    )
+    for field in raw:
 
-    if not _has_value(product_name):
-        missing.append("product_name")
+        if not isinstance(
+            field,
+            str,
+        ):
+            continue
 
-    # -----------------------------------------------------
-    # Quantity
-    # -----------------------------------------------------
+        field = field.strip()
 
-    quantity = entities.get(
-        "quantity"
-    )
+        if not field:
+            continue
 
-    if not _has_value(quantity):
-        missing.append("quantity")
+        if field not in result:
+            result.append(
+                field
+            )
 
-    # -----------------------------------------------------
-    # Address
-    # -----------------------------------------------------
-    #
-    # IMPORTANT:
-    #
-    # address_text alone does NOT satisfy checkout.
-    #
-    # The user must either:
-    #
-    # - select a saved address
-    # - create a new saved address
-    #
-    # -----------------------------------------------------
-
-    selected_address_id = (
-        _get_selected_address_id(
-            state,
-            entities,
-        )
-    )
-
-    if selected_address_id is None:
-        missing.append(
-            "address_selection"
-        )
-
-    # -----------------------------------------------------
-    # Payment
-    # -----------------------------------------------------
-
-    payment_method = entities.get(
-        "payment_method"
-    )
-
-    if not _has_value(payment_method):
-        missing.append(
-            "payment_method"
-        )
-
-    return missing
+    return result
 
 
-def _get_next_missing_field(
+def _get_next_missing(
+    state: GraphState,
     missing_fields: list[str],
 ) -> str | None:
     """
-    Return exactly ONE checkout field.
+    Read graph-produced next_missing.
 
-    Priority is always:
+    For compatibility, if next_missing is absent, use the first
+    graph-provided missing field.
 
-        product
-        quantity
-        address
-        payment
+    This is NOT a workflow calculation.
+    It is only a compatibility fallback.
     """
 
-    for field in CHECKOUT_FIELDS:
+    next_missing = state.get(
+        "next_missing"
+    )
 
-        if field in missing_fields:
-            return field
+    if isinstance(
+        next_missing,
+        str,
+    ):
+
+        next_missing = next_missing.strip()
+
+        if next_missing:
+            return next_missing
+
+    if missing_fields:
+        return missing_fields[0]
 
     return None
 
 
-def _get_checkout_state(
+# =========================================================
+# Planner / Policy / Decision Context
+# =========================================================
+
+
+def _get_planner_context(
     state: GraphState,
-) -> tuple[list[str], str | None]:
+) -> dict[str, Any]:
     """
-    Calculate current checkout state.
+    Collect Phase-2 orchestration state.
 
-    For order_create:
-        derive from entities + selected address.
+    This information is supplied to the LLM as context only.
 
-    For other intents:
-        preserve graph-provided missing_fields.
+    The Response Node does not reinterpret or override it.
     """
 
-    intent = state.get(
-        "intent",
-        "general",
+    planner = state.get(
+        "planner"
     )
 
-    if intent != "order_create":
-
-        missing_fields = list(
-            state.get(
-                "missing_fields",
-                [],
-            )
-            or []
-        )
-
-        return (
-            missing_fields,
-            _get_next_missing_field(
-                missing_fields
-            ),
-        )
-
-    missing_fields = (
-        _calculate_checkout_missing_fields(
-            state
-        )
+    policy = state.get(
+        "policy"
     )
 
-    return (
-        missing_fields,
-        _get_next_missing_field(
-            missing_fields
-        ),
+    decision = state.get(
+        "decision"
     )
+
+    planner_args = state.get(
+        "planner_args"
+    )
+
+    tool_args = state.get(
+        "tool_args"
+    )
+
+    context: dict[str, Any] = {}
+
+    if isinstance(
+        planner,
+        dict,
+    ):
+        context[
+            "planner"
+        ] = planner
+
+    if isinstance(
+        policy,
+        dict,
+    ):
+        context[
+            "policy"
+        ] = policy
+
+    if isinstance(
+        decision,
+        dict,
+    ):
+        context[
+            "decision"
+        ] = decision
+
+    if isinstance(
+        planner_args,
+        dict,
+    ):
+        context[
+            "planner_args"
+        ] = planner_args
+
+    if isinstance(
+        tool_args,
+        dict,
+    ):
+        context[
+            "tool_args"
+        ] = tool_args
+
+    return context
 
 
 # =========================================================
@@ -337,12 +429,9 @@ def _get_payment_methods(
     tool_result: Any,
 ) -> list[dict[str, Any]]:
     """
-    Read payment methods dynamically from the backend/tool
-    result.
+    Read payment methods dynamically from the backend/tool result.
 
-    Nothing is hardcoded here. If the backend has not supplied
-    payment methods, return an empty list and let the AI explain
-    what information is currently available.
+    Nothing is hardcoded here.
     """
 
     if not isinstance(
@@ -355,56 +444,152 @@ def _get_payment_methods(
         "methods"
     )
 
-    if isinstance(
+    if not isinstance(
         methods,
         list,
     ):
-        return methods
+        return []
 
-    return []
+    return methods
 
 
 # =========================================================
-# AI Checkout Response
+# Address Data
+# =========================================================
+
+
+def _get_addresses(
+    tool_result: Any,
+) -> tuple[
+    list[Any],
+    bool,
+    Any,
+]:
+    """
+    Extract address-selection information from the backend result.
+
+    Returns:
+
+        addresses
+        allow_new
+        prefill
+    """
+
+    if not isinstance(
+        tool_result,
+        dict,
+    ):
+        return (
+            [],
+            True,
+            None,
+        )
+
+    result_type = tool_result.get(
+        "type"
+    )
+
+    if result_type not in {
+        "address_selection",
+        "saved_addresses",
+    }:
+        return (
+            [],
+            True,
+            None,
+        )
+
+    addresses = tool_result.get(
+        "addresses",
+        [],
+    )
+
+    if not isinstance(
+        addresses,
+        list,
+    ):
+        addresses = []
+
+    allow_new = bool(
+        tool_result.get(
+            "allow_new",
+            True,
+        )
+    )
+
+    prefill = tool_result.get(
+        "prefill"
+    )
+
+    return (
+        addresses,
+        allow_new,
+        prefill,
+    )
+
+
+# =========================================================
+# Checkout Response Prompt
 # =========================================================
 
 
 CHECKOUT_RESPONSE_SYSTEM_PROMPT = """
 You are BuyQK AI.
 
-Your job is to understand the user's current checkout state and
-produce the single most useful next question.
+You are responsible only for generating the user-facing wording.
 
-The graph decides which checkout field is missing. You must NOT
-change the workflow or invent missing business information.
+The graph has already decided the workflow.
 
-Use only the supplied state.
+You MUST NOT:
+- change checkout order
+- select a different missing field
+- decide whether an action is allowed
+- invent business information
+- invent products
+- invent quantities
+- invent addresses
+- invent payment methods
+- invent prices
+- invent fees
+- invent totals
+- invent order IDs
+- invent statuses
 
-Rules:
-- Understand natural language and previous conversation.
-- Never invent product names, quantities, prices, addresses,
-  payment methods, fees, order IDs, or statuses.
-- Ask for exactly the field identified as next_missing.
-- Use the user's language naturally.
-- If a backend result contains options, refer to those options
-  without inventing additional ones.
-- Keep the question concise.
-- Do not mention internal implementation details.
+The graph provides:
+- missing_fields
+- next_missing
+
+Treat these as authoritative workflow state.
+
+Ask only for next_missing.
+
+If backend/tool results provide options, use only those options.
+
+Keep the response concise and natural.
+
+Never mention:
+- planner
+- policy
+- decision node
+- tool node
+- GraphState
+- internal implementation
+- prompts
+- backend architecture
 """
 
 
-def _generate_ai_checkout_response(
+def _generate_checkout_response(
     state: GraphState,
     missing_fields: list[str],
     next_missing: str | None,
     metadata: dict[str, Any],
 ) -> str:
     """
-    Let the AI understand the current checkout state and phrase
-    the next question.
+    Generate natural-language checkout wording.
 
-    The workflow remains graph-controlled; the AI controls the
-    natural-language understanding and response.
+    The graph controls the workflow.
+    The LLM only controls presentation.
     """
 
     context = {
@@ -416,19 +601,21 @@ def _generate_ai_checkout_response(
             "intent",
             "general",
         ),
-        "entities": (
-            state.get(
-                "entities",
-                {},
-            )
-            or {}
+        "entities": _get_entities(
+            state
         ),
-        "tool_result": state.get(
-            "tool_result"
+        "tool_name": state.get(
+            "tool_name"
+        ),
+        "tool_result": _get_tool_result(
+            state
         ),
         "missing_fields": missing_fields,
         "next_missing": next_missing,
         "frontend_metadata": metadata,
+        "orchestration": _get_planner_context(
+            state
+        ),
         "conversation_history": (
             state.get(
                 "conversation_history",
@@ -439,15 +626,20 @@ def _generate_ai_checkout_response(
     }
 
     prompt = f"""
-Understand the current BuyQK checkout state below and return
-ONLY the user-facing question.
+Generate ONLY the user-facing checkout question.
 
-Current state:
+The graph has already selected the next required field.
+
+Current BuyQK state:
 
 {_serialize_data(context)}
 
-The graph has already selected next_missing.
-Do not ask for any other checkout field.
+Rules:
+- Ask only for next_missing.
+- Do not ask for another checkout field.
+- Use supplied options when available.
+- Do not invent any business values.
+- Keep the response concise.
 """
 
     try:
@@ -482,146 +674,101 @@ Do not ask for any other checkout field.
     except Exception as exc:
 
         print(
-            "[CHECKOUT RESPONSE LLM ERROR] "
-            f"{type(exc).__name__}: {exc}"
+            "[CHECKOUT RESPONSE LLM ERROR]"
+            f" {type(exc).__name__}: {exc}"
         )
 
-    # This is intentionally only an operational failure message.
-    # No product, payment, address, price, or other business value
-    # is hardcoded.
-    return "Please provide the information needed to continue."
+    return _checkout_fallback(
+        next_missing
+    )
 
 
-def _checkout_response(
+def _checkout_fallback(
+    next_missing: str | None,
+) -> str:
+    """
+    Deterministic operational fallback.
+
+    This does not contain business values.
+    """
+
+    fallback_messages = {
+        "product_name": (
+            "Which product would you like?"
+        ),
+        "quantity": (
+            "How many would you like?"
+        ),
+        "address_selection": (
+            "Please select a delivery address."
+        ),
+        "payment_method": (
+            "Please select a payment method."
+        ),
+    }
+
+    return fallback_messages.get(
+        next_missing,
+        "Please provide the information needed to continue.",
+    )
+
+
+# =========================================================
+# Checkout Metadata
+# =========================================================
+
+
+def _checkout_metadata(
     state: GraphState,
     missing_fields: list[str],
     next_missing: str | None,
 ) -> dict[str, Any] | None:
     """
-    Build frontend metadata dynamically and let the AI generate
-    the user-facing checkout question.
+    Generate frontend metadata from graph/tool state.
 
-    The graph still controls sequencing.
-    The AI controls language and interpretation.
+    This function does not determine workflow.
+    It only maps the already-selected workflow step to UI metadata.
     """
 
-    entities = (
-        state.get(
-            "entities",
-            {},
-        )
-        or {}
+    tool_result = _get_tool_result(
+        state
     )
 
-    tool_result = state.get(
-        "tool_result"
-    )
-
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Product
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     if next_missing == "product_name":
 
-        metadata = {
+        return {
             "type": "product_input",
             "missing_field": "product_name",
             "missing_fields": missing_fields,
         }
 
-        return {
-            "response": _generate_ai_checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-                metadata,
-            ),
-            "metadata": metadata,
-        }
-
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Quantity
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     if next_missing == "quantity":
 
-        metadata = {
+        return {
             "type": "quantity_input",
             "missing_field": "quantity",
             "missing_fields": missing_fields,
         }
 
-        return {
-            "response": _generate_ai_checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-                metadata,
-            ),
-            "metadata": metadata,
-        }
-
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Address
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     if next_missing == "address_selection":
 
-        addresses: list[Any] = []
-        allow_new = True
-        prefill = None
-
-        if isinstance(
-            tool_result,
-            dict,
-        ):
-
-            if (
-                tool_result.get("type")
-                == "address_selection"
-            ):
-
-                backend_addresses = (
-                    tool_result.get(
-                        "addresses",
-                        [],
-                    )
-                )
-
-                if isinstance(
-                    backend_addresses,
-                    list,
-                ):
-                    addresses = backend_addresses
-
-                allow_new = bool(
-                    tool_result.get(
-                        "allow_new",
-                        True,
-                    )
-                )
-
-                prefill = tool_result.get(
-                    "prefill"
-                )
-
-            elif (
-                tool_result.get("type")
-                == "saved_addresses"
-            ):
-
-                backend_addresses = (
-                    tool_result.get(
-                        "addresses",
-                        [],
-                    )
-                )
-
-                if isinstance(
-                    backend_addresses,
-                    list,
-                ):
-                    addresses = backend_addresses
+        addresses, allow_new, prefill = (
+            _get_addresses(
+                tool_result
+            )
+        )
 
         metadata = {
             "type": "address_selection",
@@ -631,22 +778,16 @@ def _checkout_response(
             "allow_new": allow_new,
         }
 
-        if prefill:
-            metadata["prefill"] = prefill
+        if prefill is not None:
+            metadata[
+                "prefill"
+            ] = prefill
 
-        return {
-            "response": _generate_ai_checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-                metadata,
-            ),
-            "metadata": metadata,
-        }
+        return metadata
 
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
     # Payment
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
 
     if next_missing == "payment_method":
 
@@ -654,28 +795,121 @@ def _checkout_response(
             tool_result
         )
 
-        metadata = {
+        return {
             "type": "payment_selection",
             "missing_field": "payment_method",
             "missing_fields": missing_fields,
             "methods": methods,
         }
 
-        return {
-            "response": _generate_ai_checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-                metadata,
-            ),
-            "metadata": metadata,
-        }
-
     return None
 
 
 # =========================================================
-# General Conversation
+# Metadata Cleanup
+# =========================================================
+
+
+def _clean_checkout_metadata(
+    metadata: Any,
+    next_missing: str | None,
+) -> dict[str, Any]:
+    """
+    Remove stale checkout UI metadata.
+
+    Only presentation state is cleaned here.
+
+    This does NOT change graph workflow.
+    """
+
+    if not isinstance(
+        metadata,
+        dict,
+    ):
+        return {}
+
+    cleaned = dict(
+        metadata
+    )
+
+    # -----------------------------------------------------
+    # Never preserve unrelated checkout UI after completion
+    # -----------------------------------------------------
+
+    if next_missing is None:
+
+        cleaned.pop(
+            "address_selection",
+            None,
+        )
+
+        cleaned.pop(
+            "payment_selection",
+            None,
+        )
+
+        if cleaned.get(
+            "type"
+        ) in {
+            "product_input",
+            "quantity_input",
+            "address_selection",
+            "payment_selection",
+        }:
+
+            cleaned.pop(
+                "type",
+                None,
+            )
+
+        return cleaned
+
+    # -----------------------------------------------------
+    # Product / quantity
+    # -----------------------------------------------------
+
+    if next_missing in {
+        "product_name",
+        "quantity",
+    }:
+
+        cleaned.pop(
+            "address_selection",
+            None,
+        )
+
+        cleaned.pop(
+            "payment_selection",
+            None,
+        )
+
+    # -----------------------------------------------------
+    # Address
+    # -----------------------------------------------------
+
+    elif next_missing == "address_selection":
+
+        cleaned.pop(
+            "payment_selection",
+            None,
+        )
+
+    # -----------------------------------------------------
+    # Payment
+    # -----------------------------------------------------
+
+    elif next_missing == "payment_method":
+
+        cleaned.pop(
+            "address_selection",
+            None,
+        )
+
+    return cleaned
+
+
+# =========================================================
+# Greeting
 # =========================================================
 
 
@@ -683,20 +917,28 @@ def _is_greeting(
     message: str,
 ) -> bool:
     """
-    Detect simple greetings without involving the LLM.
-
-    This is important because a failed LLM call should never
-    turn "Hi" into:
-
-        "I'm sorry, I couldn't process that request..."
+    Detect simple greetings without requiring an LLM call.
     """
 
     normalized = (
-        message.strip()
+        str(
+            message
+            or ""
+        )
+        .strip()
         .lower()
-        .replace("!", "")
-        .replace(".", "")
-        .replace(",", "")
+        .replace(
+            "!",
+            "",
+        )
+        .replace(
+            ".",
+            "",
+        )
+        .replace(
+            ",",
+            "",
+        )
     )
 
     greetings = {
@@ -715,14 +957,21 @@ def _is_greeting(
     return normalized in greetings
 
 
+# =========================================================
+# General Fallback
+# =========================================================
+
+
 def _general_fallback(
     message: str,
 ) -> str:
     """
-    Deterministic fallback for normal conversation.
+    Deterministic fallback for general conversation.
     """
 
-    if _is_greeting(message):
+    if _is_greeting(
+        message
+    ):
 
         return (
             "Hello! I'm BuyQK AI. "
@@ -736,55 +985,93 @@ def _general_fallback(
 
 
 # =========================================================
-# AI Response
+# General Response Prompt
 # =========================================================
 
 
 GENERAL_SYSTEM_PROMPT = """
-You are BuyQK AI, the intelligent shopping assistant.
+You are BuyQK AI, an intelligent shopping assistant.
 
-Understand the user's intent, entities, conversation history and
-backend results, then generate the final user-facing response.
+Generate the final user-facing response from the supplied graph state.
+
+The graph has already handled:
+- intent
+- planning
+- policy
+- decision making
+- tool selection
+- workflow
 
 The backend/tool result is authoritative for transactional facts.
 
-Billing rules:
-- When an order result contains a bill, understand every item,
-  quantity, unit price, line total, subtotal, delivery charge,
-  total, payment method and order ID.
-- You may perform the arithmetic needed to explain the bill from
-  the supplied quantities and prices.
-- Prefer the authoritative bill values supplied by the backend
-  when they are present.
-- Never invent or change a price, quantity, fee, discount, total,
-  order ID, payment method, status, address, product or ticket ID.
-- If billing information is incomplete, say only what the supplied
-  information supports.
-- Never assume a fixed delivery charge or a fixed currency.
-- Never hardcode product names or payment options.
-- Never mention internal implementation details.
+You MUST:
+- use supplied backend values
+- preserve order IDs
+- preserve product IDs
+- preserve quantities
+- preserve prices
+- preserve totals
+- preserve payment methods
+- preserve statuses
+- preserve ticket IDs
+- preserve address information
+- explain backend results naturally
 
-For an order-success result, give a clear itemized bill when bill
-data exists, followed by the order ID/status/payment information
-that is actually available and a natural next-step question.
+You MUST NOT:
+- invent facts
+- modify prices
+- modify quantities
+- invent discounts
+- invent fees
+- invent taxes
+- invent totals
+- invent payment methods
+- invent order IDs
+- invent statuses
+- invent products
+- invent addresses
+- claim a transaction succeeded when the tool says it failed
 
-For tracking, cancellation, support, product search and general
-conversation, use the supplied tool result and conversation
-context.
+For billing:
+- prefer the authoritative bill
+- present itemized information when supplied
+- do not recalculate or replace backend totals
+- if billing information is incomplete, only state what is available
 
-Keep the response concise and natural.
+For product search:
+- use only returned products
+
+For tracking:
+- use only returned order status
+
+For cancellation:
+- use only returned cancellation result
+
+For support:
+- use only returned ticket information
+
+For errors:
+- explain the actual error when safe to expose
+- do not expose internal implementation details
+
+Keep responses concise and natural.
+
+Return ONLY the user-facing response.
 """
+
+
+# =========================================================
+# LLM General Response
+# =========================================================
 
 
 def _generate_llm_response(
     state: GraphState,
 ) -> str:
     """
-    Generate the final response using the AI.
+    Generate the final general response.
 
-    The complete graph/tool state is supplied so the AI can
-    understand the request rather than relying on hardcoded
-    product/payment/billing assumptions.
+    This function is presentation-only.
     """
 
     context = {
@@ -796,21 +1083,26 @@ def _generate_llm_response(
             "intent",
             "general",
         ),
-        "entities": (
-            state.get(
-                "entities",
-                {},
-            )
-            or {}
+        "entities": _get_entities(
+            state
         ),
         "tool_name": state.get(
             "tool_name"
         ),
-        "tool_result": state.get(
-            "tool_result"
+        "tool_result": _get_tool_result(
+            state
         ),
         "order_id": state.get(
             "order_id"
+        ),
+        "missing_fields": _get_missing_fields(
+            state
+        ),
+        "next_missing": _get_next_missing(
+            state,
+            _get_missing_fields(
+                state
+            ),
         ),
         "selected_address_id": state.get(
             "selected_address_id"
@@ -818,11 +1110,9 @@ def _generate_llm_response(
         "payment_method": state.get(
             "payment_method"
         ),
-        "missing_fields": state.get(
-            "missing_fields",
-            [],
-        )
-        or [],
+        "orchestration": _get_planner_context(
+            state
+        ),
         "conversation_history": (
             state.get(
                 "conversation_history",
@@ -833,21 +1123,19 @@ def _generate_llm_response(
     }
 
     prompt = f"""
-Generate the final BuyQK response from the complete state below.
+Generate the final user-facing BuyQK response.
 
 Current state:
 
 {_serialize_data(context)}
 
-Important:
-- Understand the state dynamically.
-- Use backend/tool data as transactional truth.
-- If an order bill exists, explain the billing clearly and
-  calculate/verify the arithmetic from the supplied item data
-  before presenting it.
-- Do not add facts that are absent from the state.
-- Do not mention internal systems.
-- Return only the user-facing response.
+Remember:
+- backend/tool data is authoritative
+- graph workflow is authoritative
+- do not invent missing information
+- do not change workflow
+- do not expose internal architecture
+- return only the user-facing response
 """
 
     try:
@@ -882,8 +1170,8 @@ Important:
     except Exception as exc:
 
         print(
-            "[RESPONSE LLM ERROR] "
-            f"{type(exc).__name__}: {exc}"
+            "[RESPONSE LLM ERROR]"
+            f" {type(exc).__name__}: {exc}"
         )
 
     return _general_fallback(
@@ -895,34 +1183,29 @@ Important:
 
 
 # =========================================================
-# AI Tool / Transaction Response
+# Tool Result Response
 # =========================================================
 
 
-def _generate_ai_tool_response(
+def _generate_tool_response(
     state: GraphState,
 ) -> str | None:
     """
-    Let the AI interpret successful/failed tool results.
+    Generate a natural-language explanation of a tool result.
 
-    This includes billing. No product, price, payment method,
-    delivery fee, order ID, status, ticket ID or other business
-    value is hardcoded here.
+    The tool result is authoritative.
+
+    The LLM is only responsible for wording.
     """
 
-    tool_result = state.get(
-        "tool_result"
+    tool_result = _get_tool_result(
+        state
     )
 
-    if not isinstance(
-        tool_result,
-        dict,
-    ):
+    if tool_result is None:
         return None
 
-    if (
-        "success" not in tool_result
-    ):
+    if "success" not in tool_result:
         return None
 
     context = {
@@ -934,17 +1217,19 @@ def _generate_ai_tool_response(
             "intent",
             "general",
         ),
-        "entities": (
-            state.get(
-                "entities",
-                {},
-            )
-            or {}
+        "entities": _get_entities(
+            state
         ),
         "tool_name": state.get(
             "tool_name"
         ),
         "tool_result": tool_result,
+        "order_id": state.get(
+            "order_id"
+        ),
+        "orchestration": _get_planner_context(
+            state
+        ),
         "conversation_history": (
             state.get(
                 "conversation_history",
@@ -955,32 +1240,39 @@ def _generate_ai_tool_response(
     }
 
     prompt = f"""
-Interpret the following BuyQK tool result and generate the final
-user-facing response.
+Generate the final user-facing response from this BuyQK tool result.
 
 State:
 
 {_serialize_data(context)}
 
-For successful order creation:
-1. Understand every order item.
-2. For each item, use quantity and unit price to understand the
-   line amount.
-3. Understand subtotal, delivery charge and final total.
-4. If the authoritative bill is present, use those values as
-   transactional truth.
-5. Present an itemized bill when enough data exists.
-6. Include only the payment method, order ID and status that are
-   actually supplied.
-7. Do not invent discounts, taxes, delivery charges or payment
-   options.
-8. Ask whether the user wants to track the order only when the
-   order result supports tracking.
+Rules:
 
-For every other tool result, explain what actually happened using
-only the supplied data.
+1. Treat tool_result as authoritative.
+2. If success is false, explain the failure clearly.
+3. If an order was created:
+   - use the supplied order ID
+   - use the supplied bill
+   - use the supplied items
+   - use the supplied quantities
+   - use the supplied prices
+   - use the supplied subtotal
+   - use the supplied delivery charge
+   - use the supplied discount
+   - use the supplied tax
+   - use the supplied total
+   - use the supplied currency
+   - use the supplied payment method
+   - use the supplied status
+4. Never invent missing values.
+5. Do not recalculate or override authoritative backend totals.
+6. For tracking, report the supplied status.
+7. For cancellation, report only the supplied result.
+8. For support, report only the supplied ticket information.
+9. For product search, use only returned products.
+10. Do not mention internal implementation.
 
-Return ONLY the final user-facing response.
+Return ONLY the user-facing response.
 """
 
     try:
@@ -1015,118 +1307,513 @@ Return ONLY the final user-facing response.
     except Exception as exc:
 
         print(
-            "[TOOL RESULT RESPONSE LLM ERROR] "
-            f"{type(exc).__name__}: {exc}"
+            "[TOOL RESPONSE LLM ERROR]"
+            f" {type(exc).__name__}: {exc}"
         )
 
-    return None
+    return _tool_fallback(
+        tool_result
+    )
 
 
 # =========================================================
-# Metadata Cleanup
+# Tool Fallback
 # =========================================================
 
 
-def _clean_checkout_metadata(
-    metadata: dict[str, Any],
-    next_missing: str | None,
-) -> dict[str, Any]:
+def _tool_fallback(
+    tool_result: dict[str, Any],
+) -> str:
     """
-    Remove stale checkout UI.
+    Deterministic fallback for tool responses.
 
-    Only ONE checkout UI can exist at a time.
+    Uses only supplied values.
     """
 
-    cleaned = dict(
-        metadata
+    success = tool_result.get(
+        "success"
+    )
+
+    result_type = tool_result.get(
+        "type"
     )
 
     # -----------------------------------------------------
-    # Product / Quantity
+    # Failure
     # -----------------------------------------------------
 
-    if next_missing in {
-        "product_name",
-        "quantity",
-    }:
+    if success is False:
 
-        cleaned.pop(
-            "address_selection",
-            None,
-        )
-
-        cleaned.pop(
-            "payment_selection",
-            None,
-        )
-
-        if cleaned.get("type") in {
-            "address_selection",
-            "payment_selection",
-        }:
-
-            cleaned.pop(
-                "type",
-                None,
+        error = (
+            tool_result.get(
+                "error"
             )
+            or tool_result.get(
+                "message"
+            )
+        )
+
+        if error:
+            return str(
+                error
+            )
+
+        return (
+            "I couldn't complete that request."
+        )
+
+    # -----------------------------------------------------
+    # Order
+    # -----------------------------------------------------
+
+    if result_type == "order_success":
+
+        order_id = tool_result.get(
+            "order_id"
+        )
+
+        status = tool_result.get(
+            "status"
+        )
+
+        payment_method = tool_result.get(
+            "payment_method"
+        )
+
+        parts = [
+            "Your order has been placed."
+        ]
+
+        if order_id is not None:
+
+            parts.append(
+                f"Order ID: #{order_id}."
+            )
+
+        if status is not None:
+
+            parts.append(
+                f"Status: {status}."
+            )
+
+        if payment_method is not None:
+
+            parts.append(
+                f"Payment: {payment_method}."
+            )
+
+        return " ".join(
+            parts
+        )
+
+    # -----------------------------------------------------
+    # Tracking
+    # -----------------------------------------------------
+
+    if result_type == "tracking":
+
+        order_id = tool_result.get(
+            "order_id"
+        )
+
+        status = tool_result.get(
+            "status"
+        )
+
+        if (
+            order_id is not None
+            and status is not None
+        ):
+
+            return (
+                f"Your order #{order_id} "
+                f"is currently {status}."
+            )
+
+        if status is not None:
+
+            return (
+                f"Your order is currently "
+                f"{status}."
+            )
+
+        return (
+            "I found the order information, "
+            "but no current status was provided."
+        )
+
+    # -----------------------------------------------------
+    # Cancellation
+    # -----------------------------------------------------
+
+    if result_type == "order_cancelled":
+
+        order_id = tool_result.get(
+            "order_id"
+        )
+
+        if order_id is not None:
+
+            return (
+                f"Order #{order_id} "
+                "has been cancelled."
+            )
+
+        return (
+            "The order has been cancelled."
+        )
+
+    # -----------------------------------------------------
+    # Support
+    # -----------------------------------------------------
+
+    if result_type == "support_ticket":
+
+        ticket_id = tool_result.get(
+            "ticket_id"
+        )
+
+        if ticket_id is not None:
+
+            return (
+                "Your support request has been "
+                f"created. Ticket ID: #{ticket_id}."
+            )
+
+        return (
+            "Your support request has been created."
+        )
+
+    # -----------------------------------------------------
+    # Product search
+    # -----------------------------------------------------
+
+    if result_type == "product_search":
+
+        products = tool_result.get(
+            "products",
+            [],
+        )
+
+        if isinstance(
+            products,
+            list
+        ) and products:
+
+            return (
+                "I found matching products for you."
+            )
+
+        return (
+            "I couldn't find matching products."
+        )
 
     # -----------------------------------------------------
     # Address
     # -----------------------------------------------------
 
-    elif next_missing == "address_selection":
+    if result_type == "address_selection":
 
-        cleaned.pop(
-            "payment_selection",
-            None,
+        return (
+            "Please select a delivery address."
         )
-
-        if cleaned.get("type") == (
-            "payment_selection"
-        ):
-
-            cleaned.pop(
-                "type",
-                None,
-            )
 
     # -----------------------------------------------------
     # Payment
     # -----------------------------------------------------
 
-    elif next_missing == "payment_method":
+    if result_type == "payment_selection":
 
-        cleaned.pop(
-            "address_selection",
-            None,
+        return (
+            "Please select a payment method."
         )
 
-        if cleaned.get("type") == (
-            "address_selection"
+    return (
+        "The request was completed."
+    )
+
+
+# =========================================================
+# Product Metadata
+# =========================================================
+
+
+def _product_metadata(
+    tool_result: dict[str, Any],
+    missing_fields: list[str],
+) -> dict[str, Any]:
+    """
+    Convert backend product-search data into frontend metadata.
+
+    No product selection or scoring happens here.
+    """
+
+    products = tool_result.get(
+        "products",
+        [],
+    )
+
+    if not isinstance(
+        products,
+        list,
+    ):
+        products = []
+
+    normalized_products: list[
+        dict[str, Any]
+    ] = []
+
+    for product in products:
+
+        if isinstance(
+            product,
+            dict,
         ):
 
-            cleaned.pop(
-                "type",
-                None,
+            normalized_products.append(
+                dict(product)
             )
 
-    # -----------------------------------------------------
-    # No checkout step
-    # -----------------------------------------------------
+            continue
 
-    else:
-
-        cleaned.pop(
-            "address_selection",
-            None,
+        normalized_products.append(
+            {
+                "id": getattr(
+                    product,
+                    "id",
+                    None,
+                ),
+                "name": getattr(
+                    product,
+                    "name",
+                    None,
+                ),
+                "description": getattr(
+                    product,
+                    "description",
+                    None,
+                ),
+                "brand": getattr(
+                    product,
+                    "brand",
+                    None,
+                ),
+                "price": getattr(
+                    product,
+                    "price",
+                    None,
+                ),
+                "stock": getattr(
+                    product,
+                    "stock",
+                    None,
+                ),
+                "merchant_id": getattr(
+                    product,
+                    "merchant_id",
+                    None,
+                ),
+                "category_id": getattr(
+                    product,
+                    "category_id",
+                    None,
+                ),
+                "image_url": getattr(
+                    product,
+                    "image_url",
+                    None,
+                ),
+            }
         )
 
-        cleaned.pop(
-            "payment_selection",
-            None,
+    return {
+        "type": "product_results",
+        "products": normalized_products,
+        "missing_fields": missing_fields,
+    }
+
+
+# =========================================================
+# Order Metadata
+# =========================================================
+
+
+def _order_success_metadata(
+    state: GraphState,
+    tool_result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build frontend metadata for a successful order.
+
+    Every transactional value comes directly from the backend/tool
+    result.
+    """
+
+    order_id = tool_result.get(
+        "order_id"
+    )
+
+    bill = tool_result.get(
+        "bill"
+    )
+
+    purchase_summary = tool_result.get(
+        "purchase_summary"
+    )
+
+    metadata = {
+        "type": "order_success",
+        "order_id": order_id,
+        "status": tool_result.get(
+            "status"
+        ),
+        "payment_status": tool_result.get(
+            "payment_status"
+        ),
+        "payment_method": tool_result.get(
+            "payment_method"
+        ),
+        "total_amount": tool_result.get(
+            "total_amount"
+        ),
+        "currency": (
+            bill.get(
+                "currency"
+            )
+            if isinstance(
+                bill,
+                dict,
+            )
+            else None
+        ),
+        "bill": bill,
+        "purchase_summary": purchase_summary,
+        "can_track": (
+            order_id is not None
+        ),
+    }
+
+    return metadata
+
+
+# =========================================================
+# Generic Tool Metadata
+# =========================================================
+
+
+def _tool_metadata(
+    state: GraphState,
+    missing_fields: list[str],
+) -> dict[str, Any]:
+    """
+    Preserve useful tool data for the frontend.
+
+    This is presentation metadata only.
+    """
+
+    tool_result = _get_tool_result(
+        state
+    )
+
+    if tool_result is None:
+        return {}
+
+    result_type = tool_result.get(
+        "type"
+    )
+
+    if result_type == "order_success":
+
+        return _order_success_metadata(
+            state,
+            tool_result,
         )
 
-    return cleaned
+    if result_type == "tracking":
+
+        return {
+            "type": "tracking",
+            "order_id": tool_result.get(
+                "order_id"
+            ),
+            "status": tool_result.get(
+                "status"
+            ),
+            "payment_status": tool_result.get(
+                "payment_status"
+            ),
+            "bill": tool_result.get(
+                "bill"
+            ),
+        }
+
+    if result_type == "order_cancelled":
+
+        return {
+            "type": "order_cancelled",
+            "order_id": tool_result.get(
+                "order_id"
+            ),
+            "status": tool_result.get(
+                "status"
+            ),
+        }
+
+    if result_type == "support_ticket":
+
+        return {
+            "type": "support_ticket",
+            "ticket_id": tool_result.get(
+                "ticket_id"
+            ),
+            "status": tool_result.get(
+                "status"
+            ),
+        }
+
+    if result_type == "product_search":
+
+        return _product_metadata(
+            tool_result,
+            missing_fields,
+        )
+
+    if result_type == "address_selection":
+
+        addresses, allow_new, prefill = (
+            _get_addresses(
+                tool_result
+            )
+        )
+
+        metadata = {
+            "type": "address_selection",
+            "addresses": addresses,
+            "allow_new": allow_new,
+            "missing_fields": missing_fields,
+        }
+
+        if prefill is not None:
+            metadata[
+                "prefill"
+            ] = prefill
+
+        return metadata
+
+    if result_type == "payment_selection":
+
+        return {
+            "type": "payment_selection",
+            "methods": _get_payment_methods(
+                tool_result
+            ),
+            "missing_fields": missing_fields,
+        }
+
+    return {
+        "tool_type": result_type,
+        "missing_fields": missing_fields,
+    }
 
 
 # =========================================================
@@ -1138,21 +1825,41 @@ def response_node(
     state: GraphState,
 ) -> GraphState:
     """
-    Final LangGraph response node.
+    Final Phase-2 LangGraph response node.
 
-    Processing order:
+    ========================================================
+    RESPONSIBILITY
+    ========================================================
 
-        1. Determine checkout state
-        2. Handle successful order
-        3. Handle tracking/tool results
-        4. Enforce sequential checkout
-        5. Handle non-checkout tools
-        6. Handle general conversation
+    1. Read graph-produced state.
+    2. Read authoritative tool/backend result.
+    3. Render checkout UI metadata when the graph requests it.
+    4. Generate natural language.
+    5. Return presentation state.
 
-    IMPORTANT:
+    ========================================================
+    DOES NOT
+    ========================================================
 
-    Never allow the LLM to determine checkout sequencing.
+    This function does NOT:
+
+    - calculate checkout state
+    - choose next checkout step
+    - choose a tool
+    - override policy
+    - modify orders
+    - calculate bills
+    - resolve products
+    - validate addresses
+    - validate payments
+    - invent business values
+
+    ========================================================
     """
+
+    # =====================================================
+    # Read state
+    # =====================================================
 
     intent = state.get(
         "intent",
@@ -1163,13 +1870,25 @@ def response_node(
         "tool_name"
     )
 
-    tool_result = state.get(
-        "tool_result"
+    message = str(
+        state.get(
+            "message",
+            "",
+        )
+        or ""
     )
 
-    message = state.get(
-        "message",
-        "",
+    tool_result = _get_tool_result(
+        state
+    )
+
+    missing_fields = _get_missing_fields(
+        state
+    )
+
+    next_missing = _get_next_missing(
+        state,
+        missing_fields,
     )
 
     # =====================================================
@@ -1185,22 +1904,79 @@ def response_node(
     )
 
     # =====================================================
-    # Calculate checkout state
+    # Keep graph-produced checkout metadata
+    # =====================================================
+    #
+    # We do not calculate it.
+    #
+    # We only expose the graph's state to the frontend.
     # =====================================================
 
-    missing_fields, next_missing = (
-        _get_checkout_state(
-            state
+    metadata[
+        "missing_fields"
+    ] = missing_fields
+
+    if next_missing is not None:
+
+        metadata[
+            "next_missing"
+        ] = next_missing
+
+    else:
+
+        metadata.pop(
+            "next_missing",
+            None,
+        )
+
+    # =====================================================
+    # 1. Checkout UI
+    # =====================================================
+    #
+    # The graph has already selected next_missing.
+    #
+    # Response Node only renders it.
+    # =====================================================
+
+    checkout_metadata = (
+        _checkout_metadata(
+            state,
+            missing_fields,
+            next_missing,
         )
     )
 
+    if checkout_metadata is not None:
+
+        checkout_metadata = (
+            _clean_checkout_metadata(
+                checkout_metadata,
+                next_missing,
+            )
+        )
+
+        metadata.update(
+            checkout_metadata
+        )
+
+        response = (
+            _generate_checkout_response(
+                state,
+                missing_fields,
+                next_missing,
+                metadata,
+            )
+        )
+
+        return {
+            "response": response,
+            "metadata": metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
     # =====================================================
-    # 1. ORDER SUCCESS
-    # =====================================================
-    #
-    # Billing is supplied by the tool/backend and understood and
-    # presented by the AI. No product, price, fee or payment value
-    # is calculated or hardcoded in this response node.
+    # 2. Successful Order
     # =====================================================
 
     if (
@@ -1220,71 +1996,44 @@ def response_node(
             "order_id"
         )
 
-        bill = tool_result.get(
-            "bill"
+        metadata = _order_success_metadata(
+            state,
+            tool_result,
         )
 
-        purchase_summary = tool_result.get(
-            "purchase_summary"
-        )
+        # -------------------------------------------------
+        # Generate user-facing response
+        # -------------------------------------------------
 
-        total_amount = tool_result.get(
-            "total_amount"
-        )
-
-        status = tool_result.get(
-            "status"
-        )
-
-        payment_method = tool_result.get(
-            "payment_method"
-        )
-
-        # -----------------------------------------------------
-        # AI generates the complete billing response.
-        # -----------------------------------------------------
-
-        response = _generate_ai_tool_response(
+        response = _generate_tool_response(
             state
         )
 
         if not response:
+
             response = _generate_llm_response(
                 state
             )
 
-        # -----------------------------------------------------
-        # Dynamic frontend metadata.
-        #
-        # The bill is copied from the authoritative tool result;
-        # this node does not invent or recompute business values.
-        # -----------------------------------------------------
-
-        metadata = {
-            "type": "order_success",
-            "order_id": order_id,
-            "status": status,
-            "payment_method": payment_method,
-            "total_amount": total_amount,
-            "bill": bill,
-            "purchase_summary": purchase_summary,
-            "can_track": (
-                order_id is not None
-            ),
-        }
+        # -------------------------------------------------
+        # Transaction complete
+        # -------------------------------------------------
 
         return {
             "response": response,
             "metadata": metadata,
+            "missing_fields": [],
+            "next_missing": None,
             "order_id": order_id,
+            "checkout_status": "completed",
+            "order_created": True,
             "awaiting_order_tracking_confirmation": (
                 order_id is not None
             ),
-            "missing_fields": [],
         }
 
     # =====================================================
-    # 2. TRACKING RESULT
+    # 3. Tracking
     # =====================================================
 
     if (
@@ -1300,212 +2049,143 @@ def response_node(
         ) == "tracking"
     ):
 
-        tracking_order_id = (
-            tool_result.get(
+        response = _generate_tool_response(
+            state
+        )
+
+        if not response:
+
+            response = _tool_fallback(
+                tool_result
+            )
+
+        metadata = _tool_metadata(
+            state,
+            missing_fields,
+        )
+
+        return {
+            "response": response,
+            "metadata": metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+            "order_id": tool_result.get(
                 "order_id"
-            )
+            ),
+            "awaiting_order_tracking_confirmation": False,
+        }
+
+    # =====================================================
+    # 4. Other successful tool result
+    # =====================================================
+
+    if (
+        isinstance(
+            tool_result,
+            dict,
+        )
+        and tool_result.get(
+            "success"
+        ) is True
+    ):
+
+        response = _generate_tool_response(
+            state
         )
 
-        tracking_status = (
+        if not response:
+
+            response = _tool_fallback(
+                tool_result
+            )
+
+        tool_metadata = _tool_metadata(
+            state,
+            missing_fields,
+        )
+
+        metadata = _clean_checkout_metadata(
+            tool_metadata,
+            next_missing,
+        )
+
+        metadata[
+            "missing_fields"
+        ] = missing_fields
+
+        if next_missing is not None:
+
+            metadata[
+                "next_missing"
+            ] = next_missing
+
+        return {
+            "response": response,
+            "metadata": metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+    # =====================================================
+    # 5. Tool Failure
+    # =====================================================
+
+    if (
+        isinstance(
+            tool_result,
+            dict,
+        )
+        and tool_result.get(
+            "success"
+        ) is False
+    ):
+
+        error = (
             tool_result.get(
-                "status"
+                "error"
+            )
+            or tool_result.get(
+                "message"
             )
         )
 
-        if tracking_order_id is not None:
+        # -------------------------------------------------
+        # Prefer backend error directly when available.
+        #
+        # This avoids the LLM accidentally rewriting a
+        # transactional error into a false success.
+        # -------------------------------------------------
 
-            response = (
-                f"Your order #{tracking_order_id} "
-                f"is currently {tracking_status}."
+        if error:
+
+            response = str(
+                error
             )
 
         else:
 
             response = (
-                f"Your order is currently "
-                f"{tracking_status}."
+                "I couldn't complete that request."
             )
 
-        metadata = {
-            "type": "tracking",
-            "order_id": tracking_order_id,
-            "status": tracking_status,
-        }
-
-        return {
-            "response": response,
-            "metadata": metadata,
-            "awaiting_order_tracking_confirmation": False,
-            "missing_fields": [],
-        }
-
-    # =====================================================
-    # 3. STRICT ORDER CHECKOUT
-    # =====================================================
-
-    if intent == "order_create":
-
-        # -------------------------------------------------
-        # Product / Quantity
-        # -------------------------------------------------
-
-        if next_missing in {
-            "product_name",
-            "quantity",
-        }:
-
-            checkout = _checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-            )
-
-            if checkout:
-
-                checkout_metadata = (
-                    checkout.get(
-                        "metadata",
-                        {},
-                    )
-                )
-
-                checkout_metadata = (
-                    _clean_checkout_metadata(
-                        checkout_metadata,
-                        next_missing,
-                    )
-                )
-
-                return {
-                    "response": checkout[
-                        "response"
-                    ],
-                    "metadata": checkout_metadata,
-                    "missing_fields": missing_fields,
-                }
-
-        # -------------------------------------------------
-        # Address
-        # -------------------------------------------------
-
-        if next_missing == (
-            "address_selection"
-        ):
-
-            checkout = _checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-            )
-
-            if checkout:
-
-                checkout_metadata = (
-                    checkout.get(
-                        "metadata",
-                        {},
-                    )
-                )
-
-                checkout_metadata = (
-                    _clean_checkout_metadata(
-                        checkout_metadata,
-                        next_missing,
-                    )
-                )
-
-                return {
-                    "response": checkout[
-                        "response"
-                    ],
-                    "metadata": checkout_metadata,
-                    "missing_fields": missing_fields,
-                }
-
-        # -------------------------------------------------
-        # Payment
-        # -------------------------------------------------
-
-        if next_missing == (
-            "payment_method"
-        ):
-
-            checkout = _checkout_response(
-                state,
-                missing_fields,
-                next_missing,
-            )
-
-            if checkout:
-
-                checkout_metadata = (
-                    checkout.get(
-                        "metadata",
-                        {},
-                    )
-                )
-
-                checkout_metadata = (
-                    _clean_checkout_metadata(
-                        checkout_metadata,
-                        next_missing,
-                    )
-                )
-
-                return {
-                    "response": checkout[
-                        "response"
-                    ],
-                    "metadata": checkout_metadata,
-                    "missing_fields": missing_fields,
-                }
-
-    # =====================================================
-    # 4. Tool Result
-    # =====================================================
-
-    ai_tool_response = _generate_ai_tool_response(
-        state
-    )
-
-    if ai_tool_response:
-
-        # Do not expose stale checkout UI.
         metadata = _clean_checkout_metadata(
             metadata,
             next_missing,
         )
 
-        metadata["missing_fields"] = (
-            missing_fields
-        )
-
-        # Preserve dynamic bill/tool data for the frontend.
-        if isinstance(
-            tool_result,
-            dict,
-        ):
-
-            if "bill" in tool_result:
-                metadata["bill"] = tool_result.get(
-                    "bill"
-                )
-
-            if "purchase_summary" in tool_result:
-                metadata["purchase_summary"] = (
-                    tool_result.get(
-                        "purchase_summary"
-                    )
-                )
+        metadata[
+            "missing_fields"
+        ] = missing_fields
 
         return {
-            "response": ai_tool_response,
+            "response": response,
             "metadata": metadata,
             "missing_fields": missing_fields,
+            "next_missing": next_missing,
         }
 
     # =====================================================
-    # 5. Product Search
+    # 6. Product Search
     # =====================================================
 
     if (
@@ -1524,150 +2204,52 @@ def response_node(
             [],
         )
 
-        product_list: list[dict[str, Any]] = []
-
-        if isinstance(
+        if not isinstance(
             products,
             list,
         ):
+            products = []
 
-            for product in products:
+        metadata = _product_metadata(
+            tool_result,
+            missing_fields,
+        )
 
-                # -----------------------------------------
-                # Dictionary
-                # -----------------------------------------
+        if products:
 
-                if isinstance(
-                    product,
-                    dict,
-                ):
+            response = _generate_tool_response(
+                state
+            )
 
-                    product_list.append(
-                        product
-                    )
+            if not response:
 
-                    continue
-
-                # -----------------------------------------
-                # ORM object
-                # -----------------------------------------
-
-                product_list.append(
-                    {
-                        "id": getattr(
-                            product,
-                            "id",
-                            None,
-                        ),
-                        "name": getattr(
-                            product,
-                            "name",
-                            None,
-                        ),
-                        "brand": getattr(
-                            product,
-                            "brand",
-                            None,
-                        ),
-                        "price": getattr(
-                            product,
-                            "price",
-                            None,
-                        ),
-                        "stock": getattr(
-                            product,
-                            "stock",
-                            None,
-                        ),
-                        "merchant_id": getattr(
-                            product,
-                            "merchant_id",
-                            None,
-                        ),
-                        "category_id": getattr(
-                            product,
-                            "category_id",
-                            None,
-                        ),
-                    }
-                )
-
-        if product_list:
-
-            metadata = {
-                "type": "product_results",
-                "products": product_list,
-                "missing_fields": missing_fields,
-            }
-
-            return {
-                "response": (
+                response = (
                     "I found these products "
                     "for you."
-                ),
-                "metadata": metadata,
-                "missing_fields": missing_fields,
-            }
+                )
 
-        return {
-            "response": (
+        else:
+
+            response = (
                 "I couldn't find matching products."
-            ),
-            "metadata": {
-                "type": "product_results",
-                "products": [],
-                "missing_fields": missing_fields,
-            },
-            "missing_fields": missing_fields,
-        }
-
-    # =====================================================
-    # 6. Tool Failure
-    # =====================================================
-
-    if (
-        isinstance(
-            tool_result,
-            dict,
-        )
-        and tool_result.get(
-            "success"
-        ) is False
-    ):
-
-        error = (
-            tool_result.get("error")
-            or tool_result.get("message")
-        )
-
-        if error:
-
-            return {
-                "response": str(error),
-                "metadata": metadata,
-                "missing_fields": missing_fields,
-            }
+            )
 
         return {
-            "response": (
-                "I couldn't complete that request."
-            ),
+            "response": response,
             "metadata": metadata,
             "missing_fields": missing_fields,
+            "next_missing": next_missing,
         }
 
     # =====================================================
-    # 7. General Conversation
-    # =====================================================
-    #
-    # IMPORTANT:
-    #
-    # "Hi" should NEVER depend on the LLM being available.
+    # 7. Greeting
     # =====================================================
 
     if (
         intent == "general"
-        and _is_greeting(message)
+        and _is_greeting(
+            message
+        )
     ):
 
         return {
@@ -1677,10 +2259,11 @@ def response_node(
             ),
             "metadata": {},
             "missing_fields": [],
+            "next_missing": None,
         }
 
     # =====================================================
-    # 8. General LLM Response
+    # 8. General Conversation
     # =====================================================
 
     response = _generate_llm_response(
@@ -1692,9 +2275,22 @@ def response_node(
         next_missing,
     )
 
-    metadata["missing_fields"] = (
-        missing_fields
-    )
+    metadata[
+        "missing_fields"
+    ] = missing_fields
+
+    if next_missing is not None:
+
+        metadata[
+            "next_missing"
+        ] = next_missing
+
+    else:
+
+        metadata.pop(
+            "next_missing",
+            None,
+        )
 
     # =====================================================
     # 9. Return
@@ -1704,4 +2300,5 @@ def response_node(
         "response": response,
         "metadata": metadata,
         "missing_fields": missing_fields,
+        "next_missing": next_missing,
     }
