@@ -5,48 +5,55 @@
 # Purpose:
 # Central state shared by all nodes in the BuyQK LangGraph.
 #
-# The state contains:
-#
-#   - User input
 #   - Conversation state
-#   - AI understanding
 #   - Checkout state
 #   - Transaction state
-#   - Resolved product
-#   - Quantity
+#   - Product resolution
 #   - Address/payment selection
 #   - Tool execution
 #   - Order state
-#   - Authoritative billing state
-#   - Final AI response
-#   - Frontend metadata
+#   - Authoritative billing
+#   - Context Loader state
+#   - AI understanding
+#   - AI planning
+#   - Policy validation
+#   - Tool planning
 #
-# IMPORTANT:
+# IMPORTANT ARCHITECTURAL RULE
 #
-# The AI may UNDERSTAND and EXPLAIN transaction information.
+# AI is responsible for:
 #
-# The AI must NOT invent authoritative transactional values.
+#   - understanding language
+#   - understanding user intent
+#   - resolving conversational references
+#   - understanding user goals
+#   - identifying missing conversational information
+#   - proposing the next conversational/action step
+#   - selecting an appropriate capability/tool
+#   - generating natural-language responses
 #
-# Authoritative values such as:
+# Backend/business logic is responsible for:
 #
-#   - product_id
+#   - product identity
 #   - product price
 #   - stock
-#   - quantity accepted by backend
+#   - accepted quantity
 #   - address ownership
-#   - payment availability
-#   - subtotal
-#   - delivery charge
-#   - tax
-#   - discount
-#   - final total
+#   - payment availability/validity
+#   - authorization
+#   - order creation
 #   - order ID
+#   - billing
+#   - taxes
+#   - discounts
+#   - delivery charges
+#   - final totals
+#   - cancellation eligibility
+#   - refund eligibility
+#   - transaction status
+#   - idempotency
 #
-# must come from backend/database/business logic.
-#
-# The graph state stores those values so that subsequent nodes
-# can use the same authoritative information without repeatedly
-# asking the LLM to reconstruct it.
+# The AI must NEVER invent authoritative transactional values.
 #
 # =========================================================
 
@@ -64,139 +71,72 @@ class GraphState(TypedDict, total=False):
     # USER INPUT
     # =====================================================
 
-    # Current user message.
+    # Current raw user message.
     message: str
 
     # Conversation/session identifier.
-    #
-    # This identifies the conversation across HTTP requests.
     session_id: str
 
-    # Authenticated/application-level user identifier.
+    # Application-level authenticated user identifier.
     user_id: int
 
     # =====================================================
-    # CHECKOUT / TRANSACTION IDENTITY
+    # PHASE 2 - CONTEXT LOADER
     # =====================================================
     #
-    # checkout_id identifies ONE checkout transaction.
+    # The Context Loader prepares the information required
+    # by the AI without making the actual decision.
+    #
+    # Context may contain:
+    #
+    #   - current user message
+    #   - relevant conversation history
+    #   - current checkout state
+    #   - previous backend result
+    #   - current order state
+    #   - relevant user context
+    #   - relevant product/order references
     #
     # IMPORTANT:
     #
-    # checkout_id is NOT the order ID.
+    # Context is informational.
     #
-    # checkout_id exists before an order is created.
-    #
-    # Example:
-    #
-    # checkout_id = "checkout-abc123"
-    #
-    # After successful order creation:
-    #
-    # checkout_id -> order_id
-    #
-    # This allows the system to distinguish:
-    #
-    #   "I am continuing the same checkout"
-    #
-    # from:
-    #
-    #   "I am starting a new order."
-    #
-    # This is important for idempotency and for preventing:
-    #
-    #   "Thank you"
-    #
-    # from creating another order.
+    # It does NOT replace authoritative backend state.
     #
     # =====================================================
 
-    checkout_id: str | None
+    context: dict[str, Any]
 
     # =====================================================
-    # CHECKOUT STATUS
+    # CONVERSATION HISTORY
     # =====================================================
     #
-    # Represents the lifecycle of the current checkout.
+    # Previous conversational turns.
     #
-    # Typical lifecycle:
+    # This is used by the AI to understand references such as:
     #
-    #   collecting
-    #       ↓
-    #   ready
-    #       ↓
-    #   creating
-    #       ↓
-    #   completed
+    #   "that one"
+    #   "the other one"
+    #   "make it five"
+    #   "same address"
+    #   "my previous order"
     #
-    # Possible terminal/error states may include:
-    #
-    #   failed
-    #   cancelled
-    #
-    # The actual transition logic belongs to the decision/tool
-    # layer, not to the LLM.
+    # It is NOT authoritative transaction storage.
     #
     # =====================================================
 
-    checkout_status: str | None
-
-    # =====================================================
-    # CHECKOUT SELECTION - FRONTEND AUTHORITATIVE
-    # =====================================================
-
-    # Selected saved address from the frontend.
-    #
-    # This should contain the database ID of the address.
-    #
-    # The backend must still verify that the address belongs
-    # to the current user.
-    selected_address_id: int | None
-
-    # Selected payment method from the frontend.
-    #
-    # This is the user's selected value.
-    #
-    # It is NOT the authoritative source of which payment
-    # methods are available.
-    #
-    # Available methods must come from backend/payment logic.
-    selected_payment_method: str | None
-
-    # Backward-compatible alias used by older nodes.
-    #
-    # Nodes should gradually migrate toward:
-    #
-    #     selected_payment_method
-    #
-    # but this field remains available so existing code does
-    # not immediately break.
-    payment_method: str | None
-
-    # =====================================================
-    # DATABASE
-    # =====================================================
-
-    # SQLAlchemy database session when required by the graph.
-    db: Any
-
-    # =====================================================
-    # CONVERSATION
-    # =====================================================
-
-    # Previous conversation messages/context.
-    #
-    # This is conversational context, not authoritative
-    # transaction data.
     conversation_history: list[dict[str, Any]]
 
     # =====================================================
-    # AI UNDERSTANDING
+    # PHASE 2 - AI UNDERSTANDING
     # =====================================================
 
-    # Current semantic intent.
+    # Semantic intent understood from the conversation.
     #
-    # Examples may include:
+    # This is an AI interpretation, not a backend transaction
+    # state.
+    #
+    # Examples:
     #
     #   general
     #   product_search
@@ -204,17 +144,63 @@ class GraphState(TypedDict, total=False):
     #   order_tracking
     #   order_cancel
     #   customer_support
+    #   order_modify
     #
-    # The decision node must combine intent with transaction
-    # state rather than blindly trusting the current LLM intent.
     intent: str
+
+    # User's underlying conversational goal as understood
+    # by the AI.
+    #
+    # Example:
+    #
+    #   "purchase three packets of Maggi"
+    #
+    # This is semantic information and must not be treated as
+    # an instruction to mutate the database.
+    #
+    user_goal: str | None
+
+    # Language detected/understood from the current
+    # conversation.
+    #
+    # Examples:
+    #
+    #   en
+    #   hi
+    #   hinglish
+    #   etc.
+    #
+    # The value is determined by the AI/language layer.
+    #
+    detected_language: str | None
+
+    # Conversational references resolved by the AI.
+    #
+    # Examples:
+    #
+    # {
+    #     "that_product": ...,
+    #     "that_order": ...,
+    #     "other_address": ...,
+    # }
+    #
+    # These are semantic references.
+    #
+    # They must be resolved against authoritative state before
+    # any backend mutation.
+    #
+    references: dict[str, Any]
 
     # =====================================================
     # ACCUMULATED TRANSACTION ENTITIES
     # =====================================================
     #
-    # This contains information accumulated from multiple
-    # conversation turns.
+    # Information accumulated across turns.
+    #
+    # This is useful for conversational understanding.
+    #
+    # Dedicated authoritative state fields below should be
+    # preferred once backend resolution has occurred.
     #
     # Example:
     #
@@ -226,64 +212,255 @@ class GraphState(TypedDict, total=False):
     #     "payment_method": "cod"
     # }
     #
-    # IMPORTANT:
-    #
-    # This dictionary is NOT the only authoritative source.
-    #
-    # Once the backend resolves authoritative values, those
-    # values should also be copied into their dedicated state
-    # fields below.
-    #
     # =====================================================
 
     entities: dict[str, Any]
 
-    # Fields that are still required before checkout can
-    # proceed.
+    # Information currently missing from the conversation/
+    # checkout.
     #
-    # Examples:
+    # This may initially be inferred by AI.
     #
-    #   ["quantity"]
-    #   ["address_selection", "payment_method"]
+    # Before a transaction is executed, required fields must
+    # also be validated against authoritative backend state.
     #
     missing_fields: list[str]
 
     # =====================================================
+    # PHASE 2 - AI PLANNER
+    # =====================================================
+    #
+    # The planner converts understanding + context + current
+    # transaction state into a proposed next action.
+    #
+    # Example:
+    #
+    # {
+    #     "action": "CREATE_ORDER",
+    #     "tool": "create_order",
+    #     "arguments": {...},
+    #     "missing_information": [],
+    #     "confidence": 0.96
+    # }
+    #
+    # IMPORTANT:
+    #
+    # planner_decision is a PROPOSAL.
+    #
+    # It does not have authority to mutate the database.
+    #
+    # Policy validation and backend services remain authoritative.
+    #
+    # =====================================================
+
+    planner_decision: dict[str, Any]
+
+    # AI-proposed conversational/action capability.
+    #
+    # Examples:
+    #
+    #   SEARCH_PRODUCT
+    #   START_CHECKOUT
+    #   CONTINUE_CHECKOUT
+    #   SELECT_ADDRESS
+    #   SELECT_PAYMENT
+    #   CREATE_ORDER
+    #   TRACK_ORDER
+    #   CANCEL_ORDER
+    #   MODIFY_ORDER
+    #   SUPPORT
+    #   ANSWER
+    #   ASK_CLARIFICATION
+    #   CONFIRM
+    #   END_CONVERSATION
+    #
+    # These are capability labels, not database operations.
+    #
+    planned_action: str | None
+
+    # Tool proposed by the AI planner.
+    #
+    # Example:
+    #
+    #   search_products
+    #   create_order
+    #   track_order
+    #
+    # The policy layer must validate this before execution.
+    #
+    planned_tool: str | None
+
+    # Arguments proposed for the planned capability/tool.
+    #
+    # These arguments are NOT automatically trusted.
+    #
+    # The policy/backend layer must validate:
+    #
+    #   identity
+    #   authorization
+    #   product
+    #   stock
+    #   address
+    #   payment
+    #   transaction state
+    #   idempotency
+    #
+    planned_arguments: dict[str, Any]
+
+    # Optional confidence supplied by the AI planner.
+    #
+    # Confidence is informational.
+    #
+    # It must NOT override backend validation.
+    #
+    planner_confidence: float | None
+
+    # =====================================================
+    # PHASE 2 - POLICY / VALIDATION
+    # =====================================================
+    #
+    # Result produced after validating the AI planner's
+    # proposed action.
+    #
+    # Example:
+    #
+    # {
+    #     "allowed": True,
+    #     "action": "CREATE_ORDER",
+    #     "tool": "create_order"
+    # }
+    #
+    # or:
+    #
+    # {
+    #     "allowed": False,
+    #     "reason": "checkout_already_completed"
+    # }
+    #
+    # The policy layer protects the backend from invalid
+    # or unsafe AI proposals.
+    #
+    # =====================================================
+
+    policy_result: dict[str, Any]
+
+    # Structured policy/validation error.
+    #
+    # This should contain actual validation information rather
+    # than an AI-generated guess.
+    #
+    policy_error: dict[str, Any] | None
+
+    # =====================================================
+    # CHECKOUT / TRANSACTION IDENTITY
+    # =====================================================
+
+    # Unique identifier for the current checkout transaction.
+    #
+    # checkout_id is NOT the order ID.
+    #
+    # It identifies one logical checkout attempt and is used
+    # for durable idempotency.
+    #
+    checkout_id: str | None
+
+    # =====================================================
+    # CHECKOUT STATUS
+    # =====================================================
+    #
+    # Current lifecycle state of the checkout.
+    #
+    # Typical lifecycle:
+    #
+    #   collecting
+    #       ↓
+    #   ready
+    #       ↓
+    #   creating
+    #       ↓
+    #   completed
+    #
+    # Other possible states:
+    #
+    #   failed
+    #   cancelled
+    #
+    # The exact transition is controlled by application/
+    # backend logic.
+    #
+    # The AI must understand the state but must not fabricate
+    # transaction transitions.
+    #
+    # =====================================================
+
+    checkout_status: str | None
+
+    # =====================================================
+    # CHECKOUT SELECTION - FRONTEND INPUT
+    # =====================================================
+
+    # Address selected through the frontend.
+    #
+    # Backend must verify ownership/validity.
+    #
+    selected_address_id: int | None
+
+    # Payment method selected through the frontend.
+    #
+    # This is the user's selection.
+    #
+    # Backend must verify that the method is currently valid
+    # and available.
+    #
+    selected_payment_method: str | None
+
+    # Backward-compatible alias.
+    #
+    # Existing nodes may still use payment_method.
+    #
+    payment_method: str | None
+
+    # =====================================================
+    # DATABASE
+    # =====================================================
+
+    # SQLAlchemy session used by the graph when required.
+    #
+    # The session itself is infrastructure state and should
+    # never be exposed to the LLM.
+    #
+    db: Any
+
+    # =====================================================
     # RESOLVED PRODUCT
     # =====================================================
-    #
-    # product_name:
-    #     Natural-language/product reference understood from
-    #     the conversation.
-    #
-    # product_id:
-    #     Authoritative database product ID.
-    #
-    # Once product_id is resolved, order creation must use
-    # product_id rather than repeatedly trusting product_name.
-    #
-    # =====================================================
 
-    product_id: int | None
-
+    # Natural-language product reference understood by AI.
+    #
     product_name: str | None
+
+    # Authoritative database product ID.
+    #
+    # This must come from product resolution/backend data.
+    #
+    product_id: int | None
 
     # =====================================================
     # CHECKOUT QUANTITY
     # =====================================================
 
-    # Quantity requested/understood for the current checkout.
+    # Quantity understood/requested for the checkout.
     #
-    # The backend must validate the final quantity against
-    # product availability/stock before creating the order.
+    # Backend must validate final quantity against stock.
+    #
     quantity: int | None
 
     # =====================================================
     # SELECTED ADDRESS
     # =====================================================
 
-    # Authoritative database address ID selected for the
-    # current checkout.
+    # Authoritative address ID used by the current checkout.
+    #
     address_id: int | None
 
     # =====================================================
@@ -292,36 +469,39 @@ class GraphState(TypedDict, total=False):
 
     # Backend-normalized/accepted payment method.
     #
-    # This can differ from the exact wording used by the user.
-    #
     # Example:
     #
     # User:
-    #     "cash on delivery"
+    #   "cash on delivery"
     #
-    # Backend-normalized value:
-    #     "cod"
+    # Backend:
+    #   "cod"
     #
-    selected_payment_method: str | None
+    # This field should represent the accepted/normalized
+    # transaction value.
+    #
+    selected_payment_method_normalized: str | None
 
     # =====================================================
     # TOOL EXECUTION
     # =====================================================
 
-    # Tool selected by the decision layer.
+    # Tool selected after planner + policy validation.
+    #
+    # This is the actual tool that will be executed.
+    #
     tool_name: str | None
 
-    # Raw authoritative result returned by the backend tool.
+    # Authoritative result returned by the backend/tool.
     #
-    # This may contain:
+    # May contain:
     #
-    #   - product information
-    #   - search results
-    #   - order information
-    #   - billing information
-    #   - tracking information
-    #   - support information
-    #   - validation errors
+    #   products
+    #   order
+    #   billing
+    #   tracking
+    #   support
+    #   validation errors
     #
     tool_result: Any
 
@@ -331,36 +511,68 @@ class GraphState(TypedDict, total=False):
 
     # Backend-created order ID.
     #
-    # This MUST come from the backend/database.
+    # NEVER generated by AI.
     #
-    # The AI must never generate an order ID.
     order_id: int | None
 
-    # Indicates that an order has successfully been created
-    # for the current checkout.
+    # Whether an order has successfully been created for
+    # this checkout.
     #
-    # This is one of the safeguards against duplicate order
-    # creation.
+    # This is an important duplicate-order safeguard.
     #
-    # Once True, create_order must not blindly create another
-    # order for the same checkout_id.
     order_created: bool
 
-    # True after an order has successfully been created and
-    # the AI is waiting for the user to answer whether they
-    # want to track the order.
+    # Whether an order-creation attempt has already been made
+    # for this checkout.
+    #
+    order_creation_attempted: bool
+
+    # Whether the current checkout reached a terminal state.
+    #
+    # Terminal state may be:
+    #
+    #   completed
+    #   cancelled
+    #   failed
+    #
+    checkout_completed: bool
+
+    # Whether the AI is waiting for the user to decide whether
+    # they want to track the created order.
+    #
     awaiting_order_tracking_confirmation: bool
+
+    # =====================================================
+    # TRANSACTION ERROR
+    # =====================================================
+
+    # Structured backend transaction error.
+    #
+    # Example:
+    #
+    # {
+    #     "code": "OUT_OF_STOCK",
+    #     "message": "...",
+    #     "retryable": True
+    # }
+    #
+    # The AI may explain this result but must not invent it.
+    #
+    transaction_error: dict[str, Any] | None
 
     # =====================================================
     # BILLING
     # =====================================================
     #
-    # Billing values are backend-authoritative.
+    # Billing is completely backend-authoritative.
     #
-    # The AI can explain the bill but must never calculate
-    # or invent these values independently.
+    # AI can explain it but cannot calculate it independently.
     #
-    # Example authoritative backend result:
+    # =====================================================
+
+    # Primary authoritative billing object.
+    #
+    # Example:
     #
     # {
     #     "items": [
@@ -380,40 +592,24 @@ class GraphState(TypedDict, total=False):
     #     "currency": "INR"
     # }
     #
-    # No product, price, tax, discount, delivery fee or total
-    # should be hardcoded in the AI layer.
-    #
-    # =====================================================
-
-    # Primary authoritative billing object.
-    #
-    # This should be populated from the order service/tool.
     billing: dict[str, Any]
 
-    # Backward-compatible alias.
+    # Backward-compatible alias for billing.
     #
-    # New code should prefer `billing`.
-    #
-    # If both exist, `billing` is considered the primary
-    # authoritative object.
     bill: dict[str, Any]
 
-    # Purchased line items returned by backend billing logic.
+    # Backend-returned billing line items.
+    #
     billing_items: list[dict[str, Any]]
 
     # =====================================================
     # BILLING AMOUNTS
     # =====================================================
     #
-    # These fields are convenience projections of the
-    # authoritative billing object.
+    # Convenience projections of authoritative billing.
     #
-    # They MUST be copied from backend results.
+    # These MUST be copied from backend results.
     #
-    # The AI must never calculate these values.
-    #
-    # =====================================================
-
     subtotal: float | None
 
     delivery_charge: float | None
@@ -424,65 +620,15 @@ class GraphState(TypedDict, total=False):
 
     total_amount: float | None
 
-    # Currency returned by backend/business logic.
+    # Currency returned by backend.
+    #
     currency: str | None
 
-    # =====================================================
-    # BILLING / PAYMENT SUMMARY
-    # =====================================================
-
-    # Payment method actually associated with the created
-    # transaction/order.
+    # Payment method actually associated with the order.
     #
     # This may be backend-normalized.
     #
-    # Example:
-    #
-    #     "cod"
-    #
     billing_payment_method: str | None
-
-    # =====================================================
-    # TRANSACTION / IDEMPOTENCY INFORMATION
-    # =====================================================
-    #
-    # These fields allow the graph/tool layer to distinguish
-    # a new transaction from a repeated request.
-    #
-    # IMPORTANT:
-    #
-    # These fields do NOT replace database-level uniqueness or
-    # transactional protection.
-    #
-    # The backend/order service remains responsible for the
-    # final idempotency guarantee.
-    #
-    # =====================================================
-
-    # Indicates whether an order creation attempt has already
-    # been made for the current checkout.
-    order_creation_attempted: bool
-
-    # Indicates that the current checkout has reached a
-    # terminal state and should not create another order.
-    #
-    # This is different from `order_created` because a checkout
-    # may also become terminal due to cancellation/failure.
-    checkout_completed: bool
-
-    # Optional structured transaction error.
-    #
-    # Example:
-    #
-    # {
-    #     "code": "OUT_OF_STOCK",
-    #     "message": "...",
-    #     "retryable": True
-    # }
-    #
-    # The AI may explain this to the user, but should not
-    # invent the error information.
-    transaction_error: dict[str, Any] | None
 
     # =====================================================
     # FINAL RESPONSE
@@ -490,44 +636,35 @@ class GraphState(TypedDict, total=False):
 
     # Final natural-language response generated for the user.
     #
-    # The response node may use authoritative backend data
-    # stored in:
+    # The response node may use:
     #
-    #   billing
-    #   order_id
+    #   planner_decision
+    #   policy_result
     #   tool_result
+    #   order_id
+    #   billing
+    #   transaction_error
     #
-    # but must not invent transactional values.
+    # But it must never invent authoritative values.
+    #
     response: str
 
     # =====================================================
     # FRONTEND / GRAPH METADATA
     # =====================================================
     #
-    # Metadata is used to communicate structured UI state.
+    # Structured data consumed by the frontend.
     #
     # Examples:
     #
-    # {
-    #     "type": "address_selection",
-    #     "addresses": [...]
-    # }
-    #
-    # {
-    #     "type": "payment_selection",
-    #     "methods": [...]
-    # }
-    #
-    # {
-    #     "type": "order_success",
-    #     "order_id": 1,
-    #     "bill": {...},
-    #     "can_track": True
-    # }
+    # address_selection
+    # payment_selection
+    # product_search
+    # order_success
+    # tracking
+    # error
     #
     # Metadata must be generated from actual graph/backend
-    # state and should not contain fabricated transaction data.
+    # state.
     #
-    # =====================================================
-
     metadata: dict[str, Any]
