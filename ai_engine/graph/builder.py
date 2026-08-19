@@ -2,16 +2,21 @@
 # BuyQK AI - Graph Builder
 # =========================================================
 #
-# Purpose:
-# Build the BuyQK LangGraph workflow.
+# Phase 2 Architecture
 #
 # Workflow:
 #
 # START
 #   ↓
+# context
+#   ↓
 # intent
 #   ↓
 # entity
+#   ↓
+# planner
+#   ↓
+# policy
 #   ↓
 # decision
 #   ├───────────────┐
@@ -24,36 +29,75 @@
 #   ↓
 #  END
 #
-# IMPORTANT:
 #
-# The graph itself does NOT decide:
+# =========================================================
 #
-#   - what the user wants
-#   - whether checkout is active
-#   - whether an order should be created
-#   - which backend operation is required
+# ARCHITECTURAL RESPONSIBILITIES
 #
-# Those decisions belong to the AI/nodes.
+# Context Node:
+#     Loads/normalizes conversation context.
 #
-# decision_node produces:
+# Intent Node:
+#     Understands the user's high-level intent.
 #
-#     tool_name
+# Entity Node:
+#     Extracts/updates entities from the user's message.
 #
-# If tool_name is present:
+# Planner Node:
+#     Determines the proposed next action/capability.
 #
-#     decision → tool → response
+# Policy Node:
+#     Validates whether the proposed action is allowed.
 #
-# If tool_name is None:
+# Decision Node:
+#     Converts the approved plan into executable routing state.
 #
-#     decision → response
+# Tool Node:
+#     Executes the selected backend capability.
 #
-# This prevents general messages such as:
+# Response Node:
+#     Presents the result to the user.
 #
-#     "Hi"
-#     "Thank you"
-#     "Okay"
 #
-# from accidentally executing backend tools.
+# =========================================================
+#
+# IMPORTANT
+#
+# The graph itself does NOT:
+#
+#     - interpret user language
+#     - infer intent
+#     - extract entities
+#     - decide what the user wants
+#     - decide whether an order should be created
+#     - validate payment
+#     - validate stock
+#     - calculate billing
+#     - decide business authorization
+#     - invent transaction state
+#
+# Those responsibilities belong to the appropriate AI,
+# policy, tool, and backend layers.
+#
+#
+# =========================================================
+#
+# TRANSACTIONAL TRUTH
+#
+# Backend/tool results remain authoritative for:
+#
+#     - product price
+#     - stock
+#     - payment validity
+#     - address validity
+#     - order ID
+#     - order status
+#     - bill
+#     - total
+#     - delivery charge
+#     - tax
+#     - discount
+#
 #
 # =========================================================
 
@@ -70,12 +114,24 @@ from langgraph.graph import (
 
 from ai_engine.graph.state import GraphState
 
+from ai_engine.nodes.context_node import (
+    context_node,
+)
+
 from ai_engine.nodes.intent_node import (
     intent_node,
 )
 
 from ai_engine.nodes.entity_node import (
     entity_node,
+)
+
+from ai_engine.nodes.planner_node import (
+    planner_node,
+)
+
+from ai_engine.nodes.policy_node import (
+    policy_node,
 )
 
 from ai_engine.nodes.decision_node import (
@@ -92,8 +148,9 @@ from ai_engine.nodes.response_node import (
 
 
 # =========================================================
-# Tool Routing
+# Decision Routing
 # =========================================================
+
 
 def _route_after_decision(
     state: GraphState,
@@ -101,50 +158,96 @@ def _route_after_decision(
     """
     Route the workflow after decision_node.
 
-    The decision node is authoritative for deciding whether
-    a backend tool must execute.
+    The decision node is responsible for converting the
+    approved planning/policy state into executable routing
+    information.
+
+    The graph only performs structural routing.
 
     Returns:
 
         "tool"
-            when a valid tool has been selected.
+            when a tool has been selected.
 
         "response"
             when no backend operation is required.
-
-    The graph does not infer intent or reconstruct checkout
-    state here.
     """
 
-    tool_name = state.get("tool_name")
+    tool_name = state.get(
+        "tool_name"
+    )
 
-    if isinstance(tool_name, str) and tool_name.strip():
-        return "tool"
+    if isinstance(
+        tool_name,
+        str,
+    ):
+
+        if tool_name.strip():
+
+            return "tool"
 
     return "response"
+
+
+# =========================================================
+# Tool Wrapper
+# =========================================================
+
+
+def _create_tool_wrapper(
+    default_db: Any = None,
+):
+    """
+    Create the tool-node wrapper.
+
+    The runtime database session should normally come from
+    GraphState.
+
+    default_db exists only for backwards compatibility with
+    callers that still construct the graph with build_graph(db).
+    """
+
+    def _tool_wrapper(
+        state: GraphState,
+    ):
+        db = state.get(
+            "db"
+        )
+
+        if db is None:
+
+            db = default_db
+
+        return tool_node(
+            state,
+            db,
+        )
+
+    return _tool_wrapper
 
 
 # =========================================================
 # Build Graph
 # =========================================================
 
+
 def build_graph(
     db: Any = None,
 ):
     """
-    Build and compile the BuyQK LangGraph workflow.
+    Build and compile the BuyQK Phase-2 LangGraph workflow.
 
-    Parameters:
-        db:
-            Optional database session.
+    Parameters
+    ----------
+    db:
+        Optional compatibility database session.
 
-            The preferred source of the database session is
-            the GraphState itself. This argument exists for
-            compatibility with callers that provide a default
-            database session while constructing the graph.
+        Runtime requests should preferably provide the database
+        session through GraphState.
 
-    Returns:
-        Compiled LangGraph application.
+    Returns
+    -------
+    Compiled LangGraph application.
     """
 
     graph = StateGraph(
@@ -152,8 +255,13 @@ def build_graph(
     )
 
     # =====================================================
-    # Register Nodes
+    # Register Phase-2 Nodes
     # =====================================================
+
+    graph.add_node(
+        "context",
+        context_node,
+    )
 
     graph.add_node(
         "intent",
@@ -166,40 +274,25 @@ def build_graph(
     )
 
     graph.add_node(
+        "planner",
+        planner_node,
+    )
+
+    graph.add_node(
+        "policy",
+        policy_node,
+    )
+
+    graph.add_node(
         "decision",
         decision_node,
     )
 
-    # =====================================================
-    # Tool Wrapper
-    # =====================================================
-    #
-    # tool_node requires the database session explicitly.
-    #
-    # GraphState is the authoritative runtime state, so the
-    # wrapper first attempts to read db from state.
-    #
-    # The optional build_graph(db=...) value is only a
-    # compatibility fallback.
-    #
-    # =====================================================
-
-    def _tool_wrapper(
-        state: GraphState,
-    ):
-        db_from_state = state.get("db")
-
-        if db_from_state is None:
-            db_from_state = db
-
-        return tool_node(
-            state,
-            db_from_state,
-        )
-
     graph.add_node(
         "tool",
-        _tool_wrapper,
+        _create_tool_wrapper(
+            db
+        ),
     )
 
     graph.add_node(
@@ -208,24 +301,96 @@ def build_graph(
     )
 
     # =====================================================
-    # Workflow
+    # Context
+    # =====================================================
+    #
+    # START → Context
+    #
+    # Context is responsible for loading/normalizing the
+    # information required by the AI understanding layer.
+    #
     # =====================================================
 
-    # START → Intent
     graph.add_edge(
         START,
+        "context",
+    )
+
+    # =====================================================
+    # Context → Intent
+    # =====================================================
+
+    graph.add_edge(
+        "context",
         "intent",
     )
 
+    # =====================================================
     # Intent → Entity
+    # =====================================================
+
     graph.add_edge(
         "intent",
         "entity",
     )
 
-    # Entity → Decision
+    # =====================================================
+    # Entity → Planner
+    # =====================================================
+    #
+    # At this point the graph should contain:
+    #
+    #     context
+    #     intent
+    #     entities
+    #     conversation history
+    #
+    # The planner uses these inputs to propose the next
+    # capability/action.
+    #
+    # =====================================================
+
     graph.add_edge(
         "entity",
+        "planner",
+    )
+
+    # =====================================================
+    # Planner → Policy
+    # =====================================================
+    #
+    # Planner proposes.
+    #
+    # Policy validates.
+    #
+    # The planner does not directly execute a backend action.
+    #
+    # =====================================================
+
+    graph.add_edge(
+        "planner",
+        "policy",
+    )
+
+    # =====================================================
+    # Policy → Decision
+    # =====================================================
+    #
+    # Decision receives:
+    #
+    #     - intent
+    #     - entities
+    #     - planner state
+    #     - policy state
+    #     - checkout state
+    #     - conversation context
+    #
+    # It converts the approved state into executable routing.
+    #
+    # =====================================================
+
+    graph.add_edge(
+        "policy",
         "decision",
     )
 
@@ -233,16 +398,10 @@ def build_graph(
     # Decision → Tool OR Response
     # =====================================================
     #
-    # IMPORTANT:
+    # The graph does not decide which tool to use.
     #
-    # Do NOT use:
-    #
-    #     decision → tool
-    #
-    # unconditionally.
-    #
-    # decision_node is responsible for determining whether
-    # a backend operation is actually required.
+    # It only checks the routing value produced by
+    # decision_node.
     #
     # =====================================================
 
@@ -259,16 +418,18 @@ def build_graph(
     # Tool → Response
     # =====================================================
     #
-    # The tool node updates GraphState with authoritative
-    # backend information such as:
+    # Tool execution produces authoritative backend state.
     #
-    #   checkout_id
-    #   checkout_status
-    #   order_created
-    #   order_id
-    #   bill
+    # Examples:
     #
-    # response_node then interprets that state for the user.
+    #     checkout_id
+    #     checkout_status
+    #     order_created
+    #     order_id
+    #     bill
+    #     tool_result
+    #
+    # Response then presents that result.
     #
     # =====================================================
 
@@ -295,6 +456,12 @@ def build_graph(
 
 # =========================================================
 # Default Compiled Graph
+# =========================================================
+#
+# The default graph does not own a database session.
+#
+# Runtime callers should inject db into GraphState.
+#
 # =========================================================
 
 app = build_graph()
