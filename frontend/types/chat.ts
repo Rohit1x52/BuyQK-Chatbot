@@ -1,35 +1,52 @@
 // ============================================================
-// BuyQK AI - Shared Chat Types
+// BuyQK AI - Shared Chat / Cart Types
 // ============================================================
 //
 // Backend:
-//     FastAPI -> POST /chat
+//
+//     FastAPI
+//         ↓
+//     /chat
+//     /cart
 //
 // Frontend:
-//     chat.ts -> chatStore.ts -> Chat UI
+//
+//     chat.ts
+//         ↓
+//     chatStore.ts
+//         ↓
+//     Cart / Checkout / Chat UI
 //
 // Keep these types aligned with:
 //
 //     backend/schemas/chat_schema.py
 //     backend/api/chat.py
+//     backend/api/cart.py
+//     backend/services/cart_service.py
 //
 // IMPORTANT:
 //
-// The backend/database is authoritative for:
+// Backend/database/service results are authoritative for:
 //
 //     - product price
 //     - stock
+//     - product availability
+//     - cart quantities
+//     - cart subtotal
 //     - delivery charge
 //     - discount
 //     - tax
 //     - final total
+//     - checkout ID
 //     - order ID
 //     - order status
 //     - payment status
 //     - billing
 //
-// The frontend only displays authoritative values.
-// It must NOT calculate transactional values.
+// The frontend only displays and stores these values.
+//
+// The frontend must NOT independently calculate transactional
+// values or invent transaction state.
 // ============================================================
 
 
@@ -137,11 +154,267 @@ export interface Product {
 
 
 // ============================================================
+// CART - PHASE 3
+// ============================================================
+//
+// The cart is now a first-class backend entity.
+//
+// Product
+//     ↓
+// CartItem
+//     ↓
+// Cart
+//     ↓
+// Checkout
+//     ↓
+// Order
+//
+// IMPORTANT:
+//
+// These values originate from backend/cart_service.py.
+//
+// The frontend must not:
+//
+//     - calculate line totals
+//     - calculate subtotal
+//     - change stock
+//     - determine availability
+//     - invent cart IDs
+//     - silently mutate cart state
+//
+// ============================================================
+
+
+// ============================================================
+// Cart Status
+// ============================================================
+
+export type CartStatus =
+  | string;
+
+
+// ============================================================
+// Cart Item
+// ============================================================
+
+export interface CartItem {
+  /**
+   * Unique database ID of this cart item.
+   */
+  id: number;
+
+  /**
+   * Product database ID.
+   */
+  product_id: number;
+
+  /**
+   * Product name returned by the backend.
+   */
+  product_name: string;
+
+  /**
+   * Product brand.
+   */
+  brand?: string | null;
+
+  /**
+   * Product description.
+   */
+  description?: string | null;
+
+  /**
+   * Product image URL.
+   */
+  image_url?: string | null;
+
+  /**
+   * Current cart quantity.
+   *
+   * This is authoritative backend state.
+   */
+  quantity: number;
+
+  /**
+   * Current backend-authoritative product price.
+   */
+  unit_price: number;
+
+  /**
+   * Backend-calculated quantity × unit price.
+   */
+  line_total: number;
+
+  /**
+   * Current backend-reported available stock.
+   */
+  stock?: number | null;
+
+  /**
+   * Current backend-reported product availability.
+   */
+  is_available?: boolean | null;
+
+  /**
+   * Allows future cart-item metadata without breaking
+   * the frontend type.
+   */
+  [key: string]: unknown;
+}
+
+
+// ============================================================
+// Cart Summary
+// ============================================================
+
+export interface CartSummary {
+  /**
+   * Number of distinct cart items.
+   */
+  item_count: number;
+
+  /**
+   * Total number of physical units.
+   */
+  total_quantity: number;
+
+  /**
+   * Backend-calculated subtotal.
+   */
+  subtotal: number;
+
+  /**
+   * Backend-provided currency.
+   */
+  currency: string;
+
+  /**
+   * Delivery charge.
+   *
+   * May be null until checkout/billing determines it.
+   */
+  delivery_charge: number | null;
+
+  /**
+   * Discount.
+   *
+   * May be null when no discount has been calculated.
+   */
+  discount: number | null;
+
+  /**
+   * Tax.
+   *
+   * May be null until checkout/billing determines it.
+   */
+  tax: number | null;
+
+  /**
+   * Current backend-calculated total.
+   */
+  total: number;
+
+  /**
+   * Future backend summary fields.
+   */
+  [key: string]: unknown;
+}
+
+
+// ============================================================
+// Cart
+// ============================================================
+
+export interface Cart {
+  /**
+   * Authoritative database cart ID.
+   */
+  cart_id: number;
+
+  /**
+   * User who owns this cart.
+   */
+  user_id: number;
+
+  /**
+   * Current backend cart status.
+   */
+  status: CartStatus;
+
+  /**
+   * Current authoritative cart items.
+   */
+  items: CartItem[];
+
+  /**
+   * Backend-calculated cart summary.
+   */
+  summary: CartSummary;
+
+  /**
+   * Backend timestamp.
+   */
+  created_at?: string | null;
+
+  /**
+   * Backend timestamp.
+   */
+  updated_at?: string | null;
+
+  /**
+   * Future cart metadata.
+   */
+  [key: string]: unknown;
+}
+
+
+// ============================================================
+// Cart API Requests
+// ============================================================
+
+export interface AddCartItemRequest {
+  user_id: number;
+
+  product_id: number;
+
+  quantity: number;
+}
+
+
+export interface UpdateCartItemRequest {
+  user_id: number;
+
+  quantity: number;
+}
+
+
+export interface UpdateCartProductRequest {
+  user_id: number;
+
+  quantity: number;
+}
+
+
+// ============================================================
+// Cart API Responses
+// ============================================================
+
+export interface CartResponse {
+  success: boolean;
+
+  cart: Cart;
+}
+
+
+// ============================================================
 // Checkout State
 // ============================================================
 //
 // This mirrors the authoritative transaction state introduced
 // during Phase 1 / Phase 2.
+//
+// Phase 3 adds cart_id so the frontend can associate the current
+// checkout with the cart that produced it.
 //
 // IMPORTANT:
 //
@@ -163,9 +436,6 @@ export interface CheckoutState {
 
   /**
    * Current backend-authoritative checkout status.
-   *
-   * Kept as string because the backend may introduce
-   * additional states without requiring a frontend release.
    */
   checkout_status: CheckoutStatus | null;
 
@@ -181,7 +451,15 @@ export interface CheckoutState {
   order_id: number | null;
 
   /**
+   * Cart associated with this checkout.
+   */
+  cart_id: number | null;
+
+  /**
    * Resolved authoritative product ID.
+   *
+   * Kept for backwards compatibility with the Phase 1/2
+   * single-product checkout flow.
    */
   product_id: number | null;
 
@@ -192,6 +470,9 @@ export interface CheckoutState {
 
   /**
    * Requested/purchased quantity.
+   *
+   * Kept for backwards compatibility with the Phase 1/2
+   * single-product checkout flow.
    */
   quantity: number | null;
 
@@ -221,7 +502,6 @@ export interface CheckoutState {
 // The frontend displays these values.
 // It must NOT calculate them.
 // ============================================================
-
 
 export interface BillItem {
   /**
@@ -326,9 +606,6 @@ export interface Bill {
 // ============================================================
 // Purchase Summary
 // ============================================================
-//
-// Optional simplified representation returned by tools.
-// ============================================================
 
 export interface PurchaseSummary {
   items: BillItem[];
@@ -389,6 +666,7 @@ export interface ChatMetadata {
    *     tracking
    *     cancellation
    *     product_search
+   *     cart
    */
   type?: string;
 
@@ -419,6 +697,49 @@ export interface ChatMetadata {
 
 
   // ----------------------------------------------------------
+  // Cart - Phase 3
+  // ----------------------------------------------------------
+
+  /**
+   * Current backend-authoritative cart.
+   *
+   * This may be returned by the AI/tool layer after:
+   *
+   *     add_item
+   *     remove_item
+   *     update_quantity
+   *     clear_cart
+   *     show_cart
+   *     checkout_cart
+   */
+  cart?: Cart | null;
+
+  /**
+   * Current cart database ID.
+   */
+  cart_id?: number | null;
+
+  /**
+   * Cart operation performed by the backend/tool layer.
+   *
+   * Examples:
+   *
+   *     add_item
+   *     remove_item
+   *     update_quantity
+   *     clear_cart
+   *     show_cart
+   *     checkout
+   */
+  cart_action?: string | null;
+
+  /**
+   * True when the backend/tool layer changed cart state.
+   */
+  cart_updated?: boolean;
+
+
+  // ----------------------------------------------------------
   // Product
   // ----------------------------------------------------------
 
@@ -439,6 +760,13 @@ export interface ChatMetadata {
   order_id?: number | null;
 
   status?: string | null;
+
+  /**
+   * Explicit order status when returned by backend.
+   *
+   * `status` remains supported for backwards compatibility.
+   */
+  order_status?: string | null;
 
   payment_status?: string | null;
 
@@ -491,6 +819,15 @@ export interface ChatMetadata {
 
   tracking?: TrackingMetadata | null;
 
+  can_track?: boolean;
+
+
+  // ----------------------------------------------------------
+  // Cancellation
+  // ----------------------------------------------------------
+
+  can_cancel?: boolean;
+
 
   // ----------------------------------------------------------
   // Support
@@ -542,6 +879,32 @@ export interface PaymentSelectionMetadata
 
 
 // ============================================================
+// Cart Metadata - Phase 3
+// ============================================================
+
+export interface CartMetadata
+  extends ChatMetadata {
+
+  type: "cart";
+
+  /**
+   * Backend-authoritative cart.
+   */
+  cart: Cart;
+
+  /**
+   * Operation that produced this cart response.
+   */
+  cart_action?: string | null;
+
+  /**
+   * Indicates that cart state changed.
+   */
+  cart_updated?: boolean;
+}
+
+
+// ============================================================
 // Order Success Metadata
 // ============================================================
 
@@ -559,6 +922,11 @@ export interface OrderSuccessMetadata
    * Final checkout state.
    */
   checkout_status?: string | null;
+
+  /**
+   * Cart used for this checkout.
+   */
+  cart_id?: number | null;
 
   /**
    * Backend confirmation that the order exists.
@@ -708,6 +1076,17 @@ export interface ChatMessage {
 // ============================================================
 // Chat State
 // ============================================================
+//
+// The store keeps a frontend representation of backend state.
+//
+// Backend remains authoritative.
+//
+// Phase 3 adds:
+//
+//     cart
+//
+// so cart state survives across conversational turns.
+// ============================================================
 
 export interface ChatState {
   /**
@@ -742,4 +1121,11 @@ export interface ChatState {
    * not calculated by the frontend.
    */
   checkout: CheckoutState | null;
+
+  /**
+   * Current authoritative cart.
+   *
+   * This should be updated only from backend/API responses.
+   */
+  cart: Cart | null;
 }
