@@ -1,16 +1,21 @@
+# =========================================================
+# BuyQK - SQLite Database Configuration
+# =========================================================
+
 from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 
-# ============================================================
-# BuyQK Database Configuration
-# ============================================================
-
-# Project root:
+# =========================================================
+# Project Root
+# =========================================================
+#
+# Project:
 #
 # D:\BuyQK\buyqk-ai\
 #
@@ -22,42 +27,125 @@ from sqlalchemy.orm import sessionmaker
 # parents[1] -> backend
 # parents[2] -> buyqk-ai
 #
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# =========================================================
+
+PROJECT_ROOT = (
+    Path(__file__)
+    .resolve()
+    .parents[2]
+)
 
 
-# ============================================================
-# SQLite Database Path
-# ============================================================
+# =========================================================
+# Database File
+# =========================================================
 
-DATABASE_PATH = PROJECT_ROOT / "buyqk.db"
+DATABASE_PATH = (
+    PROJECT_ROOT / "buyqk.db"
+)
 
 
-# Convert Windows path safely for SQLAlchemy SQLite URL.
+# =========================================================
+# SQLite URL
+# =========================================================
 #
-# Example:
+# Using as_posix() makes the URL work correctly on Windows:
 #
 # sqlite:///D:/BuyQK/buyqk-ai/buyqk.db
 #
+# =========================================================
+
 DATABASE_URL = (
     f"sqlite:///{DATABASE_PATH.as_posix()}"
 )
 
 
-# ============================================================
+# =========================================================
 # Debug Information
-# ============================================================
+# =========================================================
 
 print("=" * 60)
 print("[DATABASE] BuyQK SQLite configuration")
-print(f"[DATABASE] Project root : {PROJECT_ROOT}")
-print(f"[DATABASE] Database file : {DATABASE_PATH}")
-print(f"[DATABASE] Database URL  : {DATABASE_URL}")
+print(
+    f"[DATABASE] Project root : "
+    f"{PROJECT_ROOT}"
+)
+print(
+    f"[DATABASE] Database file : "
+    f"{DATABASE_PATH}"
+)
+print(
+    f"[DATABASE] Database URL  : "
+    f"{DATABASE_URL}"
+)
 print("=" * 60)
 
 
-# ============================================================
+# =========================================================
+# SQLite Connection Configuration
+# =========================================================
+
+@event.listens_for(
+    Engine,
+    "connect",
+)
+def _configure_sqlite(
+    dbapi_connection,
+    connection_record,
+):
+    """
+    Configure every SQLite connection.
+
+    Foreign-key enforcement is important because BuyQK uses
+    relationships such as:
+
+        orders → users
+        orders → addresses
+        orders → riders
+        order_items → orders
+        order_items → products
+        payments → orders
+
+    WAL improves read/write concurrency for the MVP,
+    particularly when the frontend and AI workflow access
+    SQLite around the same time.
+    """
+
+    cursor = dbapi_connection.cursor()
+
+    try:
+        # ---------------------------------------------
+        # Enforce foreign keys
+        # ---------------------------------------------
+
+        cursor.execute(
+            "PRAGMA foreign_keys=ON"
+        )
+
+        # ---------------------------------------------
+        # Improve SQLite read/write concurrency
+        # ---------------------------------------------
+
+        cursor.execute(
+            "PRAGMA journal_mode=WAL"
+        )
+
+        # ---------------------------------------------
+        # Wait briefly for another transaction instead
+        # of immediately failing with "database is locked".
+        # ---------------------------------------------
+
+        cursor.execute(
+            "PRAGMA busy_timeout=5000"
+        )
+
+    finally:
+        cursor.close()
+
+
+# =========================================================
 # SQLAlchemy Engine
-# ============================================================
+# =========================================================
 
 engine = create_engine(
     DATABASE_URL,
@@ -68,9 +156,9 @@ engine = create_engine(
 )
 
 
-# ============================================================
+# =========================================================
 # Session Factory
-# ============================================================
+# =========================================================
 
 SessionLocal = sessionmaker(
     autocommit=False,
@@ -79,15 +167,17 @@ SessionLocal = sessionmaker(
 )
 
 
-# ============================================================
+# =========================================================
 # FastAPI Database Dependency
-# ============================================================
+# =========================================================
 
 def get_db():
     """
-    Create a database session for a FastAPI request.
+    Create one SQLAlchemy session for a FastAPI request.
 
     The session is always closed after the request finishes.
+
+    Transaction ownership remains with the service layer.
     """
 
     db = SessionLocal()
