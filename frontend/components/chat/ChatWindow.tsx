@@ -8,6 +8,7 @@ import MessageBubble from "./MessageBubble";
 import ChatInput from "./ChatInput";
 import AddressSelector from "./AddressSelector";
 import PaymentSelector from "./PaymentSelector";
+import Cart from "../cart/Cart";
 
 import type {
   AddressSelectionMetadata,
@@ -15,18 +16,61 @@ import type {
   PaymentSelectionMetadata,
 } from "../../types/chat";
 
-
 /* =========================================================
    Metadata Types
    ========================================================= */
 
+type OrderMetadata = {
+  type?: string;
+
+  checkout_id?: string | null;
+  checkout_status?: string | null;
+
+  order_created?: boolean;
+  order_id?: number | string | null;
+
+  status?: string | null;
+  payment_status?: string | null;
+  payment_method?: string | null;
+
+  can_track?: boolean;
+  can_cancel?: boolean;
+
+  bill?: Bill | null;
+
+  [key: string]: unknown;
+};
+
+
+type TrackingMetadata = {
+  type?: string;
+
+  order_id?: number | string | null;
+  status?: string | null;
+
+  tracking_status?: string | null;
+  can_track?: boolean;
+
+  [key: string]: unknown;
+};
+
+
 type ChatMetadata =
   | AddressSelectionMetadata
   | PaymentSelectionMetadata
+  | OrderMetadata
+  | TrackingMetadata
   | {
       type?: string;
+
+      checkout_id?: string | null;
+      checkout_status?: string | null;
+
+      order_created?: boolean;
+      order_id?: number | string | null;
+
       bill?: Bill | null;
-      purchase_summary?: unknown;
+
       [key: string]: unknown;
     };
 
@@ -38,7 +82,6 @@ type ChatMetadata =
 function getMessageMetadata(
   message: unknown
 ): ChatMetadata | null {
-
   if (
     !message ||
     typeof message !== "object"
@@ -65,28 +108,110 @@ function getMessageMetadata(
 
 
 /* =========================================================
-   Billing Validation
-   =========================================================
+   Backend Metadata Helpers
+   ========================================================= */
+
+/**
+ * Extract the checkout identifier returned by the backend.
  *
+ * The frontend never generates this value.
+ */
+function getCheckoutId(
+  metadata: ChatMetadata | null
+): string | null {
+  if (!metadata) {
+    return null;
+  }
+
+  const checkoutId =
+    metadata.checkout_id;
+
+  return typeof checkoutId === "string" &&
+    checkoutId.trim()
+    ? checkoutId
+    : null;
+}
+
+
+/**
+ * Extract the backend checkout status.
+ *
+ * This value is informational only.
+ * The frontend does not decide whether a checkout is valid.
+ */
+function getCheckoutStatus(
+  metadata: ChatMetadata | null
+): string | null {
+  if (!metadata) {
+    return null;
+  }
+
+  const status =
+    metadata.checkout_status;
+
+  return typeof status === "string" &&
+    status.trim()
+    ? status
+    : null;
+}
+
+
+/**
+ * Extract backend order creation state.
+ */
+function getOrderCreated(
+  metadata: ChatMetadata | null
+): boolean {
+  return metadata?.order_created === true;
+}
+
+
+/**
+ * Extract backend order ID.
+ */
+function getOrderId(
+  metadata: ChatMetadata | null
+): number | string | null {
+  if (!metadata) {
+    return null;
+  }
+
+  const orderId =
+    metadata.order_id;
+
+  if (
+    typeof orderId === "number" ||
+    typeof orderId === "string"
+  ) {
+    return orderId;
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   Billing Validation
+   ========================================================= */
+
+/**
  * The backend/order service is authoritative.
  *
- * This helper ONLY checks whether the backend returned
+ * This helper ONLY verifies that the backend returned
  * enough structured data to safely render the bill.
  *
  * It NEVER calculates:
- *   - line totals
- *   - subtotal
- *   - delivery charge
- *   - discount
- *   - tax
- *   - total
  *
- * ========================================================= */
-
+ * - line totals
+ * - subtotal
+ * - delivery charge
+ * - discount
+ * - tax
+ * - total
+ */
 function getValidBill(
   metadata: ChatMetadata | null
 ): Bill | null {
-
   if (!metadata) {
     return null;
   }
@@ -116,22 +241,17 @@ function getValidBill(
 
 /* =========================================================
    Currency Formatting
-   =========================================================
- *
+   ========================================================= */
+
+/**
  * Currency comes from the backend.
  *
  * No product-specific currency or price is hardcoded.
- *
- * If the backend does not provide a currency, the value is
- * displayed numerically rather than inventing a currency.
- *
- * ========================================================= */
-
+ */
 function formatMoney(
   amount: number,
   currency?: string | null
 ): string {
-
   if (!Number.isFinite(amount)) {
     return "—";
   }
@@ -163,7 +283,6 @@ function formatMoney(
       }
     ).format(amount);
   } catch {
-    // Unknown backend currency should not crash the chat UI.
     return `${normalizedCurrency} ${amount.toFixed(2)}`;
   }
 }
@@ -178,7 +297,6 @@ function BillSummary({
 }: {
   bill: Bill;
 }) {
-
   const discount =
     typeof bill.discount === "number"
       ? bill.discount
@@ -203,7 +321,6 @@ function BillSummary({
         boxSizing: "border-box",
       }}
     >
-
       {/* =================================================
           Bill Header
           ================================================= */}
@@ -217,7 +334,6 @@ function BillSummary({
           marginBottom: "16px",
         }}
       >
-
         <div>
           <h3
             style={{
@@ -232,17 +348,16 @@ function BillSummary({
 
           {bill.order_id !== null &&
             bill.order_id !== undefined && (
-
-            <p
-              style={{
-                margin: "4px 0 0",
-                fontSize: "0.82rem",
-                color: "var(--text-secondary)",
-              }}
-            >
-              Order #{bill.order_id}
-            </p>
-          )}
+              <p
+                style={{
+                  margin: "4px 0 0",
+                  fontSize: "0.82rem",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                Order #{bill.order_id}
+              </p>
+            )}
         </div>
 
         {bill.payment_method && (
@@ -257,7 +372,6 @@ function BillSummary({
             {bill.payment_method}
           </span>
         )}
-
       </div>
 
 
@@ -272,10 +386,8 @@ function BillSummary({
           gap: "12px",
         }}
       >
-
         {bill.items.map(
           (item, index) => (
-
             <div
               key={
                 item.product_id ??
@@ -290,14 +402,12 @@ function BillSummary({
                   "1px solid var(--border-color, #eeeeee)",
               }}
             >
-
               <div
                 style={{
                   minWidth: 0,
                   flex: 1,
                 }}
               >
-
                 <div
                   style={{
                     fontWeight: 600,
@@ -321,9 +431,7 @@ function BillSummary({
                     bill.currency
                   )}
                 </div>
-
               </div>
-
 
               <div
                 style={{
@@ -337,11 +445,9 @@ function BillSummary({
                   bill.currency
                 )}
               </div>
-
             </div>
           )
         )}
-
       </div>
 
 
@@ -358,7 +464,6 @@ function BillSummary({
           fontSize: "0.9rem",
         }}
       >
-
         <div
           style={{
             display: "flex",
@@ -376,7 +481,6 @@ function BillSummary({
           </span>
         </div>
 
-
         <div
           style={{
             display: "flex",
@@ -393,7 +497,6 @@ function BillSummary({
             )}
           </span>
         </div>
-
 
         {discount !== 0 && (
           <div
@@ -414,7 +517,6 @@ function BillSummary({
           </div>
         )}
 
-
         {tax !== 0 && (
           <div
             style={{
@@ -433,7 +535,6 @@ function BillSummary({
             </span>
           </div>
         )}
-
       </div>
 
 
@@ -455,7 +556,6 @@ function BillSummary({
           fontWeight: 700,
         }}
       >
-
         <span>
           Total
         </span>
@@ -466,9 +566,258 @@ function BillSummary({
             bill.currency
           )}
         </span>
+      </div>
+    </section>
+  );
+}
 
+
+/* =========================================================
+   Order / Checkout Metadata Display
+   ========================================================= */
+
+/**
+ * This component only displays authoritative metadata.
+ *
+ * It does not:
+ *
+ * - create orders
+ * - change checkout state
+ * - calculate bills
+ * - determine whether tracking/cancellation is allowed
+ * - select payment methods
+ */
+function OrderStatusSummary({
+  metadata,
+}: {
+  metadata: ChatMetadata;
+}) {
+  const checkoutId =
+    getCheckoutId(metadata);
+
+  const checkoutStatus =
+    getCheckoutStatus(metadata);
+
+  const orderCreated =
+    getOrderCreated(metadata);
+
+  const orderId =
+    getOrderId(metadata);
+
+  const orderStatus =
+    typeof metadata.status === "string"
+      ? metadata.status
+      : null;
+
+  const paymentStatus =
+    typeof metadata.payment_status === "string"
+      ? metadata.payment_status
+      : null;
+
+  const showOrderInformation =
+    checkoutId !== null ||
+    checkoutStatus !== null ||
+    orderCreated ||
+    orderId !== null ||
+    orderStatus !== null ||
+    paymentStatus !== null;
+
+  if (!showOrderInformation) {
+    return null;
+  }
+
+  return (
+    <section
+      aria-label="Order status"
+      style={{
+        width: "100%",
+        maxWidth: "560px",
+        border: "1px solid var(--border-color, #e5e7eb)",
+        borderRadius: "12px",
+        padding: "14px 16px",
+        background:
+          "var(--surface-secondary, #f9fafb)",
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: "10px",
+          color: "var(--text-primary)",
+        }}
+      >
+        Order Status
       </div>
 
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "6px",
+          fontSize: "0.85rem",
+        }}
+      >
+        {orderId !== null && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: "12px",
+            }}
+          >
+            <span>Order ID</span>
+            <strong>{orderId}</strong>
+          </div>
+        )}
+
+        {checkoutStatus && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: "12px",
+            }}
+          >
+            <span>Checkout</span>
+            <span>{checkoutStatus}</span>
+          </div>
+        )}
+
+        {orderStatus && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: "12px",
+            }}
+          >
+            <span>Order status</span>
+            <span>{orderStatus}</span>
+          </div>
+        )}
+
+        {paymentStatus && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: "12px",
+            }}
+          >
+            <span>Payment status</span>
+            <span>{paymentStatus}</span>
+          </div>
+        )}
+
+        {orderCreated && (
+          <div
+            style={{
+              marginTop: "4px",
+              fontSize: "0.8rem",
+              color: "var(--text-secondary)",
+            }}
+          >
+            Order creation has been confirmed by the backend.
+          </div>
+        )}
+
+        {checkoutId && (
+          <div
+            style={{
+              marginTop: "4px",
+              fontSize: "0.72rem",
+              color: "var(--text-secondary)",
+              overflowWrap: "anywhere",
+            }}
+          >
+            Checkout: {checkoutId}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+
+/* =========================================================
+   Tracking Metadata Display
+   ========================================================= */
+
+function TrackingSummary({
+  metadata,
+}: {
+  metadata: ChatMetadata;
+}) {
+  const orderId =
+    getOrderId(metadata);
+
+  const status =
+    typeof metadata.tracking_status === "string"
+      ? metadata.tracking_status
+      : typeof metadata.status === "string"
+        ? metadata.status
+        : null;
+
+  if (
+    orderId === null &&
+    status === null
+  ) {
+    return null;
+  }
+
+  return (
+    <section
+      aria-label="Tracking information"
+      style={{
+        width: "100%",
+        maxWidth: "560px",
+        border: "1px solid var(--border-color, #e5e7eb)",
+        borderRadius: "12px",
+        padding: "14px 16px",
+        background:
+          "var(--surface-secondary, #f9fafb)",
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: "8px",
+          color: "var(--text-primary)",
+        }}
+      >
+        Tracking
+      </div>
+
+      {orderId !== null && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "12px",
+            fontSize: "0.85rem",
+          }}
+        >
+          <span>Order ID</span>
+          <strong>{orderId}</strong>
+        </div>
+      )}
+
+      {status && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "12px",
+            marginTop: "6px",
+            fontSize: "0.85rem",
+          }}
+        >
+          <span>Status</span>
+          <span>{status}</span>
+        </div>
+      )}
     </section>
   );
 }
@@ -479,12 +828,44 @@ function BillSummary({
    ========================================================= */
 
 export default function ChatWindow() {
-
   const {
     messages,
     isLoading,
     error,
   } = useChatStore();
+
+  /* -------------------------------------------------------
+     Authoritative Cart
+
+     Cart data is returned by the backend inside assistant
+     message metadata. We recover the most recent cart snapshot
+     instead of calculating or reconstructing cart state in the
+     UI. This keeps ChatWindow compatible with the current
+     chatStore while still allowing Cart to update immediately
+     after every cart operation.
+     ------------------------------------------------------- */
+
+  const cart = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const metadata = getMessageMetadata(messages[index]);
+
+      if (!metadata) {
+        continue;
+      }
+
+      const candidate = metadata.cart;
+
+      if (
+        candidate &&
+        typeof candidate === "object" &&
+        !Array.isArray(candidate)
+      ) {
+        return candidate as Record<string, unknown>;
+      }
+    }
+
+    return null;
+  })();
 
 
   /* -------------------------------------------------------
@@ -496,13 +877,10 @@ export default function ChatWindow() {
       null
     );
 
-
   useEffect(() => {
-
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
     });
-
   }, [
     messages,
     isLoading,
@@ -514,7 +892,6 @@ export default function ChatWindow() {
      ======================================================= */
 
   return (
-
     <div className="chat-window">
 
       {/* =================================================
@@ -522,7 +899,6 @@ export default function ChatWindow() {
           ================================================= */}
 
       <header className="chat-header">
-
         <h1>
           BuyQK AI
         </h1>
@@ -530,7 +906,6 @@ export default function ChatWindow() {
         <p>
           Your smart shopping assistant
         </p>
-
       </header>
 
 
@@ -561,7 +936,6 @@ export default function ChatWindow() {
                 strokeWidth="1.5"
                 aria-hidden="true"
               >
-
                 <path
                   d="
                     M21 11.5a8.38 8.38 0 0 1-.9 3.8
@@ -574,9 +948,7 @@ export default function ChatWindow() {
                     h.5a8.48 8.48 0 0 1 8 8v.5z
                   "
                 />
-
               </svg>
-
 
               <h2
                 style={{
@@ -588,7 +960,6 @@ export default function ChatWindow() {
               >
                 How can I help you?
               </h2>
-
 
               <p
                 style={{
@@ -631,6 +1002,24 @@ export default function ChatWindow() {
                   getValidBill(
                     metadata
                   );
+
+
+                const isOrderMetadata =
+                  metadata?.type ===
+                    "order_success" ||
+                  metadata?.type ===
+                    "order_created" ||
+                  metadata?.order_created === true ||
+                  metadata?.order_id !==
+                    undefined;
+
+                const isTrackingMetadata =
+                  metadata?.type ===
+                    "tracking" ||
+                  metadata?.type ===
+                    "tracking_update" ||
+                  metadata?.tracking_status !==
+                    undefined;
 
 
                 return (
@@ -684,13 +1073,35 @@ export default function ChatWindow() {
 
 
                     {/* =================================
+                        Order / Checkout Metadata
+                        ================================= */}
+
+                    {isOrderMetadata && metadata && (
+                      <OrderStatusSummary
+                        metadata={metadata}
+                      />
+                    )}
+
+
+                    {/* =================================
+                        Tracking Metadata
+                        ================================= */}
+
+                    {isTrackingMetadata && metadata && (
+                      <TrackingSummary
+                        metadata={metadata}
+                      />
+                    )}
+
+
+                    {/* =================================
                         Order Bill
                         =================================
 
                         The bill is rendered only when
                         authoritative billing data exists.
 
-                        No calculation happens here.
+                        No calculations happen here.
                         ================================= */}
 
                     {bill && (
@@ -700,7 +1111,6 @@ export default function ChatWindow() {
                     )}
 
                   </div>
-
                 );
               }
             )}
@@ -778,6 +1188,23 @@ export default function ChatWindow() {
         />
 
       </main>
+
+
+      {/* =================================================
+          Cart
+          ================================================= */}
+
+      {cart && (
+        <div
+          style={{
+            padding: "0 16px 16px",
+          }}
+        >
+          <Cart
+            cart={cart}
+          />
+        </div>
+      )}
 
 
       {/* =================================================
