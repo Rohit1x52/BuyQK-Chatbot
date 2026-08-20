@@ -397,6 +397,7 @@ def _build_initial_state(
     previous_state: dict[str, Any],
     selected_address_id: int | None,
     payment_method: str | None,
+    checkout_id: str | None,
 ) -> dict[str, Any]:
     """
     Build the GraphState for the current request.
@@ -417,6 +418,13 @@ def _build_initial_state(
     state: dict[str, Any] = deepcopy(
         previous_state
     )
+
+    # =====================================================
+    # Current Frontend Checkout Selection
+    # =====================================================
+
+    if checkout_id is not None and str(checkout_id).strip():
+        state["checkout_id"] = str(checkout_id).strip()
 
     # =====================================================
     # Current User Input
@@ -665,6 +673,7 @@ def run_chat(
     db: Session,
     selected_address_id: int | None = None,
     payment_method: str | None = None,
+    checkout_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Execute the BuyQK Phase-2 AI graph.
@@ -807,6 +816,7 @@ def run_chat(
         previous_state=previous_state,
         selected_address_id=selected_address_id,
         payment_method=payment_method,
+        checkout_id=checkout_id,
     )
 
     # =====================================================
