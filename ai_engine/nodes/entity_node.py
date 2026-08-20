@@ -47,7 +47,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+import uuid
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -154,22 +155,19 @@ class LLMEntityOutput(BaseModel):
         description="Product name mentioned or implied by the user.",
     )
 
-    quantity: Optional[int] = Field(
+    quantity: Optional[str] = Field(
         default=None,
-        ge=1,
-        description="Explicit positive quantity supplied by the user.",
+        description="Quantity as understood from the user. Return digits as text; application code validates and converts it.",
     )
 
-    order_id: Optional[int] = Field(
+    order_id: Optional[str] = Field(
         default=None,
-        ge=1,
-        description="Order ID explicitly supplied or referenced by the user.",
+        description="Order ID as understood from the user. Return digits as text; application code validates and converts it.",
     )
 
-    address_id: Optional[int] = Field(
+    address_id: Optional[str] = Field(
         default=None,
-        ge=1,
-        description="Saved address ID explicitly selected by the user.",
+        description="Saved address ID as understood from the user. Return digits as text; application code validates and converts it.",
     )
 
     address_text: Optional[str] = Field(
@@ -181,6 +179,53 @@ class LLMEntityOutput(BaseModel):
         default=None,
         description="Payment method: upi or cod.",
     )
+
+
+# =========================================================
+# Current-Turn Intent Decision
+# =========================================================
+
+class IntentDecision(BaseModel):
+    """
+    AI decision for the CURRENT user turn.
+
+    Previous intent/entity state is context only. It must never
+    override the intent of the current message.
+    """
+
+    intent: Literal[
+        "product_search",
+        "order_create",
+        "order_tracking",
+        "order_cancel",
+        "customer_support",
+        "general",
+    ] = Field(
+        description=(
+            "The user's intent for the current message only."
+        )
+    )
+
+    order_action: Literal[
+        "start_new_order",
+        "continue_order",
+        "none",
+    ] = Field(
+        description=(
+            "For order-related messages, decide whether the "
+            "user is starting a new order or continuing an "
+            "existing checkout. Use none for non-order turns."
+        )
+    )
+
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the current-turn intent decision.",
+    )
+
+
 
 
 # =========================================================
@@ -375,6 +420,10 @@ llm = get_llm()
 
 structured_llm = llm.with_structured_output(
     LLMEntityOutput
+)
+
+intent_structured_llm = llm.with_structured_output(
+    IntentDecision
 )
 
 
@@ -954,6 +1003,84 @@ def recover_order_id_from_history(
 
 
 # =========================================================
+# Checkout ID Recovery
+# =========================================================
+#
+# ADDED: these two helpers were being called by
+# _fallback_current_turn_intent() and entity_node() but were
+# never defined anywhere in this module, which caused:
+#
+#     NameError: name '_recover_checkout_id_from_history'
+#     is not defined
+#
+# at runtime whenever the deterministic/fallback checkout path
+# executed (e.g. during an LLM rate limit).
+# =========================================================
+
+
+def _recover_checkout_id_from_history(
+    conversation_history: list[dict[str, Any]] | None,
+) -> Optional[str]:
+    """
+    Attempt to recover a checkout_id that was embedded in a
+    previous turn's metadata.
+
+    This is a best-effort recovery path used only when
+    state["checkout_id"] itself is missing (e.g. a fresh HTTP
+    request that lost its session-level state). It looks for a
+    "checkout_id" key on each history item, or nested under a
+    "metadata" dict, walking from the most recent turn backward.
+
+    Returns None if nothing recoverable is found.
+    """
+
+    if not conversation_history:
+        return None
+
+    for item in reversed(conversation_history):
+
+        if not isinstance(item, dict):
+            continue
+
+        checkout_id = item.get("checkout_id")
+
+        if checkout_id:
+            return str(checkout_id).strip()
+
+        metadata = item.get("metadata")
+
+        if isinstance(metadata, dict):
+
+            checkout_id = metadata.get("checkout_id")
+
+            if checkout_id:
+                return str(checkout_id).strip()
+
+    return None
+
+
+def _ensure_checkout_id(
+    state: GraphState,
+    conversation_history: list[dict[str, Any]] | None,
+) -> str:
+    """
+    Return the existing/recoverable checkout_id for the current
+    order-continuation turn, or mint a new one if none can be
+    found anywhere.
+    """
+
+    checkout_id = (
+        state.get("checkout_id")
+        or _recover_checkout_id_from_history(conversation_history)
+    )
+
+    if checkout_id:
+        return str(checkout_id).strip()
+
+    return str(uuid.uuid4())
+
+
+# =========================================================
 # Product Fallback
 # =========================================================
 
@@ -1039,162 +1166,402 @@ def detect_product_fallback(
 
 
 # =========================================================
-# New Order Detection
+# Explicit Product Statement Detection (current message)
+# =========================================================
+#
+# ADDED: entity_node()'s deterministic_turn check calls
+# detect_product_from_message(message), which was also never
+# defined. Unlike detect_product_fallback() above (which looks
+# back through history for continuation turns), this checks only
+# the CURRENT message for an explicit "order/buy/get X" statement.
 # =========================================================
 
+
+def detect_product_from_message(
+    message: str,
+) -> Optional[str]:
+    """
+    Detect an explicit product order statement in the CURRENT
+    message only (no history lookback).
+
+    Examples:
+        "I want to order Amul milk" -> "Amul milk"
+        "Buy bread"                 -> "bread"
+    """
+
+    if not message:
+        return None
+
+    patterns = (
+        r"\bi\s+(?:want|need)\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
+        r"\bi\s+(?:want|need)\s+(?:to\s+)?(?:order|buy|get)\s+(.+?)\s*$",
+        r"\bi(?:'d|\s+would)\s+like\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
+        r"\b(?:order|buy|get|purchase)\s+(.+?)\s*$",
+    )
+
+    for pattern in patterns:
+
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+
+        if not match:
+            continue
+
+        candidate = match.group(1).strip().rstrip(".!?,")
+
+        if not candidate:
+            continue
+
+        if detect_quantity(candidate) is not None:
+            continue
+
+        if detect_payment_method(candidate) is not None:
+            continue
+
+        return candidate
+
+    return None
+
+
+# =========================================================
+# AI Current-Turn Intent Resolution
+# =========================================================
+
+INTENT_SYSTEM_PROMPT = """
+You are the transaction-intent decision component of BuyQK AI.
+
+Your ONLY job is to determine what the USER means by the CURRENT
+MESSAGE. Do not classify the entire conversation. Do not blindly
+reuse the previous intent.
+
+Supported intents:
+
+- product_search
+  The user wants to find, browse, compare, or get information about
+  products without asking to place an order.
+
+- order_create
+  The user wants to place an order OR is supplying information that
+  is clearly required to complete an order already being created.
+
+- order_tracking
+  The user wants to track/check the status/location/progress of an
+  existing order.
+
+- order_cancel
+  The user wants to cancel an existing order.
+
+- customer_support
+  The user wants help with a problem, complaint, ticket, or human
+  support.
+
+- general
+  Conversation that does not request one of the transactional
+  actions above.
+
+For order_action:
+
+- start_new_order:
+  The current message begins a new purchase/order, including a
+  request to order something different after a previous order was
+  completed.
+
+- continue_order:
+  The current message supplies information or confirmation for an
+  order that is currently being assembled.
+
+- none:
+  The current message is not an order-creation turn.
+
+CRITICAL CURRENT-TURN RULE:
+
+A previous completed order does NOT make the next message an
+order_create turn.
+
+Examples:
+
+Previous:
+  assistant: "Your order was placed. Would you like to track it?"
+
+Current:
+  "Thank you"
+  -> intent = general
+  -> order_action = none
+
+Current:
+  "Okay"
+  -> intent = general
+  -> order_action = none
+
+Current:
+  "Yes, track it"
+  -> intent = order_tracking
+  -> order_action = none
+
+Current:
+  "I want to buy another one"
+  -> intent = order_create
+  -> order_action = start_new_order
+
+Current:
+  "5"
+  when the assistant just asked for quantity
+  -> intent = order_create
+  -> order_action = continue_order
+
+Current:
+  "Use that address"
+  when the assistant just asked for delivery address
+  -> intent = order_create
+  -> order_action = continue_order
+
+Current:
+  "UPI"
+  when the assistant just asked for payment
+  -> intent = order_create
+  -> order_action = continue_order
+
+Do not use English keyword matching. Understand the user's meaning
+semantically. The user may speak English, Hindi, Hinglish, or another
+language.
+
+If the current message is ambiguous, prefer the safer non-transactional
+interpretation rather than creating an order.
+"""
+
+
+# =========================================================
+# Deterministic Intent Fallback
+# =========================================================
+
+def _fallback_current_turn_intent(
+    state: GraphState,
+    message: str,
+) -> IntentDecision:
+    """Safe fallback used when the intent LLM is unavailable/rate-limited.
+
+    This does not replace AI understanding in the normal path. It only
+    preserves the checkout protocol when the model provider is unavailable.
+    """
+    text = (message or "").strip()
+    entities = state.get("entities", {}) or {}
+    checkout_id = state.get("checkout_id") or _recover_checkout_id_from_history(
+        state.get("conversation_history", []) or []
+    )
+    completed = bool(state.get("order_created")) or str(
+        state.get("checkout_status") or ""
+    ).casefold() in {"completed", "order_created", "success"}
+
+    if _is_explicit_tracking_request(text):
+        return IntentDecision(intent="order_tracking", order_action="none", confidence=0.0)
+    if _is_explicit_cancel_request(text):
+        return IntentDecision(intent="order_cancel", order_action="none", confidence=0.0)
+    if _is_explicit_support_request(text):
+        return IntentDecision(intent="customer_support", order_action="none", confidence=0.0)
+
+    if _is_new_order_request(text):
+        return IntentDecision(intent="order_create", order_action="start_new_order", confidence=0.0)
+
+    continuation = (
+        detect_quantity(text) is not None
+        or detect_address_id(text) is not None
+        or detect_address_text(text) is not None
+        or detect_payment_method(text) is not None
+        or bool(re.fullmatch(r"\s*(?:use\s+)?(?:the\s+)?selected\s+(?:delivery\s+)?address\.?\s*", text, re.I))
+    )
+
+    if continuation and (checkout_id or entities.get("product_name")) and not completed:
+        return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
+
+    if text and not completed and entities.get("product_name") and state.get("checkout_status") in {"collecting", "ready", None}:
+        # A short continuation/reference can still belong to checkout.
+        if len(text.split()) <= 5:
+            return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
+
+    return IntentDecision(intent="general", order_action="none", confidence=0.0)
+
+
+def resolve_current_turn_intent(
+    state: GraphState,
+    message: str,
+) -> IntentDecision:
+    # High-confidence checkout turns do not need an LLM call.
+    # This keeps checkout operational during provider rate limits.
+    deterministic = (
+        _is_new_order_request(message)
+        or detect_quantity(message) is not None
+        or detect_address_id(message) is not None
+        or detect_address_text(message) is not None
+        or detect_payment_method(message) is not None
+        or bool(re.fullmatch(
+            r"\s*(?:use\s+)?(?:the\s+)?selected\s+(?:delivery\s+)?address\.?\s*",
+            message or "",
+            flags=re.IGNORECASE,
+        ))
+    )
+    if deterministic:
+        return _fallback_current_turn_intent(
+            state=state,
+            message=message,
+        )
+
+    """
+    Ask the LLM to classify the CURRENT turn.
+
+    This is deliberately separate from entity extraction. Entity
+    accumulation answers "what values do we know?", while this
+    function answers "what does the user want NOW?"
+    """
+
+    clean_message = (
+        message or ""
+    ).strip()
+
+    history = (
+        state.get(
+            "conversation_history",
+            [],
+        )
+        or []
+    )
+
+    history_text = format_conversation_history(
+        history
+    )
+
+    previous_intent = state.get(
+        "intent",
+        "general",
+    )
+
+    previous_entities = (
+        state.get(
+            "entities",
+            {},
+        )
+        or {}
+    )
+
+    context = f"""
+RECENT CONVERSATION
+-------------------
+{history_text}
+
+CURRENT USER MESSAGE
+-------------------
+{clean_message}
+
+PREVIOUS GRAPH INTENT
+---------------------
+{previous_intent}
+
+PREVIOUS ENTITY STATE
+---------------------
+{previous_entities}
+
+IMPORTANT:
+The previous intent and entity state are context only.
+Classify the current message independently.
+"""
+
+    try:
+        result = intent_structured_llm.invoke(
+            [
+                SystemMessage(
+                    content=INTENT_SYSTEM_PROMPT
+                ),
+                HumanMessage(
+                    content=context
+                ),
+            ]
+        )
+
+        if isinstance(
+            result,
+            IntentDecision,
+        ):
+            return result
+
+    except Exception as exc:
+        print(
+            "[INTENT LLM ERROR]"
+            f" {type(exc).__name__}: {exc}"
+        )
+
+    # Fail closed.
+    #
+    # A failed intent decision must NEVER create an order from
+    # stale entities. General is the safest fallback.
+    return IntentDecision(
+        intent="general",
+        order_action="none",
+        confidence=0.0,
+    )
+
+
+# =========================================================
+# Compatibility Helpers
+# =========================================================
 
 def _is_new_order_request(
     message: str,
 ) -> bool:
     """
-    Detect an explicit request to start a new order.
+    Deprecated compatibility helper.
 
-    This prevents stale checkout information from an
-    earlier completed order being reused.
+    Natural-language new-order detection is now performed by the
+    AI intent classifier. This function intentionally does not make
+    a language-specific decision.
     """
-
-    if not message:
-        return False
-
-    text = (
-        message
-        .strip()
-        .lower()
-    )
-
-    continuation_phrases = (
-        "actually",
-        "instead",
-        "change it",
-        "make it",
-        "change the product",
-    )
-
-    if any(
-        phrase in text
-        for phrase in continuation_phrases
-    ):
-        return False
-
-    new_order_patterns = (
-        r"\bi\s+want\s+to\s+order\b",
-        r"\bi'd\s+like\s+to\s+order\b",
-        r"\bi\s+would\s+like\s+to\s+order\b",
-        r"\bi\s+want\s+to\s+buy\b",
-        r"\bi'd\s+like\s+to\s+buy\b",
-        r"\bplace\s+(?:an\s+)?order\b",
-        r"\bnew\s+order\b",
-    )
-
-    return any(
-        re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
-        for pattern in new_order_patterns
-    )
-
-
-# =========================================================
-# Explicit Tracking
-# =========================================================
+    return False
 
 
 def _is_explicit_tracking_request(
     message: str,
 ) -> bool:
+    """
+    Deprecated compatibility helper.
 
-    phrases = (
-        "track my order",
-        "track order",
-        "track my delivery",
-        "where is my order",
-        "where's my order",
-        "where is my delivery",
-        "order status",
-        "delivery status",
-        "check my order",
-        "check order status",
-    )
-
-    text = (
-        message or ""
-    ).lower()
-
-    return any(
-        phrase in text
-        for phrase in phrases
-    )
-
-
-# =========================================================
-# Explicit Cancellation
-# =========================================================
+    Current-turn tracking intent is decided by the AI classifier.
+    """
+    return False
 
 
 def _is_explicit_cancel_request(
     message: str,
 ) -> bool:
+    """
+    Deprecated compatibility helper.
 
-    phrases = (
-        "cancel my order",
-        "cancel order",
-        "i want to cancel",
-        "please cancel",
-        "cancel it",
-    )
-
-    text = (
-        message or ""
-    ).lower()
-
-    return any(
-        phrase in text
-        for phrase in phrases
-    )
-
-
-# =========================================================
-# Explicit Support
-# =========================================================
+    Current-turn cancellation intent is decided by the AI classifier.
+    """
+    return False
 
 
 def _is_explicit_support_request(
     message: str,
 ) -> bool:
+    """
+    Deprecated compatibility helper.
 
-    phrases = (
-        "contact support",
-        "talk to support",
-        "customer support",
-        "raise a complaint",
-        "file a complaint",
-        "create a ticket",
-        "support ticket",
-        "i have a problem",
-        "i have an issue",
-    )
-
-    text = (
-        message or ""
-    ).lower()
-
-    return any(
-        phrase in text
-        for phrase in phrases
-    )
+    Current-turn support intent is decided by the AI classifier.
+    """
+    return False
 
 
 # =========================================================
-# Payment Selection
+# Payment / Address Continuation Helpers
 # =========================================================
-
 
 def _is_payment_selection(
     message: str,
 ) -> bool:
+    """
+    Lightweight extraction helper only.
 
+    This does NOT decide transaction intent. The AI intent classifier
+    makes that decision. This helper is retained only for legacy
+    entity-recovery compatibility.
+    """
     return (
         detect_payment_method(
             message
@@ -1203,16 +1570,15 @@ def _is_payment_selection(
     )
 
 
-# =========================================================
-# Address Selection
-# =========================================================
-
-
 def _is_address_selection(
     state: GraphState,
     message: str,
 ) -> bool:
+    """
+    Lightweight frontend/entity helper only.
 
+    This does NOT decide transaction intent.
+    """
     if (
         state.get(
             "selected_address_id"
@@ -1229,26 +1595,12 @@ def _is_address_selection(
     ):
         return True
 
-    text = (
-        message or ""
-    ).lower()
-
-    return any(
-        phrase in text
-        for phrase in (
-            "selected delivery address",
-            "use the selected address",
-            "use selected address",
-            "use this address",
-            "address selected",
-        )
-    )
+    return False
 
 
 # =========================================================
-# Active Checkout Detection
+# Legacy Active Checkout Helper
 # =========================================================
-
 
 def _is_active_order_checkout(
     state: GraphState,
@@ -1256,200 +1608,39 @@ def _is_active_order_checkout(
     message: str,
 ) -> bool:
     """
-    Determine whether the current turn belongs to an
-    active order checkout.
+    Compatibility helper.
+
+    Active checkout is now determined by the AI's CURRENT-TURN
+    intent. Stale entities are deliberately insufficient.
     """
-
-    # Explicit commands have priority.
-    if _is_explicit_tracking_request(
-        message
-    ):
-        return False
-
-    if _is_explicit_cancel_request(
-        message
-    ):
-        return False
-
-    if _is_explicit_support_request(
-        message
-    ):
-        return False
-
-    # Explicitly starting a new order.
-    if _is_new_order_request(
-        message
-    ):
-        return True
-
-    current_intent = state.get(
-        "intent",
-        "general",
-    )
-
-    if current_intent == "order_create":
-        return True
-
-    # Do not convert a normal product-search turn into checkout
-    # merely because a product name was extracted.
-    if current_intent == "product_search":
-        return False
-
-    existing_entities = (
+    return (
         state.get(
-            "entities",
-            {},
+            "intent"
         )
-        or {}
+        == "order_create"
     )
 
-    product_id = entities.get("product_id")
-    if product_id is None:
-        product_id = existing_entities.get("product_id")
-
-    product_name = entities.get("product_name")
-    if not _has_value(product_name):
-        product_name = existing_entities.get("product_name")
-
-    quantity = entities.get("quantity")
-    if quantity is None:
-        quantity = existing_entities.get("quantity")
-
-    address_id = state.get("selected_address_id")
-    if address_id is None:
-        address_id = entities.get("address_id")
-    if address_id is None:
-        address_id = existing_entities.get("address_id")
-
-    payment_method = entities.get("payment_method")
-    if not _has_value(payment_method):
-        payment_method = existing_entities.get("payment_method")
-
-    # A resolved product ID is the strongest checkout signal.
-    if _has_value(product_id):
-        return True
-
-    # Product name is also a checkout signal before backend resolution.
-    if _has_value(
-        product_name
-    ):
-        return True
-
-    # Quantity continuation.
-    if _has_value(
-        quantity
-    ):
-        return True
-
-    # Address selection continuation.
-    if _is_address_selection(
-        state,
-        message,
-    ):
-        return True
-
-    # Payment continuation.
-    if _is_payment_selection(
-        message
-    ):
-        return True
-
-    if (
-        _has_value(
-            payment_method
-        )
-        and (
-            _has_value(
-                product_name
-            )
-            or _has_value(
-                quantity
-            )
-            or _has_value(
-                address_id
-            )
-        )
-    ):
-        return True
-
-    return False
-
 
 # =========================================================
-# Intent Resolution
+# Intent Resolution Compatibility Wrapper
 # =========================================================
-
 
 def resolve_transaction_intent(
     state: GraphState,
     entities: dict[str, Any],
     message: str,
 ) -> str:
+    """
+    Resolve current-turn intent using the AI.
 
-    llm_intent = state.get(
-        "intent",
-        "general",
+    This wrapper preserves the previous public function name.
+    """
+    decision = resolve_current_turn_intent(
+        state=state,
+        message=message,
     )
 
-    clean_message = (
-        message or ""
-    ).strip()
-
-    # -----------------------------------------------------
-    # 1. Explicit tracking
-    # -----------------------------------------------------
-
-    if _is_explicit_tracking_request(
-        clean_message
-    ):
-        return "order_tracking"
-
-    # -----------------------------------------------------
-    # 2. Explicit cancellation
-    # -----------------------------------------------------
-
-    if _is_explicit_cancel_request(
-        clean_message
-    ):
-        return "order_cancel"
-
-    # -----------------------------------------------------
-    # 3. Explicit support
-    # -----------------------------------------------------
-
-    if _is_explicit_support_request(
-        clean_message
-    ):
-        return "customer_support"
-
-    # -----------------------------------------------------
-    # 4. Active checkout
-    # -----------------------------------------------------
-
-    if _is_active_order_checkout(
-        state=state,
-        entities=entities,
-        message=clean_message,
-    ):
-        return "order_create"
-
-    # -----------------------------------------------------
-    # 5. Valid existing intent
-    # -----------------------------------------------------
-
-    valid_intents = {
-        "product_search",
-        "order_tracking",
-        "order_cancel",
-        "customer_support",
-        "order_create",
-        "general",
-    }
-
-    if llm_intent in valid_intents:
-        return llm_intent
-
-    return "general"
+    return decision.intent
 
 
 # =========================================================
@@ -1628,10 +1819,12 @@ def extract_entities(
     except Exception as exc:
 
         print(
-            "[ENTITY LLM ERROR]"
+            "[ENTITY LLM FALLBACK]"
             f" {type(exc).__name__}: {exc}"
         )
 
+        # Deterministic extraction in entity_node remains authoritative
+        # for simple transactional fields when the LLM is unavailable.
         return LLMEntityOutput()
 
 
@@ -1705,32 +1898,66 @@ def entity_node(
     )
 
     # =====================================================
-    # New order reset
+    # CURRENT-TURN AI INTENT
     # =====================================================
     #
-    # If the user explicitly starts another order, don't
-    # accidentally reuse the quantity/address/payment from
-    # the previous completed order.
+    # This is the most important distinction in the workflow:
     #
+    #     entity state = what we know
+    #     current intent = what the user wants NOW
+    #
+    # A previous order_create intent must never automatically
+    # become the intent of the next user message.
     # =====================================================
 
-    new_order = _is_new_order_request(
-        message
+    intent_decision = resolve_current_turn_intent(
+        state=state,
+        message=message,
     )
 
-    # Only recover checkout fields from history while the graph is
-    # actually in an order-creation flow. This prevents quantities,
-    # addresses, and payment methods from old orders leaking into
-    # unrelated product-search turns.
+    resolved_current_intent = (
+        intent_decision.intent
+    )
+
+    new_order = (
+        resolved_current_intent
+        == "order_create"
+        and intent_decision.order_action
+        == "start_new_order"
+    )
+
+    # History recovery is allowed only when the AI says the
+    # CURRENT turn is an order continuation.
+    previous_checkout_id = (
+        state.get("checkout_id")
+        or _recover_checkout_id_from_history(
+            conversation_history
+        )
+    )
+
+    if new_order:
+        checkout_id = str(uuid.uuid4())
+        checkout_status = "collecting"
+        order_created = False
+    elif resolved_current_intent == "order_create":
+        checkout_id = (
+            str(previous_checkout_id).strip()
+            if previous_checkout_id
+            else _ensure_checkout_id(
+                state,
+                conversation_history,
+            )
+        )
+        checkout_status = state.get("checkout_status") or "collecting"
+        order_created = bool(state.get("order_created", False))
+    else:
+        checkout_id = previous_checkout_id
+        checkout_status = state.get("checkout_status")
+        order_created = bool(state.get("order_created", False))
+
     checkout_context = (
-        original_intent == "order_create"
-        or _is_address_selection(
-            state,
-            message,
-        )
-        or _is_payment_selection(
-            message
-        )
+        resolved_current_intent == "order_create"
+        and not new_order
     )
 
     if new_order:
@@ -1775,10 +2002,29 @@ def entity_node(
     # =====================================================
     # LLM extraction
     # =====================================================
+    # Simple transactional replies are fully recoverable from the
+    # current message/history. Do not spend an LLM call on them.
+    deterministic_turn = (
+        detect_quantity(message) is not None
+        or detect_address_id(message) is not None
+        or detect_address_text(message) is not None
+        or detect_payment_method(message) is not None
+        or bool(detect_product_from_message(message))
+        or _is_new_order_request(message)
+        or bool(re.fullmatch(
+            r"\s*(?:use\s+)?(?:the\s+)?selected\s+(?:delivery\s+)?address\.?\s*",
+            message,
+            flags=re.IGNORECASE,
+        ))
+    )
 
-    extracted = extract_entities(
-        message=message,
-        conversation_history=conversation_history,
+    extracted = (
+        LLMEntityOutput()
+        if deterministic_turn
+        else extract_entities(
+            message=message,
+            conversation_history=conversation_history,
+        )
     )
 
     extracted_entities = (
@@ -2349,15 +2595,15 @@ def entity_node(
             )
 
     # =====================================================
-    # Resolve final intent
+    # FINAL CURRENT-TURN INTENT
+    # =====================================================
+    #
+    # Do not run a second deterministic intent override here.
+    # The AI decision above is authoritative for the current turn.
     # =====================================================
 
     resolved_intent = (
-        resolve_transaction_intent(
-            state=state,
-            entities=entities,
-            message=message,
-        )
+        resolved_current_intent
     )
 
     # =====================================================
@@ -2419,6 +2665,10 @@ def entity_node(
         "\n"
         f"  intent_after     = {resolved_intent!r}"
         "\n"
+        f"  order_action      = {intent_decision.order_action!r}"
+        "\n"
+        f"  intent_confidence = {intent_decision.confidence!r}"
+        "\n"
         f"  new_order        = {new_order}"
         "\n"
         f"  selected_address = {selected_address_id!r}"
@@ -2449,6 +2699,14 @@ def entity_node(
         "address_id": final_entities.get("address_id"),
         "payment_method": final_entities.get(
             "payment_method"
+        ),
+
+        # Transaction identity/state must survive every HTTP turn.
+        "checkout_id": checkout_id,
+        "checkout_status": checkout_status,
+        "order_created": order_created,
+        "checkout_completed": bool(
+            checkout_status == "completed" or order_created
         ),
 
         "missing_fields": missing_fields,

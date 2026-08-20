@@ -81,6 +81,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from langchain_core.messages import (
@@ -194,6 +195,134 @@ def _serialize_data(
     except Exception:
 
         return "{}"
+
+
+def _extract_text_content(content: Any) -> str:
+    """
+    Convert common LangChain response-content shapes into plain text.
+
+    Supports:
+        - plain strings
+        - objects with .content
+        - list-based content blocks
+        - dict content blocks
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+
+        content_value = content.get("content")
+        if isinstance(content_value, str):
+            return content_value
+
+        if isinstance(content_value, list):
+            return _extract_text_content(content_value)
+
+        return ""
+
+    if isinstance(content, list):
+        parts: list[str] = []
+
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+
+            if isinstance(block, dict):
+                block_text = block.get("text")
+                if isinstance(block_text, str):
+                    parts.append(block_text)
+                    continue
+
+                block_content = block.get("content")
+                if isinstance(block_content, str):
+                    parts.append(block_content)
+                    continue
+
+            block_text = getattr(block, "text", None)
+            if isinstance(block_text, str):
+                parts.append(block_text)
+
+        return "\n".join(parts)
+
+    nested = getattr(content, "content", None)
+    if nested is not None and nested is not content:
+        return _extract_text_content(nested)
+
+    return ""
+
+
+def _sanitize_user_response(
+    response: Any,
+) -> str:
+    """
+    Final safety boundary for all LLM-generated customer-facing text.
+
+    Reasoning such as Qwen <think>...</think> must never reach the
+    frontend. This function also removes common markdown/code wrappers
+    that can accidentally expose an internal structured response.
+
+    It does NOT alter normal user-facing content.
+    """
+    text = _extract_text_content(response).strip()
+
+    if not text:
+        return ""
+
+    # Remove complete reasoning blocks.
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Remove an unmatched reasoning block.
+    text = re.sub(
+        r"<think>.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Remove other common hidden-reasoning wrappers if a model emits them.
+    text = re.sub(
+        r"<analysis>.*?</analysis>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<analysis>.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # Remove a leading assistant/final label if emitted by a model.
+    text = re.sub(
+        r"^\s*(?:final\s+answer|assistant\s*:)\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove surrounding markdown fences when the entire response is
+    # accidentally wrapped as a code block.
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            lines = lines[1:-1]
+            text = "\n".join(lines).strip()
+
+    return text.strip()
 
 
 def _get_entities(
@@ -586,101 +715,35 @@ def _generate_checkout_response(
     metadata: dict[str, Any],
 ) -> str:
     """
-    Generate natural-language checkout wording.
+    Generate checkout wording deterministically.
 
-    The graph controls the workflow.
-    The LLM only controls presentation.
+    Checkout sequencing is graph-controlled. The Response Node must not
+    ask an LLM to decide which field comes next.
+
+    This also prevents model reasoning (<think>...</think>) from leaking
+    into checkout responses.
     """
+    entities = _get_entities(state)
+    product_name = entities.get("product_name")
 
-    context = {
-        "user_message": state.get(
-            "message",
-            "",
-        ),
-        "intent": state.get(
-            "intent",
-            "general",
-        ),
-        "entities": _get_entities(
-            state
-        ),
-        "tool_name": state.get(
-            "tool_name"
-        ),
-        "tool_result": _get_tool_result(
-            state
-        ),
-        "missing_fields": missing_fields,
-        "next_missing": next_missing,
-        "frontend_metadata": metadata,
-        "orchestration": _get_planner_context(
-            state
-        ),
-        "conversation_history": (
-            state.get(
-                "conversation_history",
-                [],
+    if next_missing == "product_name":
+        return "Which product would you like?"
+
+    if next_missing == "quantity":
+        if isinstance(product_name, str) and product_name.strip():
+            return (
+                f"How many packs of "
+                f"{product_name.strip()} would you like?"
             )
-            or []
-        ),
-    }
+        return "How many would you like?"
 
-    prompt = f"""
-Generate ONLY the user-facing checkout question.
+    if next_missing == "address_selection":
+        return "Please select a delivery address."
 
-The graph has already selected the next required field.
+    if next_missing == "payment_method":
+        return "Please select a payment method."
 
-Current BuyQK state:
-
-{_serialize_data(context)}
-
-Rules:
-- Ask only for next_missing.
-- Do not ask for another checkout field.
-- Use supplied options when available.
-- Do not invent any business values.
-- Keep the response concise.
-"""
-
-    try:
-
-        result = llm.invoke(
-            [
-                SystemMessage(
-                    content=CHECKOUT_RESPONSE_SYSTEM_PROMPT
-                ),
-                HumanMessage(
-                    content=prompt
-                ),
-            ]
-        )
-
-        content = getattr(
-            result,
-            "content",
-            "",
-        )
-
-        if isinstance(
-            content,
-            str,
-        ):
-
-            content = content.strip()
-
-            if content:
-                return content
-
-    except Exception as exc:
-
-        print(
-            "[CHECKOUT RESPONSE LLM ERROR]"
-            f" {type(exc).__name__}: {exc}"
-        )
-
-    return _checkout_fallback(
-        next_missing
-    )
+    return _checkout_fallback(next_missing)
 
 
 def _checkout_fallback(
@@ -777,6 +840,8 @@ def _checkout_metadata(
             "addresses": addresses,
             "allow_new": allow_new,
         }
+        if state.get("checkout_id"):
+            metadata["checkout_id"] = state.get("checkout_id")
 
         if prefill is not None:
             metadata[
@@ -795,12 +860,15 @@ def _checkout_metadata(
             tool_result
         )
 
-        return {
+        result = {
             "type": "payment_selection",
             "missing_field": "payment_method",
             "missing_fields": missing_fields,
             "methods": methods,
         }
+        if state.get("checkout_id"):
+            result["checkout_id"] = state.get("checkout_id")
+        return result
 
     return None
 
@@ -1057,6 +1125,8 @@ For errors:
 Keep responses concise and natural.
 
 Return ONLY the user-facing response.
+Never output <think>, <analysis>, chain-of-thought, internal reasoning,
+planning notes, JSON, markdown code fences, or implementation details.
 """
 
 
@@ -1136,6 +1206,7 @@ Remember:
 - do not change workflow
 - do not expose internal architecture
 - return only the user-facing response
+- never expose <think>, <analysis>, chain-of-thought, or internal reasoning
 """
 
     try:
@@ -1151,21 +1222,10 @@ Remember:
             ]
         )
 
-        content = getattr(
-            result,
-            "content",
-            "",
-        )
+        content = _sanitize_user_response(result)
 
-        if isinstance(
-            content,
-            str,
-        ):
-
-            content = content.strip()
-
-            if content:
-                return content
+        if content:
+            return content
 
     except Exception as exc:
 
@@ -1273,6 +1333,8 @@ Rules:
 10. Do not mention internal implementation.
 
 Return ONLY the user-facing response.
+Never output <think>, <analysis>, chain-of-thought, internal reasoning,
+planning notes, JSON, markdown code fences, or implementation details.
 """
 
     try:
@@ -1288,21 +1350,10 @@ Return ONLY the user-facing response.
             ]
         )
 
-        content = getattr(
-            result,
-            "content",
-            "",
-        )
+        content = _sanitize_user_response(result)
 
-        if isinstance(
-            content,
-            str,
-        ):
-
-            content = content.strip()
-
-            if content:
-                return content
+        if content:
+            return content
 
     except Exception as exc:
 
@@ -1663,6 +1714,10 @@ def _order_success_metadata(
 
     metadata = {
         "type": "order_success",
+        "checkout_id": (
+            tool_result.get("checkout_id")
+            or state.get("checkout_id")
+        ),
         "order_id": order_id,
         "status": tool_result.get(
             "status"
@@ -2004,10 +2059,11 @@ def response_node(
             tool_result,
         )
 
-        response = _generate_tool_response(state)
-
-        if not response:
-            response = _generate_llm_response(state)
+        # Order success is transactional output. Do not spend another
+        # LLM call just to paraphrase it; this also keeps checkout usable
+        # when the LLM provider is rate-limited.
+        response = _tool_fallback(tool_result)
+        response = _sanitize_user_response(response)
 
         return {
             "response": response,
@@ -2071,6 +2127,11 @@ def response_node(
         else:
             cart_metadata.pop("next_missing", None)
 
+        response = _sanitize_user_response(response)
+
+        if not response:
+            response = _cart_fallback(tool_result)
+
         result: dict[str, Any] = {
             "response": response,
             "metadata": cart_metadata,
@@ -2115,11 +2176,13 @@ def response_node(
 
         metadata.update(checkout_metadata)
 
-        response = _generate_checkout_response(
-            state,
-            missing_fields,
-            next_missing,
-            metadata,
+        response = _sanitize_user_response(
+            _generate_checkout_response(
+                state,
+                missing_fields,
+                next_missing,
+                metadata,
+            )
         )
 
         return {
@@ -2127,6 +2190,9 @@ def response_node(
             "metadata": metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
+            "checkout_id": state.get("checkout_id"),
+            "checkout_status": state.get("checkout_status"),
+            "order_created": bool(state.get("order_created", False)),
         }
 
     # ---------------------------------------------------------
@@ -2146,6 +2212,11 @@ def response_node(
             state,
             missing_fields,
         )
+
+        response = _sanitize_user_response(response)
+
+        if not response:
+            response = _tool_fallback(tool_result)
 
         return {
             "response": response,
@@ -2192,6 +2263,15 @@ def response_node(
         else:
             response = "I couldn't find matching products."
 
+        response = _sanitize_user_response(response)
+
+        if not response:
+            response = (
+                "I found these products for you."
+                if products
+                else "I couldn't find matching products."
+            )
+
         return {
             "response": response,
             "metadata": product_metadata,
@@ -2199,6 +2279,37 @@ def response_node(
             "next_missing": next_missing,
         }
 
+
+    # ---------------------------------------------------------
+    # Policy failure
+    #
+    # NOTE (fix): policy_error is now written fresh on every turn by
+    # decision_node (including an explicit None when there is no
+    # rejection). Do not read any other key for this, and do not
+    # remove decision_node's unconditional policy_error write —
+    # doing so reintroduces stale rejections leaking into later,
+    # unrelated turns (e.g. a plain "Hi" showing a checkout error
+    # left over from an earlier failed transaction in the same
+    # session).
+    # ---------------------------------------------------------
+    policy_error = state.get("policy_error")
+    if isinstance(policy_error, dict) and policy_error.get("allowed") is False:
+        reason = str(policy_error.get("reason") or "").strip().lower()
+        policy_messages = {
+            "missing_checkout_id": "The checkout session is missing. Please restart your checkout so I can place the order safely.",
+            "checkout_already_completed": "This checkout has already been completed.",
+            "checkout_incomplete": "The checkout is not complete yet. Please provide the remaining checkout details.",
+        }
+        response = policy_messages.get(
+            reason,
+            "I couldn't continue with that transaction. Please provide the required checkout information.",
+        )
+        return {
+            "response": response,
+            "metadata": _clean_checkout_metadata(metadata, next_missing),
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
 
     # ---------------------------------------------------------
     # 5. Tool failure
@@ -2234,6 +2345,17 @@ def response_node(
             failure_metadata["next_missing"] = next_missing
         else:
             failure_metadata.pop("next_missing", None)
+
+        response = _sanitize_user_response(response)
+
+        if not response:
+            response = (
+                str(
+                    tool_result.get("error")
+                    or tool_result.get("message")
+                    or "I couldn't complete that request."
+                )
+            )
 
         return {
             "response": response,
@@ -2271,6 +2393,11 @@ def response_node(
         else:
             tool_metadata.pop("next_missing", None)
 
+        response = _sanitize_user_response(response)
+
+        if not response:
+            response = _tool_fallback(tool_result)
+
         return {
             "response": response,
             "metadata": tool_metadata,
@@ -2298,7 +2425,12 @@ def response_node(
     # ---------------------------------------------------------
     # 9. General conversation
     # ---------------------------------------------------------
-    response = _generate_llm_response(state)
+    response = _sanitize_user_response(
+        _generate_llm_response(state)
+    )
+
+    if not response:
+        response = _general_fallback(message)
 
     metadata = _clean_checkout_metadata(
         metadata,
