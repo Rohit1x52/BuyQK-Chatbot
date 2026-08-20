@@ -13,7 +13,7 @@ Responsibilities:
     - Calculate the current cart summary.
     - Validate product availability and stock.
 
-Important architecture rule:
+Architecture:
 
     AI / Planner
         ↓
@@ -23,10 +23,11 @@ Important architecture rule:
         ↓
     Database
 
-The AI does NOT calculate prices, stock, subtotals, discounts,
-delivery charges, or totals.
+IMPORTANT:
+    The AI does NOT calculate prices, stock, subtotals, discounts,
+    delivery charges, or totals.
 
-The CartItem stores only:
+CartItem stores only:
     - cart_id
     - product_id
     - quantity
@@ -59,6 +60,7 @@ ACTIVE_CART_STATUS = "active"
 # Exceptions
 # ============================================================
 
+
 class CartServiceError(Exception):
     """Base exception for cart-service errors."""
 
@@ -86,6 +88,7 @@ class InvalidQuantityError(CartServiceError):
 # ============================================================
 # Internal Helpers
 # ============================================================
+
 
 def _validate_quantity(quantity: int) -> int:
     """
@@ -121,8 +124,8 @@ def _get_product(
     """
     Retrieve a product by ID.
 
-    Product existence, availability, and stock are authoritative
-    backend facts.
+    Product existence, availability, and stock are
+    authoritative backend facts.
     """
 
     product = db.execute(
@@ -150,20 +153,67 @@ def _get_active_cart(
 ) -> Cart | None:
     """
     Return the user's current active cart, if one exists.
+
+    IMPORTANT:
+    The cart and its items are freshly loaded from the database.
     """
 
-    return db.execute(
-        select(Cart)
-        .options(
-            joinedload(Cart.items)
-            .joinedload(CartItem.product)
+    return (
+        db.execute(
+            select(Cart)
+            .options(
+                joinedload(Cart.items)
+                .joinedload(CartItem.product)
+            )
+            .where(
+                Cart.user_id == user_id,
+                Cart.status == ACTIVE_CART_STATUS,
+            )
+            .order_by(Cart.id.desc())
         )
-        .where(
-            Cart.user_id == user_id,
-            Cart.status == ACTIVE_CART_STATUS,
+        .unique()
+        .scalars()
+        .first()
+    )
+
+
+def _refresh_cart(
+    db: Session,
+    cart_id: int,
+) -> Cart:
+    """
+    Reload a cart from the database.
+
+    This is important after INSERT/UPDATE/DELETE operations because
+    SQLAlchemy's in-memory relationship collection may otherwise
+    still contain stale CartItem objects.
+
+    The returned Cart has its items and products freshly loaded.
+    """
+
+    db.expire_all()
+
+    cart = (
+        db.execute(
+            select(Cart)
+            .options(
+                joinedload(Cart.items)
+                .joinedload(CartItem.product)
+            )
+            .where(
+                Cart.id == cart_id
+            )
         )
-        .order_by(Cart.id.desc())
-    ).unique().scalars().first()
+        .unique()
+        .scalar_one_or_none()
+    )
+
+    if cart is None:
+        raise CartServiceError(
+            f"Cart {cart_id} was not found."
+        )
+
+    return cart
 
 
 def _serialize_item(
@@ -201,11 +251,10 @@ def _build_summary(
     Calculate the current cart summary from authoritative
     Product prices.
 
-    This function intentionally does not invent delivery,
-    discount, tax, or payment values.
+    The AI never supplies monetary values.
 
-    Those belong to the appropriate backend billing/checkout
-    service when those capabilities exist.
+    Delivery, discount, and tax remain None until their
+    respective backend services are implemented.
     """
 
     serialized_items = [
@@ -239,7 +288,7 @@ def _serialize_cart(
     cart: Cart,
 ) -> dict[str, Any]:
     """
-    Serialize a cart and its current authoritative contents.
+    Serialize a cart and its freshly loaded contents.
     """
 
     items = list(cart.items)
@@ -261,6 +310,7 @@ def _serialize_cart(
 # ============================================================
 # Get / Create Cart
 # ============================================================
+
 
 def get_or_create_cart(
     db: Session,
@@ -295,12 +345,17 @@ def get_or_create_cart(
     db.add(cart)
     db.flush()
 
-    return cart
+    # Return a fresh database-backed representation.
+    return _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
 
 
 # ============================================================
 # Get Cart
 # ============================================================
+
 
 def get_cart(
     db: Session,
@@ -318,7 +373,10 @@ def get_cart(
         user_id=user_id,
     )
 
-    db.flush()
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
 
     return _serialize_cart(cart)
 
@@ -326,6 +384,7 @@ def get_cart(
 # ============================================================
 # Add Item
 # ============================================================
+
 
 def add_item(
     db: Session,
@@ -396,12 +455,21 @@ def add_item(
 
     db.flush()
 
+    # IMPORTANT:
+    # Reload after mutation so the response represents the
+    # actual database state.
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
+
     return _serialize_cart(cart)
 
 
 # ============================================================
 # Update Quantity
 # ============================================================
+
 
 def update_quantity(
     db: Session,
@@ -454,12 +522,18 @@ def update_quantity(
 
     db.flush()
 
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
+
     return _serialize_cart(cart)
 
 
 # ============================================================
 # Update Quantity By Product
 # ============================================================
+
 
 def update_item_quantity(
     db: Session,
@@ -470,8 +544,8 @@ def update_item_quantity(
     """
     Update the quantity of a product already present in the cart.
 
-    This helper is useful for AI/tool operations where the AI
-    identifies a product rather than a CartItem ID.
+    Useful for AI/tool operations where the AI identifies a
+    product rather than a CartItem ID.
     """
 
     normalized_quantity = _validate_quantity(
@@ -512,12 +586,18 @@ def update_item_quantity(
 
     db.flush()
 
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
+
     return _serialize_cart(cart)
 
 
 # ============================================================
 # Remove Item
 # ============================================================
+
 
 def remove_item(
     db: Session,
@@ -526,6 +606,10 @@ def remove_item(
 ) -> dict[str, Any]:
     """
     Remove one CartItem from the user's active cart.
+
+    The returned cart is reloaded after deletion so the deleted
+    item cannot remain in the response because of a stale
+    SQLAlchemy relationship collection.
     """
 
     cart = get_or_create_cart(
@@ -547,8 +631,17 @@ def remove_item(
             f"Cart item {cart_item_id} was not found."
         )
 
+    cart_id = cart.id
+
     db.delete(item)
     db.flush()
+
+    # CRITICAL FIX:
+    # Do not serialize the old cart.items collection.
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart_id,
+    )
 
     return _serialize_cart(cart)
 
@@ -556,6 +649,7 @@ def remove_item(
 # ============================================================
 # Remove Item By Product
 # ============================================================
+
 
 def remove_product(
     db: Session,
@@ -565,8 +659,8 @@ def remove_product(
     """
     Remove a product from the user's active cart.
 
-    Useful when the AI/tool layer has identified the product
-    but does not have a CartItem ID.
+    Useful when the AI/tool layer identifies the product but
+    does not have a CartItem ID.
     """
 
     cart = get_or_create_cart(
@@ -588,8 +682,17 @@ def remove_product(
             f"Product {product_id} is not in the cart."
         )
 
+    cart_id = cart.id
+
     db.delete(item)
     db.flush()
+
+    # CRITICAL FIX:
+    # Reload the relationship from the database.
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart_id,
+    )
 
     return _serialize_cart(cart)
 
@@ -597,6 +700,7 @@ def remove_product(
 # ============================================================
 # Clear Cart
 # ============================================================
+
 
 def clear_cart(
     db: Session,
@@ -613,10 +717,19 @@ def clear_cart(
         user_id=user_id,
     )
 
+    cart_id = cart.id
+
     for item in list(cart.items):
         db.delete(item)
 
     db.flush()
+
+    # CRITICAL FIX:
+    # Reload after all DELETE operations.
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart_id,
+    )
 
     return _serialize_cart(cart)
 
@@ -624,6 +737,7 @@ def clear_cart(
 # ============================================================
 # Cart Summary
 # ============================================================
+
 
 def calculate_cart(
     db: Session,
@@ -640,7 +754,10 @@ def calculate_cart(
         user_id=user_id,
     )
 
-    db.flush()
+    cart = _refresh_cart(
+        db=db,
+        cart_id=cart.id,
+    )
 
     serialized = _serialize_cart(cart)
 
@@ -650,6 +767,7 @@ def calculate_cart(
 # ============================================================
 # Commit Helper
 # ============================================================
+
 
 def commit_cart(
     db: Session,
