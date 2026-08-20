@@ -137,6 +137,6 @@ class Product(Base):
 
     ## relationship with cart items
     cart_items = relationship(
-    "CartItem",
-    back_populates="product",
+        "CartItem",
+        back_populates="product",
     )

@@ -1,15 +1,26 @@
 """
 The Order model will:
-Identify which user placed the order.
-Store the delivery address.
-Store the assigned rider.
-Track the order status.
-Store the total order amount.
-Track payment status.
-Store creation/update timestamps.
-Connect the order to its OrderItem records.
-Connect the order to its payment record.
-Provide the database foundation for tracking and cancellation.
+
+- Identify which user placed the order.
+- Store the delivery address.
+- Store the assigned rider.
+- Track the order status.
+- Store the total order amount.
+- Track payment status.
+- Store creation/update timestamps.
+- Identify the checkout transaction that created the order.
+- Connect the order to its OrderItem records.
+- Connect the order to its payment record.
+- Provide the database foundation for tracking and cancellation.
+
+IMPORTANT:
+
+checkout_id is the transaction/idempotency identifier.
+
+One user + one checkout_id = one order.
+
+This prevents the same checkout from accidentally creating
+multiple orders when the same request is processed more than once.
 """
 
 from datetime import datetime
@@ -19,8 +30,13 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     String,
+    UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import (
+    Mapped,
+    mapped_column,
+    relationship,
+)
 
 from backend.database.base import Base
 
@@ -32,124 +48,164 @@ class Order(Base):
 
     __tablename__ = "orders"
 
-    # Unique identifier for the order
+    # =========================================================
+    # Database Constraints
+    # =========================================================
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "checkout_id",
+            name="uq_orders_user_checkout",
+        ),
+    )
+
+    # =========================================================
+    # Primary Key
+    # =========================================================
+
     id: Mapped[int] = mapped_column(
         primary_key=True,
-        autoincrement=True
+        autoincrement=True,
     )
 
-    # User who placed the order
+    # =========================================================
+    # User
+    # =========================================================
+
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "users.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
-        index=True
+        index=True,
     )
 
-    # Delivery address selected for the order
-    address_id: Mapped[int] = mapped_column(
-        ForeignKey("addresses.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True
-    )
+    # =========================================================
+    # Checkout / Idempotency
+    # =========================================================
 
-    # Rider assigned to deliver the order
-    # Nullable because a newly created order
-    # may not have a rider assigned yet.
-    rider_id: Mapped[int | None] = mapped_column(
-        ForeignKey("riders.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True
-    )
-
-    # Current order status
+    # Unique transaction identifier for the checkout flow.
     #
-    # Possible MVP values:
-    # pending
-    # confirmed
-    # packed
-    # shipped
-    # out_for_delivery
-    # delivered
-    # cancelled
+    # Existing legacy orders may have NULL here.
+    # New checkout-created orders should always provide it.
+
+    checkout_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
+
+    # =========================================================
+    # Delivery Address
+    # =========================================================
+
+    address_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "addresses.id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    # =========================================================
+    # Rider
+    # =========================================================
+
+    rider_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "riders.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    # =========================================================
+    # Order Status
+    # =========================================================
+
     status: Mapped[str] = mapped_column(
         String(30),
         default="pending",
         nullable=False,
-        index=True
+        index=True,
     )
 
-    # Total monetary value of the order
+    # =========================================================
+    # Order Total
+    # =========================================================
+
     total_amount: Mapped[float] = mapped_column(
         Float,
         default=0.0,
-        nullable=False
+        nullable=False,
     )
 
-    # Current payment status
-    #
-    # Possible MVP values:
-    # pending
-    # success
-    # failed
-    # refunded
+    # =========================================================
+    # Payment Status
+    # =========================================================
+
     payment_status: Mapped[str] = mapped_column(
         String(30),
         default="pending",
         nullable=False,
-        index=True
+        index=True,
     )
 
-    # Order creation timestamp
+    # =========================================================
+    # Timestamps
+    # =========================================================
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        nullable=False
+        nullable=False,
     )
 
-    # Order last update timestamp
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        nullable=False
+        nullable=False,
     )
 
-    # Relationship with User
+    # =========================================================
+    # Relationships
+    # =========================================================
+
     user = relationship(
         "User",
-        back_populates="orders"
+        back_populates="orders",
     )
 
-    # Relationship with Address
     address = relationship(
         "Address",
-        back_populates="orders"
+        back_populates="orders",
     )
 
-    # Relationship with Rider
     rider = relationship(
         "Rider",
-        back_populates="orders"
+        back_populates="orders",
     )
 
-    # Relationship with OrderItem
     items = relationship(
         "OrderItem",
         back_populates="order",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
 
-    # Relationship with Payment
     payment = relationship(
         "Payment",
         back_populates="order",
         uselist=False,
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
 
-    # Support tickets linked to this order
     support_tickets = relationship(
         "SupportTicket",
         back_populates="order",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
