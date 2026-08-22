@@ -45,6 +45,14 @@ import {
   sendChatMessage,
 } from "../services/chat";
 
+import {
+  getCart as apiGetCart,
+  addCartItem as apiAddCartItem,
+  updateCartItem as apiUpdateCartItem,
+  removeCartItem as apiRemoveCartItem,
+  clearCart as apiClearCart,
+} from "../services/cart_service";
+
 import type {
   Bill,
   Cart,
@@ -94,6 +102,14 @@ interface ChatStore {
    */
   cart: Cart | null;
 
+  /**
+   * Loading state for direct Cart API operations.
+   *
+   * Kept separate from chat loading because Cart API mutations
+   * are deterministic REST operations, not chat operations.
+   */
+  isCartLoading: boolean;
+
 
   // ----------------------------------------------------------
   // Actions
@@ -110,6 +126,48 @@ interface ChatStore {
   continueWithPaymentMethod: (
     methodId: string
   ) => Promise<boolean>;
+
+  /**
+   * Load the authoritative cart from the Cart API.
+   */
+  refreshCart: () => Promise<boolean>;
+
+  /**
+   * Add a product to the current Cart through the Cart API.
+   */
+  addCartItem: (
+    productId: number,
+    quantity?: number
+  ) => Promise<boolean>;
+
+  /**
+   * Update an existing Cart item through the Cart API.
+   */
+  updateCartItem: (
+    itemId: number,
+    quantity: number
+  ) => Promise<boolean>;
+
+  /**
+   * Remove an existing Cart item through the Cart API.
+   */
+  removeCartItem: (
+    itemId: number
+  ) => Promise<boolean>;
+
+  /**
+   * Delete the current backend Cart through the Cart API.
+   */
+  clearCart: () => Promise<boolean>;
+
+  /**
+   * Replace the frontend cart only with an already-authoritative
+   * backend cart representation.
+   *
+   * This does not calculate, mutate, or optimistically modify
+   * cart business state.
+   */
+  setCart: (cart: unknown) => boolean;
 
   clearChat: () => void;
 
@@ -808,6 +866,8 @@ function applyBackendState(
       metadata.cart !== undefined
     ) {
 
+      // normalizeResponseMetadata() has already validated the
+      // backend cart. Reuse that normalized representation.
       const normalizedCart =
         normalizeCart(
           metadata.cart,
@@ -859,6 +919,9 @@ export const useChatStore =
 
     checkout:
       null,
+
+    isCartLoading:
+      false,
 
     /**
      * No cart exists in the frontend until the backend
@@ -1371,6 +1434,449 @@ export const useChatStore =
 
 
     // ========================================================
+    // Refresh authoritative Cart
+    // ========================================================
+    //
+    // Direct Cart API operation.
+    //
+    // The backend remains authoritative. The store only accepts
+    // the returned Cart after normalizeCart() validation.
+    // ========================================================
+
+    refreshCart: async () => {
+
+      const userId =
+        get().userId;
+
+      if (userId === null) {
+
+        set({
+          error:
+            "User ID is required to load the cart.",
+        });
+
+        return false;
+      }
+
+      if (get().isCartLoading) {
+        return false;
+      }
+
+      set({
+        isCartLoading:
+          true,
+        error:
+          null,
+      });
+
+      try {
+
+        const cart =
+          await apiGetCart(userId);
+
+        const normalizedCart =
+          normalizeCart(cart);
+
+        if (!normalizedCart) {
+          throw new Error(
+            "Received invalid cart data from the backend.",
+          );
+        }
+
+        set({
+          cart:
+            normalizedCart,
+          isCartLoading:
+            false,
+          error:
+            null,
+        });
+
+        return true;
+
+      } catch (error) {
+
+        set({
+          isCartLoading:
+            false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to load the cart.",
+        });
+
+        return false;
+      }
+    },
+
+
+    // ========================================================
+    // Add Cart Item
+    // ========================================================
+
+    addCartItem: async (
+      productId: number,
+      quantity: number = 1,
+    ) => {
+
+      const userId = get().userId;
+
+      if (userId === null) {
+        set({ error: "User ID is required to add an item to the cart." });
+        return false;
+      }
+
+      if (!Number.isInteger(productId) || productId <= 0) {
+        set({ error: "A valid product ID is required." });
+        return false;
+      }
+
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        set({ error: "Quantity must be a positive integer." });
+        return false;
+      }
+
+      if (get().isCartLoading) {
+        return false;
+      }
+
+      set({ isCartLoading: true, error: null });
+
+      try {
+        const cart = await apiAddCartItem({
+          user_id: userId,
+          product_id: productId,
+          quantity,
+        });
+
+        const normalizedCart = normalizeCart(cart);
+
+        if (!normalizedCart) {
+          throw new Error("Received invalid cart data from the backend.");
+        }
+
+        set({
+          cart: normalizedCart,
+          isCartLoading: false,
+          error: null,
+        });
+
+        return true;
+      } catch (error) {
+        set({
+          isCartLoading: false,
+          error: error instanceof Error
+            ? error.message
+            : "Unable to add the item to the cart.",
+        });
+        return false;
+      }
+    },
+
+    // ========================================================
+    // Update Cart Item
+    // ========================================================
+
+    updateCartItem: async (
+      itemId: number,
+      quantity: number,
+    ) => {
+
+      const userId =
+        get().userId;
+
+      if (userId === null) {
+
+        set({
+          error:
+            "User ID is required to update the cart.",
+        });
+
+        return false;
+      }
+
+      if (
+        !Number.isInteger(itemId) ||
+        itemId <= 0
+      ) {
+
+        set({
+          error:
+            "A valid cart item ID is required.",
+        });
+
+        return false;
+      }
+
+      if (
+        !Number.isInteger(quantity) ||
+        quantity <= 0
+      ) {
+
+        set({
+          error:
+            "Quantity must be a positive integer.",
+        });
+
+        return false;
+      }
+
+      if (get().isCartLoading) {
+        return false;
+      }
+
+      set({
+        isCartLoading:
+          true,
+        error:
+          null,
+      });
+
+      try {
+
+        const cart =
+          await apiUpdateCartItem(
+            itemId,
+            {
+              user_id:
+                userId,
+              quantity,
+            },
+          );
+
+        const normalizedCart =
+          normalizeCart(cart);
+
+        if (!normalizedCart) {
+          throw new Error(
+            "Received invalid cart data from the backend.",
+          );
+        }
+
+        set({
+          cart:
+            normalizedCart,
+          isCartLoading:
+            false,
+          error:
+            null,
+        });
+
+        return true;
+
+      } catch (error) {
+
+        set({
+          isCartLoading:
+            false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to update the cart.",
+        });
+
+        return false;
+      }
+    },
+
+
+    // ========================================================
+    // Remove Cart Item
+    // ========================================================
+
+    removeCartItem: async (
+      itemId: number,
+    ) => {
+
+      const userId =
+        get().userId;
+
+      if (userId === null) {
+
+        set({
+          error:
+            "User ID is required to remove an item.",
+        });
+
+        return false;
+      }
+
+      if (
+        !Number.isInteger(itemId) ||
+        itemId <= 0
+      ) {
+
+        set({
+          error:
+            "A valid cart item ID is required.",
+        });
+
+        return false;
+      }
+
+      if (get().isCartLoading) {
+        return false;
+      }
+
+      set({
+        isCartLoading:
+          true,
+        error:
+          null,
+      });
+
+      try {
+
+        const cart =
+          await apiRemoveCartItem(
+            itemId,
+            userId,
+          );
+
+        const normalizedCart =
+          normalizeCart(cart);
+
+        if (!normalizedCart) {
+          throw new Error(
+            "Received invalid cart data from the backend.",
+          );
+        }
+
+        set({
+          cart:
+            normalizedCart,
+          isCartLoading:
+            false,
+          error:
+            null,
+        });
+
+        return true;
+
+      } catch (error) {
+
+        set({
+          isCartLoading:
+            false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to remove the cart item.",
+        });
+
+        return false;
+      }
+    },
+
+
+    // ========================================================
+    // Clear Cart
+    // ========================================================
+
+    clearCart: async () => {
+
+      const userId =
+        get().userId;
+
+      if (userId === null) {
+
+        set({
+          error:
+            "User ID is required to clear the cart.",
+        });
+
+        return false;
+      }
+
+      if (get().isCartLoading) {
+        return false;
+      }
+
+      set({
+        isCartLoading:
+          true,
+        error:
+          null,
+      });
+
+      try {
+
+        const cart =
+          await apiClearCart(
+            userId,
+          );
+
+        const normalizedCart =
+          normalizeCart(cart);
+
+        if (!normalizedCart) {
+          throw new Error(
+            "Received invalid cart data from the backend.",
+          );
+        }
+
+        set({
+          cart:
+            normalizedCart,
+          isCartLoading:
+            false,
+          error:
+            null,
+        });
+
+        return true;
+
+      } catch (error) {
+
+        set({
+          isCartLoading:
+            false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to clear the cart.",
+        });
+
+        return false;
+      }
+    },
+
+
+    // ========================================================
+    // Set authoritative Cart
+    // ========================================================
+    //
+    // This is the only public store action for replacing cart
+    // state. It accepts backend-shaped data and validates it
+    // through normalizeCart().
+    //
+    // IMPORTANT:
+    // - no optimistic cart mutation
+    // - no quantity calculation
+    // - no subtotal/total calculation
+    // - no stock/availability decision
+    // ========================================================
+
+    setCart: (cart: unknown) => {
+      const normalizedCart = normalizeCart(cart);
+
+      if (!normalizedCart) {
+        set({
+          error: "Received invalid cart data from the backend.",
+        });
+
+        return false;
+      }
+
+      set({
+        cart: normalizedCart,
+        error: null,
+      });
+
+      return true;
+    },
+
+    // ========================================================
     // Clear Chat
     // ========================================================
     //
@@ -1381,7 +1887,7 @@ export const useChatStore =
     // messages  -> reset
     // sessionId -> regenerate
     // checkout  -> reset
-    // cart      -> reset
+    // cart      -> preserved
     //
     // The backend cart itself is NOT deleted here.
     //
@@ -1395,12 +1901,15 @@ export const useChatStore =
 
     clearChat: () => {
 
-      set({
+      set((state) => ({
 
         messages:
           [],
 
         isLoading:
+          false,
+
+        isCartLoading:
           false,
 
         error:
@@ -1412,8 +1921,12 @@ export const useChatStore =
         checkout:
           null,
 
+        // IMPORTANT:
+        // clearChat() clears conversation state only.
+        // The backend cart is still authoritative and must not
+        // disappear merely because a new chat session starts.
         cart:
-          null,
-      });
+          state.cart,
+      }));
     },
   }));
