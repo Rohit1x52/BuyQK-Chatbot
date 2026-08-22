@@ -187,6 +187,20 @@ class GraphState(TypedDict, total=False):
     # This is only a proposal.
     planner_decision: dict[str, Any]
 
+    # Canonical planner result returned by planner_node.
+    #
+    # planner_node currently writes:
+    #
+    #     planner
+    #     planner_args
+    #
+    # Keep these fields explicitly represented in GraphState so the
+    # planner -> policy -> decision -> tool contract is typed.
+    planner: dict[str, Any]
+
+    # Canonical planner arguments consumed by downstream nodes.
+    planner_args: dict[str, Any]
+
     # Proposed capability/action.
     #
     # Existing Phase 2 actions:
@@ -361,6 +375,9 @@ class GraphState(TypedDict, total=False):
     #     "success": False,
     #     "error": {...}
     # }
+    #
+    # Tool execution may also expose the same authoritative result
+    # through tool_result for the generic tool contract.
     cart_result: dict[str, Any] | None
 
     # Whether the backend says the current cart is ready
