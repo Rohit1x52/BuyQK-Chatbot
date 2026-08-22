@@ -1,834 +1,1252 @@
 # =========================================================
-# BuyQK AI - Policy / Validator Node
+# BuyQK - AI Planner Node
 # =========================================================
 #
 # Purpose:
-# Validate the AI Planner's proposed action before allowing
-# the Tool Node to execute anything.
 #
-# Phase 2 architecture:
+# Convert AI-understood conversation state into a structured
+# execution plan.
 #
-#   Context
-#      ↓
-#   Understander
-#      ↓
-#   Planner
-#      ↓
-#   Policy / Validator
-#      ↓
-#   Tool
+# Architecture:
+#
+# User Message
+#       ↓
+# Context
+#       ↓
+# Entity / Understanding
+#       ↓
+# Planner
+#       ↓
+# Policy
+#       ↓
+# Decision
+#       ↓
+# Tool
 #
 # IMPORTANT:
 #
-# The Policy Node is NOT another AI decision maker.
+# The planner is an AI reasoning layer.
 #
-# The AI Planner proposes:
+# It may determine:
 #
-#   action
-#   tool
-#   arguments
+#   - user's goal
+#   - conversational action
+#   - required capability
+#   - missing information
+#   - checkout modification
+#   - tracking request
+#   - cancellation request
+#   - support request
 #
-# This node verifies whether that proposal is compatible
-# with the authoritative application state.
-#
-# It does NOT:
+# It must NOT:
 #
 #   - calculate prices
 #   - calculate bills
-#   - check product stock by itself
-#   - create orders
-#   - generate order IDs
-#   - generate checkout IDs
-#   - invent payment methods
-#   - invent addresses
+#   - invent stock
+#   - invent order IDs
+#   - invent payment results
+#   - authorize transactions
+#   - mutate the database
 #
-# Those responsibilities belong to backend services.
-#
-# The Policy Node protects backend tools from invalid AI
-# proposals and prevents completed transactions from being
-# executed again.
-#
+# Backend services remain authoritative for all
+# transactional/business facts.
 # =========================================================
-
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
-from ai_engine.graph.state import GraphState
+# IMPORTANT:
+#
+# Import get_llm directly into THIS module.
+#
+# Tests and other Phase-2 components intentionally patch:
+#
+#     planner_node.get_llm
+#
+# Therefore this symbol must exist at module level.
+#
+from ai_engine.llm.client import get_llm
 
 
 # =========================================================
-# Supported Tools
+# Planner Actions
 # =========================================================
 
-SUPPORTED_TOOLS = {
+PLANNER_ACTIONS: set[str] = {
+    "answer",
+    "end_conversation",
+    "ask_clarification",
+    "start_checkout",
+    "modify_checkout",
     "search_products",
+    "add_to_checkout",
     "create_order",
     "track_order",
     "cancel_order",
-    "create_support_ticket",
-    "list_saved_addresses",
+    "request_support",
+
+    # Phase 3 cart capabilities.
+    "add_to_cart",
+    "remove_from_cart",
+    "update_cart_item",
+    "clear_cart",
+    "show_cart",
+    "checkout_cart",
 }
 
 
 # =========================================================
-# Actions That Do Not Require Backend Tools
+# Utility: Extract Response Content
 # =========================================================
 
-NON_TOOL_ACTIONS = {
-    "ANSWER",
-    "ASK_CLARIFICATION",
-    "CONFIRM",
-    "END_CONVERSATION",
-    "START_CHECKOUT",
-    "MODIFY_CHECKOUT",
-}
-
-
-# =========================================================
-# Utility
-# =========================================================
-
-def _has_value(
-    value: Any,
-) -> bool:
+def _get_content(response: Any) -> Any:
     """
-    Determine whether a value is meaningfully present.
+    Extract content from a LangChain response.
 
-    Empty strings and None are considered absent.
-    Numeric zero remains a valid value.
+    Supports:
+        - AIMessage-like objects
+        - dictionaries
+        - strings
+        - structured content blocks
     """
 
-    if value is None:
-        return False
+    if isinstance(response, dict):
+        return response
 
-    if isinstance(
-        value,
-        str,
-    ):
-        return bool(
-            value.strip()
-        )
+    content = getattr(response, "content", None)
 
-    return True
+    if content is not None:
+        return content
 
-
-def _failure(reason: str, *, action: str | None = None, tool: str | None = None, retryable: bool = False) -> GraphState:
-    result = {"allowed": False, "action": action, "tool": tool, "reason": reason, "retryable": retryable}
-    return {
-        "policy_result": result,
-        "policy_error": result,
-        "policy_decision": "deny",
-        "policy_allowed": False,
-        "policy_reason": reason,
-        "tool_name": None,
-        "planner_action": action,
-        "planner_tool": tool,
-        "planner_status": "rejected",
-    }
-
-
-def _success(action: str, tool: str | None) -> GraphState:
-    result = {"allowed": True, "action": action, "tool": tool}
-    return {
-        "policy_result": result,
-        "policy_error": None,
-        "policy_decision": "allow",
-        "policy_allowed": True,
-        "policy_reason": None,
-        "tool_name": tool,
-        "planner_action": action,
-        "planner_tool": tool,
-        "planner_status": "approved",
-    }
+    return response
 
 
 # =========================================================
-# Completed Transaction Guard
+# Utility: Extract JSON
 # =========================================================
 
-def _transaction_already_completed(
-    state: GraphState,
-) -> bool:
+def _extract_json(content: Any) -> dict[str, Any]:
     """
-    Determine whether this checkout already resulted in a
-    successfully created order.
+    Extract a JSON object from an LLM response.
 
-    This is the critical Phase 1 → Phase 2 duplicate-order
-    protection.
-
-    Example:
-
-        Order created
-            ↓
-        user: "Thank you"
-            ↓
-        planner proposes ANSWER
-            ↓
-        allowed
-
-    Even if the planner incorrectly proposes CREATE_ORDER,
-    the policy layer prevents another transaction.
+    Handles:
+        direct JSON
+        markdown JSON fences
+        Qwen <think>...</think> output
+        explanatory text surrounding JSON
+        structured LangChain content
     """
 
-    order_created = bool(
-        state.get(
-            "order_created",
-            False,
-        )
-    )
+    # -----------------------------------------------------
+    # Dictionary already returned
+    # -----------------------------------------------------
 
-    checkout_completed = bool(
-        state.get(
-            "checkout_completed",
-            False,
-        )
-    )
+    if isinstance(content, dict):
+        return content
 
-    checkout_status = state.get(
-        "checkout_status"
-    )
+    # -----------------------------------------------------
+    # LangChain message object
+    # -----------------------------------------------------
 
-    order_id = state.get(
-        "order_id"
-    )
+    if not isinstance(content, str):
 
-    # The authoritative order_created flag is sufficient.
-    if order_created:
-        return True
-
-    # A persisted order ID means an order already exists.
-    if _has_value(order_id):
-        return True
-
-    # A terminal completed checkout should not be recreated.
-    if (
-        isinstance(
-            checkout_status,
-            str,
-        )
-        and checkout_status.strip().lower()
-        in {
-            "completed",
-            "complete",
-            "success",
-            "successful",
-        }
-    ):
-        return True
-
-    if checkout_completed:
-        return True
-
-    return False
-
-
-# =========================================================
-# Checkout Readiness
-# =========================================================
-
-def _checkout_has_required_state(
-    state: GraphState,
-) -> tuple[bool, list[str]]:
-    """
-    Validate that the current GraphState contains the
-    transaction fields required before CREATE_ORDER.
-
-    This does NOT validate business facts such as:
-
-        product exists
-        stock is sufficient
-        address belongs to user
-        payment is currently available
-
-    Those are backend responsibilities.
-    """
-
-    missing: list[str] = []
-
-    if not (
-        _has_value(state.get("product_id"))
-        or _has_value(state.get("product_name"))
-    ):
-        missing.append(
-            "product_name"
-        )
-
-    if not _has_value(
-        state.get(
-            "quantity"
-        )
-    ):
-        missing.append(
-            "quantity"
-        )
-
-    address_id = state.get(
-        "address_id"
-    )
-
-    selected_address_id = state.get(
-        "selected_address_id"
-    )
-
-    if not (
-        _has_value(address_id)
-        or _has_value(
-            selected_address_id
-        )
-    ):
-        missing.append(
-            "address_id"
-        )
-
-    payment_method = state.get(
-        "selected_payment_method"
-    )
-
-    if not _has_value(
-        payment_method
-    ):
-        payment_method = state.get(
-            "payment_method"
-        )
-
-    if not _has_value(
-        payment_method
-    ):
-        payment_method = state.get(
-            "selected_payment_method_normalized"
-        )
-
-    if not _has_value(
-        payment_method
-    ):
-        missing.append(
-            "payment_method"
-        )
-
-    return (
-        len(missing) == 0,
-        missing,
-    )
-
-
-# =========================================================
-# Validate Tool
-# =========================================================
-
-def _validate_tool(
-    tool: Any,
-) -> tuple[bool, str | None]:
-    """
-    Validate that the planner requested a tool supported by
-    the application.
-
-    The planner cannot invent arbitrary tool names.
-    """
-
-    if tool is None:
-        return (
-            True,
+        message_content = getattr(
+            content,
+            "content",
             None,
         )
+
+        if isinstance(message_content, str):
+
+            content = message_content
+
+        elif isinstance(message_content, list):
+
+            text_parts: list[str] = []
+
+            for block in message_content:
+
+                if isinstance(block, str):
+                    text_parts.append(block)
+
+                elif isinstance(block, dict):
+
+                    text = block.get("text")
+
+                    if isinstance(text, str):
+                        text_parts.append(text)
+
+            content = "\n".join(text_parts)
+
+        else:
+
+            raise ValueError(
+                "Planner returned an unsupported response type."
+            )
+
+    # -----------------------------------------------------
+    # Validate text
+    # -----------------------------------------------------
+
+    text = content.strip()
+
+    if not text:
+        raise ValueError(
+            "Planner returned an empty response."
+        )
+
+    # -----------------------------------------------------
+    # Remove Qwen reasoning blocks
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
+    # -----------------------------------------------------
+    # Remove unmatched <think>
+    # -----------------------------------------------------
+
+    if "<think>" in text.lower():
+
+        text = re.sub(
+            r"<think>.*",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    # -----------------------------------------------------
+    # Remove markdown fences
+    # -----------------------------------------------------
+
+    if text.startswith("```"):
+
+        lines = text.splitlines()
+
+        if (
+            lines
+            and lines[0].strip().startswith("```")
+        ):
+            lines = lines[1:]
+
+        if (
+            lines
+            and lines[-1].strip() == "```"
+        ):
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
+
+    # -----------------------------------------------------
+    # Direct JSON
+    # -----------------------------------------------------
+
+    try:
+
+        parsed = json.loads(text)
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    except json.JSONDecodeError:
+        pass
+
+    # -----------------------------------------------------
+    # Embedded JSON
+    # -----------------------------------------------------
+
+    decoder = json.JSONDecoder()
+
+    for index, character in enumerate(text):
+
+        if character != "{":
+            continue
+
+        candidate = text[index:]
+
+        try:
+
+            parsed, _ = decoder.raw_decode(candidate)
+
+            if isinstance(parsed, dict):
+                return parsed
+
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError(
+        "Planner returned invalid JSON."
+    )
+
+
+# =========================================================
+# Utility: Normalize Action
+# =========================================================
+
+def _normalize_action(
+    action: Any,
+) -> str | None:
+    """
+    Normalize equivalent action field names.
+
+    The AI may return:
+
+        action
+        capability
+        tool
+        tool_name
+        intent
+
+    No conversational decision is made here.
+    """
+
+    if not isinstance(action, str):
+        return None
+
+    normalized = (
+        action
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    return normalized or None
+
+
+# =========================================================
+# Phase 3: Cart Action → Planner Capability
+# =========================================================
+
+
+CART_ACTION_TO_CAPABILITY: dict[str, str] = {
+    "add_item": "add_to_cart",
+    "remove_item": "remove_from_cart",
+    "update_quantity": "update_cart_item",
+    "clear_cart": "clear_cart",
+    "show_cart": "show_cart",
+    "checkout": "checkout_cart",
+}
+
+
+def _cart_capability_from_state(
+    state: dict[str, Any],
+) -> str | None:
+    """Map explicit entity understanding to a cart capability."""
+
+    intent = str(
+        state.get("intent") or ""
+    ).strip().lower()
+
+    if intent != "cart":
+        return None
+
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    cart_action = entities.get("cart_action")
+
+    if not isinstance(cart_action, str):
+        cart_action = state.get("cart_action")
+
+    if not isinstance(cart_action, str):
+        return None
+
+    cart_action = (
+        cart_action.strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    return CART_ACTION_TO_CAPABILITY.get(cart_action)
+
+
+def _build_cart_arguments(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build safe arguments from already-understood state.
+
+    No database lookup, stock check, price calculation, or
+    cart mutation occurs here.
+    """
+
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    arguments: dict[str, Any] = {}
+
+    product_name = entities.get("product_name")
+    if product_name:
+        arguments["product_name"] = product_name
+
+    quantity = entities.get("quantity")
+    if quantity is not None:
+        try:
+            quantity = int(quantity)
+            if quantity > 0:
+                arguments["quantity"] = quantity
+        except (TypeError, ValueError):
+            pass
+
+    # Preserve only already-resolved backend values.
+    product_id = entities.get("product_id")
+    if product_id is not None:
+        try:
+            product_id = int(product_id)
+            if product_id > 0:
+                arguments["product_id"] = product_id
+        except (TypeError, ValueError):
+            pass
+
+    cart_id = state.get("cart_id")
+    if cart_id is not None:
+        arguments["cart_id"] = cart_id
+
+    return arguments
+
+
+# =========================================================
+# Utility: Normalize Planner Output
+# =========================================================
+
+def _normalize_plan(
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Convert raw LLM output into the canonical planner
+    contract.
+    """
+
+    # -----------------------------------------------------
+    # Action
+    # -----------------------------------------------------
+
+    action = _normalize_action(
+        plan.get("action")
+    )
+
+    if action is None:
+
+        for field in (
+            "capability",
+            "tool",
+            "tool_name",
+            "intent",
+        ):
+
+            action = _normalize_action(
+                plan.get(field)
+            )
+
+            if action is not None:
+                break
+
+    # -----------------------------------------------------
+    # Arguments
+    # -----------------------------------------------------
+
+    arguments = plan.get("arguments")
+
+    if not isinstance(arguments, dict):
+
+        arguments = plan.get(
+            "tool_arguments"
+        )
+
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    # -----------------------------------------------------
+    # Missing fields
+    # -----------------------------------------------------
+
+    missing_fields = plan.get(
+        "missing_fields"
+    )
 
     if not isinstance(
-        tool,
-        str,
+        missing_fields,
+        list,
     ):
-        return (
-            False,
-            "invalid_tool",
-        )
+        missing_fields = []
 
-    tool = tool.strip()
+    # Keep only strings.
+    missing_fields = [
+        str(value)
+        for value in missing_fields
+        if value is not None
+    ]
 
-    if not tool:
-        return (
-            True,
-            None,
-        )
+    # -----------------------------------------------------
+    # Confidence
+    # -----------------------------------------------------
 
-    if tool not in SUPPORTED_TOOLS:
-        return (
-            False,
-            "unsupported_tool",
-        )
-
-    return (
-        True,
-        tool,
+    confidence = plan.get(
+        "confidence"
     )
+
+    if isinstance(
+        confidence,
+        (int, float),
+    ):
+
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(confidence),
+            ),
+        )
+
+    else:
+
+        confidence = None
+
+    # -----------------------------------------------------
+    # Reason
+    # -----------------------------------------------------
+
+    reason = plan.get("reason")
+
+    if not isinstance(reason, str):
+        reason = None
+
+    # -----------------------------------------------------
+    # Canonical contract
+    # -----------------------------------------------------
+
+    tool_name = action
+    if isinstance(action, str) and action.upper() in {
+        "ANSWER",
+        "ASK_CLARIFICATION",
+        "CONFIRM",
+        "END_CONVERSATION",
+        "START_CHECKOUT",
+        "MODIFY_CHECKOUT",
+    }:
+        tool_name = None
+
+    return {
+        "action": action,
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "missing_fields": missing_fields,
+        "confidence": confidence,
+        "reason": reason,
+    }
 
 
 # =========================================================
-# Validate CREATE_ORDER
+# Planner Prompt
 # =========================================================
 
-def _validate_create_order(
-    state: GraphState,
-    action: str,
-    tool: str | None,
-) -> GraphState:
+def _build_planner_prompt(
+    state: dict[str, Any],
+) -> str:
     """
-    Validate an AI proposal to create an order.
+    Build the planner prompt from GraphState.
 
-    Only transaction-state readiness is checked here.
-
-    Product availability, stock, price, payment validity,
-    authorization and final billing remain backend
-    responsibilities.
+    Only conversational reasoning is delegated to the LLM.
     """
 
-    # -----------------------------------------------------
-    # Duplicate transaction guard
-    # -----------------------------------------------------
-
-    if _transaction_already_completed(
-        state
-    ):
-        return _failure(
-            "checkout_already_completed",
-            action=action,
-            tool=tool,
-            retryable=False,
-        )
-
-    # -----------------------------------------------------
-    # Checkout ID
-    # -----------------------------------------------------
-    #
-    # Durable idempotency requires a checkout ID.
-    #
-    # The Policy Node does not generate one.
-    #
-    # -----------------------------------------------------
-
-    checkout_id = state.get(
-        "checkout_id"
+    message = state.get(
+        "message",
+        "",
     )
 
-    if not _has_value(
-        checkout_id
-    ):
-        return _failure(
-            "missing_checkout_id",
-            action=action,
-            tool=tool,
-            retryable=True,
-        )
-
-    # -----------------------------------------------------
-    # Required checkout state
-    # -----------------------------------------------------
-
-    ready, missing = (
-        _checkout_has_required_state(
-            state
-        )
+    conversation_history = state.get(
+        "conversation_history",
+        [],
     )
 
-    if not ready:
+    entities = state.get(
+        "entities",
+        {},
+    )
+
+    intent = state.get(
+        "intent"
+    )
+
+    missing_fields = state.get(
+        "missing_fields",
+        [],
+    )
+
+    cart_state = {
+        "cart_id": state.get("cart_id"),
+        "cart_status": state.get("cart_status"),
+        "cart_items": state.get("cart_items", []),
+        "cart_summary": state.get("cart_summary"),
+        "cart_action": (
+            entities.get("cart_action")
+            if isinstance(entities, dict)
+            else state.get("cart_action")
+        ),
+        "cart_checkout_ready": state.get(
+            "cart_checkout_ready",
+            False,
+        ),
+    }
+
+    # -----------------------------------------------------
+    # Authoritative checkout state
+    # -----------------------------------------------------
+
+    checkout_state = {
+        "checkout_id": state.get(
+            "checkout_id"
+        ),
+        "checkout_status": state.get(
+            "checkout_status"
+        ),
+        "order_created": state.get(
+            "order_created"
+        ),
+        "order_id": state.get(
+            "order_id"
+        ),
+        "bill": state.get(
+            "bill"
+        ),
+    }
+
+    # -----------------------------------------------------
+    # Frontend selection
+    # -----------------------------------------------------
+
+    frontend_state = {
+        "selected_address_id": state.get(
+            "selected_address_id"
+        ),
+        "payment_method": state.get(
+            "payment_method"
+        ),
+        "selected_payment_method": state.get(
+            "selected_payment_method"
+        ),
+    }
+
+    # -----------------------------------------------------
+    # Safe context
+    # -----------------------------------------------------
+
+    context = {
+        "current_message": message,
+        "conversation_history": conversation_history,
+        "intent": intent,
+        "entities": entities,
+        "missing_fields": missing_fields,
+        "checkout": checkout_state,
+        "cart": cart_state,
+        "frontend_selection": frontend_state,
+    }
+
+    return f"""
+You are the BuyQK AI Planner.
+
+Your job is to understand the user's CURRENT goal and
+produce exactly ONE structured execution plan.
+
+You are a conversational reasoning layer.
+
+You may decide:
+
+- what the user means
+- the user's current goal
+- whether the user wants to start a checkout
+- whether the user wants to modify an existing checkout
+- whether the user wants product search
+- whether the user wants tracking
+- whether the user wants cancellation
+- whether the user wants support
+- whether clarification is required
+- whether the message is ordinary conversation
+- which backend capability is appropriate
+
+You must NOT:
+
+- calculate prices
+- calculate bills
+- invent stock
+- invent order IDs
+- invent payment results
+- invent transaction success
+- decide backend authorization
+- decide cancellation eligibility
+- mutate the database
+- claim an order was created without authoritative backend state
+
+The backend is authoritative for transactional facts.
+
+IMPORTANT CHECKOUT RULE:
+
+The supplied checkout state is authoritative.
+
+If:
+
+checkout_status = "completed"
+and
+order_created = true
+
+then a normal acknowledgement such as "Thank you",
+"Thanks", "Okay", "Alright", or "Got it" must NOT
+be interpreted as another purchase.
+
+If the user explicitly expresses a NEW shopping goal,
+that is a new conversational goal.
+
+If the user wants to change an active checkout,
+use modify_checkout.
+
+If the user's reference cannot be resolved from the
+available context, use ask_clarification.
+
+Available capabilities:
+
+answer
+end_conversation
+ask_clarification
+start_checkout
+modify_checkout
+search_products
+add_to_checkout
+create_order
+track_order
+cancel_order
+request_support
+
+- request_support
+
+Phase 3 cart capabilities:
+
+- add_to_cart
+- remove_from_cart
+- update_cart_item
+- clear_cart
+- show_cart
+- checkout_cart
+
+CART PLANNING RULE:
+
+When intent is "cart", map cart_action as follows:
+
+add_item
+→ add_to_cart
+
+remove_item
+→ remove_from_cart
+
+update_quantity
+→ update_cart_item
+
+clear_cart
+→ clear_cart
+
+show_cart
+→ show_cart
+
+checkout
+→ checkout_cart
+
+For cart operations:
+- pass product_name only when already understood.
+- pass quantity only when already understood.
+- pass product_id only when already backend-resolved.
+- pass cart_id only when already present.
+- never invent product_id or cart_id.
+- never calculate prices, totals, stock, or discounts.
+- never execute the cart operation.
+- never claim that the cart was modified.
+
+If intent is "cart" but cart_action is missing or ambiguous,
+use ask_clarification.
+
+Return ONLY JSON.
+
+
+Required structure:
+
+{{
+  "action": "<one action>",
+  "arguments": {{}},
+  "missing_fields": [],
+  "confidence": 0.0,
+  "reason": "<short explanation>"
+}}
+
+The arguments object may contain only information
+supported by the supplied context.
+
+Do not invent transactional values.
+
+CURRENT GRAPH STATE:
+
+{json.dumps(
+    context,
+    ensure_ascii=False,
+    default=str,
+    indent=2,
+)}
+""".strip()
+
+
+# =========================================================
+# Planner Node
+# =========================================================
+
+def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
+    """Safe planner fallback for LLM outages/rate limits.
+
+    Entity/understanding state is already available; this function only
+    maps that state to the canonical workflow capability.
+    """
+    intent = str(state.get("intent") or "general").strip().lower()
+    entities = state.get("entities", {}) or {}
+    missing = list(state.get("missing_fields", []) or [])
+
+    # =====================================================
+    # CART FALLBACK
+    # =====================================================
+    #
+    # If the planner LLM is unavailable, an already-resolved
+    # Cart intent/action must still map deterministically to
+    # the canonical Cart capability.
+    #
+    # This function only creates a plan. It never calls a
+    # CartService method and never mutates backend state.
+    # =====================================================
+
+    if intent == "cart":
+        cart_capability = _cart_capability_from_state(state)
+
+        if cart_capability is None:
+            return {
+                "action": "ask_clarification",
+                "tool_name": None,
+                "arguments": {},
+                "missing_fields": ["cart_action"],
+                "confidence": 0.0,
+                "reason": (
+                    "Cart intent was understood, but the Cart action "
+                    "could not be resolved."
+                ),
+            }
+
+        arguments = _build_cart_arguments(state)
+        cart_missing_fields: list[str] = []
+
+        if cart_capability in {
+            "add_to_cart",
+            "update_cart_item",
+        }:
+            if not (
+                arguments.get("product_name")
+                or arguments.get("product_id")
+            ):
+                cart_missing_fields.append("product_reference")
+
+            if "quantity" not in arguments:
+                cart_missing_fields.append("quantity")
+
+        elif cart_capability == "remove_from_cart":
+            if not (
+                arguments.get("product_name")
+                or arguments.get("product_id")
+            ):
+                cart_missing_fields.append("product_reference")
+
+        if cart_missing_fields:
+            return {
+                "action": "ask_clarification",
+                "tool_name": None,
+                "arguments": arguments,
+                "missing_fields": cart_missing_fields,
+                "confidence": 0.0,
+                "reason": (
+                    "Deterministic Cart fallback requires "
+                    "additional information."
+                ),
+            }
+
         return {
-            "policy_result": {
-                "allowed": False,
-                "action": action,
-                "tool": tool,
-                "reason": "checkout_incomplete",
-                "missing_fields": missing,
-                "retryable": True,
-            },
-            "policy_error": {
-                "allowed": False,
-                "action": action,
-                "tool": tool,
-                "reason": "checkout_incomplete",
-                "missing_fields": missing,
-                "retryable": True,
-            },
-            "tool_name": None,
-            "missing_fields": missing,
+            "action": cart_capability,
+            "tool_name": cart_capability,
+            "arguments": arguments,
+            "missing_fields": [],
+            "confidence": 0.0,
+            "reason": (
+                "Deterministic Cart fallback used because "
+                "the planner model was unavailable."
+            ),
         }
 
-    return _success(
-        action,
-        tool,
-    )
-
-
-# =========================================================
-# Validate TRACK_ORDER
-# =========================================================
-
-def _validate_track_order(
-    state: GraphState,
-    action: str,
-    tool: str | None,
-) -> GraphState:
-    """
-    Validate tracking capability.
-
-    The actual order ownership/status lookup remains a backend
-    responsibility.
-    """
-
-    order_id = state.get(
-        "order_id"
-    )
-
-    planned_arguments = state.get(
-        "planned_arguments",
-        {},
-    )
-
-    planned_order_id = None
-
-    if isinstance(
-        planned_arguments,
-        dict,
-    ):
-        planned_order_id = (
-            planned_arguments.get(
-                "order_id"
-            )
-        )
-
-    if not (
-        _has_value(order_id)
-        or _has_value(
-            planned_order_id
-        )
-    ):
-        return _failure(
-            "missing_order_reference",
-            action=action,
-            tool=tool,
-            retryable=True,
-        )
-
-    return _success(
-        action,
-        tool,
-    )
-
-
-# =========================================================
-# Validate CANCEL_ORDER
-# =========================================================
-
-def _validate_cancel_order(
-    state: GraphState,
-    action: str,
-    tool: str | None,
-) -> GraphState:
-    """
-    Validate that a cancellation request contains an order
-    reference.
-
-    Whether cancellation is actually allowed is determined
-    by the backend/order service.
-    """
-
-    order_id = state.get(
-        "order_id"
-    )
-
-    planned_arguments = state.get(
-        "planned_arguments",
-        {},
-    )
-
-    planned_order_id = None
-
-    if isinstance(
-        planned_arguments,
-        dict,
-    ):
-        planned_order_id = (
-            planned_arguments.get(
-                "order_id"
-            )
-        )
-
-    if not (
-        _has_value(order_id)
-        or _has_value(
-            planned_order_id
-        )
-    ):
-        return _failure(
-            "missing_order_reference",
-            action=action,
-            tool=tool,
-            retryable=True,
-        )
-
-    return _success(
-        action,
-        tool,
-    )
-
-
-# =========================================================
-# Validate Generic Tool
-# =========================================================
-
-def _validate_generic_tool(
-    state: GraphState,
-    action: str,
-    tool: str | None,
-) -> GraphState:
-    """
-    Validate a normal backend capability.
-
-    The actual business validation happens in the backend.
-    """
-
-    return _success(
-        action,
-        tool,
-    )
-
-
-# =========================================================
-# Policy Node
-# =========================================================
-
-def policy_node(
-    state: GraphState,
-) -> GraphState:
-    """
-    Validate the AI Planner's proposed action.
-
-    The policy node is deliberately deterministic.
-
-    AI decides:
-        What does the user want?
-
-    Policy verifies:
-        Is this proposed action permitted by the current
-        application/transaction state?
-
-    Backend decides:
-        Is the actual operation valid?
-    """
-
     # =====================================================
-    # DIAGNOSTIC (temporary — remove once confirmed)
+    # ORDER CREATE FALLBACK
     # =====================================================
+
+    if intent == "order_create":
+        args = {}
+        for key in (
+            "product_name",
+            "quantity",
+            "address_id",
+            "payment_method",
+        ):
+            value = entities.get(key)
+            if value is not None:
+                args[key] = value
+
+        if missing:
+            return {
+                "action": "start_checkout",
+                "tool_name": None,
+                "arguments": args,
+                "missing_fields": missing,
+                "confidence": 0.0,
+                "reason": (
+                    "Deterministic checkout fallback used because "
+                    "the planner model was unavailable."
+                ),
+            }
+
+        return {
+            "action": "create_order",
+            "tool_name": "create_order",
+            "arguments": args,
+            "missing_fields": [],
+            "confidence": 0.0,
+            "reason": (
+                "Deterministic order-creation fallback used because "
+                "the planner model was unavailable."
+            ),
+        }
+
+    mapping = {
+        "product_search": "search_products",
+        "order_tracking": "track_order",
+        "order_cancel": "cancel_order",
+        "customer_support": "request_support",
+    }
+    action = mapping.get(intent, "answer")
+    return {
+        "action": action,
+        "tool_name": action if action != "answer" else None,
+        "arguments": {},
+        "missing_fields": missing,
+        "confidence": 0.0,
+        "reason": "Deterministic planner fallback used because the planner model was unavailable.",
+    }
+
+
+def planner_node(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Execute the AI planner.
+
+    Input:
+        GraphState
+
+    Output:
+        planner
+        planner_args
+        missing_fields
+
+    This node does NOT execute backend operations.
+    """
+
+    # -----------------------------------------------------
+    # Deterministic cart orchestration
+    # -----------------------------------------------------
+    # Cart mutations are transactional. Once Entity Node has
+    # deterministically understood the cart action/product/quantity,
+    # do not send the same request through a second free-form LLM.
+    # This eliminates planner JSON/tool-call failures and prevents
+    # a valid cart request from falling back to checkout clarification.
+    # -----------------------------------------------------
+    if str(state.get("intent") or "").strip().lower() == "cart":
+        plan = _deterministic_plan_fallback(state)
+        result = {
+            "planner": plan,
+            "planner_args": dict(plan.get("arguments", {})),
+            "missing_fields": list(plan.get("missing_fields", [])),
+            "cart_action": state.get("cart_action")
+                or (state.get("entities") or {}).get("cart_action"),
+            "cart_capability": plan.get("action")
+                if plan.get("action") != "ask_clarification"
+                else None,
+        }
+        print("[AI PLANNER NODE] deterministic cart plan")
+        print(f"action          = {plan.get('action')!r}")
+        print(f"arguments       = {plan.get('arguments')!r}")
+        print(f"missing_fields  = {plan.get('missing_fields')!r}")
+        return result
+
+    # -----------------------------------------------------
+    # Deterministic checkout orchestration
+    # -----------------------------------------------------
+    if str(state.get("intent") or "").strip().lower() == "order_create":
+        plan = _deterministic_plan_fallback(state)
+        result = {
+            "planner": plan,
+            "planner_args": dict(plan.get("arguments", {})),
+            "missing_fields": list(plan.get("missing_fields", [])),
+        }
+        print("[AI PLANNER NODE] deterministic checkout plan")
+        print(f"action          = {plan.get('action')!r}")
+        print(f"arguments       = {plan.get('arguments')!r}")
+        print(f"missing_fields  = {plan.get('missing_fields')!r}")
+        print(f"checkout_id     = {state.get('checkout_id')!r}")
+        return result
+
+    # -----------------------------------------------------
+    # Build prompt
+    # -----------------------------------------------------
+
+    prompt = _build_planner_prompt(
+        state
+    )
+
+    # -----------------------------------------------------
+    # IMPORTANT
     #
-    # planner_node definitely returns {"planner": plan, ...}.
-    # If the log line below does NOT include "planner" in the
-    # key list, the state object reaching this node does not
-    # contain what planner_node returned — meaning the state
-    # is being dropped/filtered before it gets here (most
-    # likely because GraphState's TypedDict in state.py does
-    # not declare a "planner" / "planner_args" field). That is
-    # a graph-state-schema issue, not something fixable here.
-    # =====================================================
+    # get_llm is deliberately resolved through the module
+    # namespace.
+    #
+    # This allows:
+    #
+    # monkeypatch.setattr(
+    #     planner_module,
+    #     "get_llm",
+    #     ...
+    # )
+    #
+    # and keeps production configuration centralized.
+    # -----------------------------------------------------
 
-    print(
-        "\n"
-        "====================================================\n"
-        "[POLICY NODE] incoming state keys\n"
-        "====================================================\n"
-        f"{sorted(state.keys())!r}\n"
-        f"has 'planner' key   = {'planner' in state!r}\n"
-        f"planner value       = {state.get('planner')!r}\n"
-        "====================================================\n"
+    try:
+        llm = get_llm()
+        response = llm.invoke(prompt)
+        content = _get_content(response)
+        raw_plan = _extract_json(content)
+        plan = _normalize_plan(raw_plan)
+    except Exception as exc:
+        print(
+            "[PLANNER LLM FALLBACK]"
+            f" {type(exc).__name__}: {exc}"
+        )
+        plan = _deterministic_plan_fallback(state)
+
+    # -----------------------------------------------------
+    # Phase 3 cart capability enforcement
+    # -----------------------------------------------------
+    #
+    # Explicit cart understanding from entity_node takes
+    # precedence over a generic LLM planner action.
+    # This prevents cart requests from becoming checkout/order
+    # operations accidentally.
+    #
+    # No cart operation is executed here.
+    # -----------------------------------------------------
+
+    cart_capability = _cart_capability_from_state(
+        state
     )
 
-    planner_decision = state.get("planner_decision")
+    if cart_capability is not None:
 
-    if not isinstance(planner_decision, dict):
-        planner = state.get("planner")
-        if isinstance(planner, dict):
-            planner_decision = {
-                "action": planner.get("action"),
-                "tool": planner.get("tool") or planner.get("tool_name"),
-                "arguments": planner.get("arguments", {}),
-            }
-        elif _has_value(state.get("planner_action")):
-            planner_decision = {
-                "action": state.get("planner_action"),
-                "tool": state.get("planner_tool"),
-                "arguments": state.get("planner_args", {}),
-            }
-        elif _has_value(state.get("action")):
-            planner_decision = {
-                "action": state.get("action"),
-                "tool": state.get("tool") or state.get("tool_name"),
-                "arguments": state.get("arguments", {}),
-            }
-        else:
-            planner_decision = {
-                "action": None,
-                "tool": None,
-                "arguments": {},
-            }
+        llm_arguments = plan.get(
+            "arguments",
+            {},
+        )
 
-    print(
-        "\n"
-        "====================================================\n"
-        "[POLICY NODE]\n"
-        "====================================================\n"
-        f"planner_decision = {planner_decision!r}\n"
-        "====================================================\n"
-    )
+        if not isinstance(
+            llm_arguments,
+            dict,
+        ):
+            llm_arguments = {}
 
-    if not isinstance(planner_decision, dict):
-        return _failure("missing_planner_decision")
+        cart_arguments = _build_cart_arguments(
+            state
+        )
 
-    action = planner_decision.get(
+        merged_arguments = dict(
+            llm_arguments
+        )
+
+        for key, value in cart_arguments.items():
+            merged_arguments[key] = value
+
+        plan["action"] = cart_capability
+        plan["tool_name"] = cart_capability
+        plan["arguments"] = merged_arguments
+        plan["reason"] = (
+            "Mapped explicit cart understanding to the "
+            "canonical cart capability."
+        )
+
+    elif (
+        str(state.get("intent") or "").strip().lower()
+        == "cart"
+    ):
+        plan["action"] = "ask_clarification"
+        plan["tool_name"] = "ask_clarification"
+        plan["arguments"] = {}
+        plan["missing_fields"] = [
+            "cart_action"
+        ]
+        plan["reason"] = (
+            "Cart intent was understood, but the requested "
+            "cart operation is ambiguous."
+        )
+
+    # -----------------------------------------------------
+    # Validate capability
+    # -----------------------------------------------------
+
+    action = plan.get(
         "action"
     )
 
-    if not isinstance(
-        action,
-        str,
-    ) or not action.strip():
-        return _failure(
-            "invalid_planner_action"
+    if action is None:
+
+        plan["action"] = "answer"
+        plan["tool_name"] = None
+        plan["reason"] = (
+            "Planner returned valid JSON but omitted the action field. Defaulting to answer."
         )
 
-    action = action.strip().upper()
+    elif (
+        action is not None
+        and action not in PLANNER_ACTIONS
+    ):
 
-    tool = planner_decision.get("tool")
-    if not tool and action in {"CREATE_ORDER", "TRACK_ORDER", "CANCEL_ORDER"}:
-        tool = {"CREATE_ORDER":"create_order","TRACK_ORDER":"track_order","CANCEL_ORDER":"cancel_order"}.get(action)
+        plan["action"] = None
+        plan["tool_name"] = None
 
-    planned_arguments = planner_decision.get("arguments")
-    if isinstance(planned_arguments, dict):
-        # Compatibility mirror consumed by validators.
-        state = dict(state)
-        state["planned_arguments"] = planned_arguments
-
-    # =====================================================
-    # Tool Validation
-    # =====================================================
-
-    valid_tool, normalized_tool = (
-        _validate_tool(
-            tool
+        plan["reason"] = (
+            "Planner returned an unsupported capability."
         )
+
+    # -----------------------------------------------------
+    # Preserve backend transaction state
+    # -----------------------------------------------------
+    #
+    # IMPORTANT:
+    #
+    # Do NOT return replacements for:
+    #
+    # checkout_id
+    # checkout_status
+    # order_created
+    # order_id
+    # bill
+    #
+    # The planner cannot mutate authoritative transaction
+    # state.
+    # -----------------------------------------------------
+
+    result: dict[str, Any] = {
+        "planner": plan,
+
+        "planner_args": dict(
+            plan.get(
+                "arguments",
+                {},
+            )
+        ),
+
+        "missing_fields": list(
+            plan.get(
+                "missing_fields",
+                state.get(
+                    "missing_fields",
+                    [],
+                ),
+            )
+        ),
+    }
+
+    # -----------------------------------------------------
+    # Debug logging
+    # -----------------------------------------------------
+
+    print(
+        "\n"
+        + "=" * 60
+        + "\n"
+        + "[AI PLANNER NODE]"
+        + "\n"
+        + "=" * 60
     )
 
-    if not valid_tool:
-        return _failure(
-            "unsupported_tool",
-            action=action,
-            tool=(
-                tool
-                if isinstance(
-                    tool,
-                    str,
-                )
-                else None
-            ),
-            retryable=False,
-        )
-
-    tool = normalized_tool
-
-    # =====================================================
-    # Non-tool conversational action
-    # =====================================================
-
-    if action in NON_TOOL_ACTIONS:
-
-        # -------------------------------------------------
-        # Critical completed-order protection
-        # -------------------------------------------------
-        #
-        # A conversational message after a completed order
-        # is allowed to remain conversational.
-        #
-        # It must never be converted into create_order merely
-        # because checkout information remains in state.
-        #
-        # -------------------------------------------------
-
-        return _success(
-            action,
-            None,
-        )
-
-    # =====================================================
-    # CREATE_ORDER
-    # =====================================================
-
-    if action == "CREATE_ORDER":
-
-        # The planner must explicitly request the order tool.
-        if tool != "create_order":
-            return _failure(
-                "create_order_requires_create_order_tool",
-                action=action,
-                tool=tool,
-                retryable=False,
-            )
-
-        return _validate_create_order(
-            state,
-            action,
-            tool,
-        )
-
-    # =====================================================
-    # TRACK_ORDER
-    # =====================================================
-
-    if action == "TRACK_ORDER":
-
-        if tool != "track_order":
-            return _failure(
-                "track_order_requires_track_order_tool",
-                action=action,
-                tool=tool,
-                retryable=False,
-            )
-
-        return _validate_track_order(
-            state,
-            action,
-            tool,
-        )
-
-    # =====================================================
-    # CANCEL_ORDER
-    # =====================================================
-
-    if action == "CANCEL_ORDER":
-
-        if tool != "cancel_order":
-            return _failure(
-                "cancel_order_requires_cancel_order_tool",
-                action=action,
-                tool=tool,
-                retryable=False,
-            )
-
-        return _validate_cancel_order(
-            state,
-            action,
-            tool,
-        )
-
-    # =====================================================
-    # All Other Tool Actions
-    # =====================================================
-
-    if tool is None:
-        return _failure(
-            "tool_required_for_action",
-            action=action,
-            tool=None,
-            retryable=False,
-        )
-
-    return _validate_generic_tool(
-        state,
-        action,
-        tool,
+    print(
+        f"message         = "
+        f"{state.get('message')!r}"
     )
+
+    print(
+        f"action          = "
+        f"{plan.get('action')!r}"
+    )
+
+    print(
+        f"arguments       = "
+        f"{plan.get('arguments')!r}"
+    )
+
+    print(
+        f"missing_fields  = "
+        f"{plan.get('missing_fields')!r}"
+    )
+
+    print(
+        f"confidence      = "
+        f"{plan.get('confidence')!r}"
+    )
+
+    print(
+        f"checkout_id     = "
+        f"{state.get('checkout_id')!r}"
+    )
+
+    print(
+        f"checkout_status = "
+        f"{state.get('checkout_status')!r}"
+    )
+
+    print(
+        f"order_created   = "
+        f"{state.get('order_created')!r}"
+    )
+
+    print(
+        f"order_id        = "
+        f"{state.get('order_id')!r}"
+    )
+
+    print(
+        f"cart_action     = "
+        f"{state.get('cart_action')!r}"
+    )
+
+    print(
+        f"cart_capability = "
+        f"{_cart_capability_from_state(state)!r}"
+    )
+
+    print("=" * 60)
+
+    return result

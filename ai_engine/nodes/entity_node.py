@@ -141,6 +141,18 @@ class EntityOutput(BaseModel):
         description="Supported payment method: upi or cod.",
     )
 
+    cart_action: Optional[Literal[
+        "add_item",
+        "remove_item",
+        "update_quantity",
+        "clear_cart",
+        "show_cart",
+        "checkout",
+    ]] = Field(
+        default=None,
+        description="Current cart operation when the intent is cart.",
+    )
+
 
 class LLMEntityOutput(BaseModel):
     """
@@ -155,19 +167,19 @@ class LLMEntityOutput(BaseModel):
         description="Product name mentioned or implied by the user.",
     )
 
-    quantity: Optional[str] = Field(
+    quantity: int | str | None = Field(
         default=None,
-        description="Quantity as understood from the user. Return digits as text; application code validates and converts it.",
+        description="Quantity supplied by the user. Accept an integer, numeric string, or null. Never invent a quantity.",
     )
 
-    order_id: Optional[str] = Field(
+    order_id: int | str | None = Field(
         default=None,
-        description="Order ID as understood from the user. Return digits as text; application code validates and converts it.",
+        description="Order ID supplied by the user. Accept an integer, numeric string, or null. Never invent an order ID.",
     )
 
-    address_id: Optional[str] = Field(
+    address_id: int | str | None = Field(
         default=None,
-        description="Saved address ID as understood from the user. Return digits as text; application code validates and converts it.",
+        description="Saved address ID supplied by the user. Accept an integer, numeric string, or null. Never invent an address ID.",
     )
 
     address_text: Optional[str] = Field(
@@ -180,6 +192,32 @@ class LLMEntityOutput(BaseModel):
         description="Payment method: upi or cod.",
     )
 
+
+    cart_action: Optional[Literal[
+        "add_item",
+        "remove_item",
+        "update_quantity",
+        "clear_cart",
+        "show_cart",
+        "checkout",
+    ]] = Field(
+        default=None,
+        description="Cart operation requested by the user, or null for non-cart messages.",
+    )
+
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate_to_json
+
+    from pydantic import model_validator
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_none_strings(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, str) and v.strip().lower() in ("none", "null", ""):
+                    data[k] = None
+        return data
 
 # =========================================================
 # Current-Turn Intent Decision
@@ -199,6 +237,7 @@ class IntentDecision(BaseModel):
         "order_tracking",
         "order_cancel",
         "customer_support",
+        "cart",
         "general",
     ] = Field(
         description=(
@@ -216,6 +255,19 @@ class IntentDecision(BaseModel):
             "user is starting a new order or continuing an "
             "existing checkout. Use none for non-order turns."
         )
+    )
+
+    cart_action: Literal[
+        "add_item",
+        "remove_item",
+        "update_quantity",
+        "clear_cart",
+        "show_cart",
+        "checkout",
+        "none",
+    ] = Field(
+        default="none",
+        description="Cart operation for the current message; use none for non-cart turns.",
     )
 
     confidence: float = Field(
@@ -247,6 +299,10 @@ Supported fields:
 - address_id
 - address_text
 - payment_method
+- cart_action
+
+For cart requests, cart_action must be one of: add_item, remove_item, update_quantity, clear_cart, show_cart, checkout.
+For non-cart requests, return null.
 
 product_id is NOT an LLM-extracted field. Never invent, infer,
 or change a product_id. It must come only from backend/database
@@ -629,6 +685,9 @@ def detect_quantity(
 
         # want 3
         r"\b(?:want|need|like)\s+(\d+)\b",
+
+        # order 3 maggi / buy 5 milk (number between verb and product)
+        r"\b(?:order|buy|get|purchase|add)\s+(\d+)\s+[a-zA-Z]",
     ]
 
     if allow_plain_number:
@@ -857,11 +916,21 @@ def detect_order_id(
     if not message:
         return None
 
+    # Require an explicit ID/number/no/# qualifier so that
+    # "I want to order 11 Maggi" is NOT misread as order_id=11.
     match = re.search(
-        r"\border\s*(?:id|number|no\.?)?\s*[:#]?\s*(\d+)\b",
+        r"\border\s+(?:id|number|no\.?)\s*[:#]?\s*(\d+)\b",
         message,
         flags=re.IGNORECASE,
     )
+
+    if not match:
+        # Also accept "order #123" (hash directly after order)
+        match = re.search(
+            r"\border\s*[#]\s*(\d+)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
 
     if not match:
         return None
@@ -1005,56 +1074,40 @@ def recover_order_id_from_history(
 # =========================================================
 # Checkout ID Recovery
 # =========================================================
-#
-# ADDED: these two helpers were being called by
-# _fallback_current_turn_intent() and entity_node() but were
-# never defined anywhere in this module, which caused:
-#
-#     NameError: name '_recover_checkout_id_from_history'
-#     is not defined
-#
-# at runtime whenever the deterministic/fallback checkout path
-# executed (e.g. during an LLM rate limit).
-# =========================================================
-
 
 def _recover_checkout_id_from_history(
     conversation_history: list[dict[str, Any]] | None,
 ) -> Optional[str]:
     """
-    Attempt to recover a checkout_id that was embedded in a
-    previous turn's metadata.
+    Recover checkout_id from previous conversation metadata.
 
-    This is a best-effort recovery path used only when
-    state["checkout_id"] itself is missing (e.g. a fresh HTTP
-    request that lost its session-level state). It looks for a
-    "checkout_id" key on each history item, or nested under a
-    "metadata" dict, walking from the most recent turn backward.
-
-    Returns None if nothing recoverable is found.
+    This is a best-effort fallback for HTTP turns where the graph state
+    no longer contains checkout_id. The latest history item wins.
     """
 
     if not conversation_history:
         return None
 
     for item in reversed(conversation_history):
-
         if not isinstance(item, dict):
             continue
 
         checkout_id = item.get("checkout_id")
 
         if checkout_id:
-            return str(checkout_id).strip()
+            value = str(checkout_id).strip()
+            if value:
+                return value
 
         metadata = item.get("metadata")
 
         if isinstance(metadata, dict):
-
             checkout_id = metadata.get("checkout_id")
 
             if checkout_id:
-                return str(checkout_id).strip()
+                value = str(checkout_id).strip()
+                if value:
+                    return value
 
     return None
 
@@ -1064,20 +1117,94 @@ def _ensure_checkout_id(
     conversation_history: list[dict[str, Any]] | None,
 ) -> str:
     """
-    Return the existing/recoverable checkout_id for the current
-    order-continuation turn, or mint a new one if none can be
-    found anywhere.
+    Return the current checkout_id if available/recoverable;
+    otherwise create a new checkout identifier.
     """
 
     checkout_id = (
         state.get("checkout_id")
-        or _recover_checkout_id_from_history(conversation_history)
+        or _recover_checkout_id_from_history(
+            conversation_history
+        )
     )
 
     if checkout_id:
         return str(checkout_id).strip()
 
     return str(uuid.uuid4())
+
+
+# =========================================================
+# Product Message Detection
+# =========================================================
+
+def detect_product_from_message(
+    message: str,
+) -> Optional[str]:
+    """
+    Conservative product-name detector used only to identify turns
+    that contain an explicit product/order reference.
+
+    It does not resolve a database product_id.
+    """
+
+    if not message:
+        return None
+
+    text = str(message).strip()
+
+    patterns = (
+        r"\bi\s+(?:want|need)\s+to\s+(?:order|buy|get|purchase)\s+(.+?)\s*$",
+        r"\bi(?:'d|\s+would)\s+like\s+to\s+(?:order|buy|get|purchase)\s+(.+?)\s*$",
+        r"\b(?:order|buy|purchase|get)\s+(.+?)\s*$",
+    )
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        candidate = (
+            match.group(1)
+            .strip()
+            .rstrip(".!?,")
+        )
+
+        if not candidate:
+            continue
+
+        # Strip leading quantity prefix: "11 Maggi" → "Maggi"
+        candidate = re.sub(
+            r"^\d+\s+",
+            "",
+            candidate,
+        ).strip()
+
+        if not candidate:
+            continue
+
+        # Do not mistake a quantity/payment/address continuation
+        # for a product request.
+        if detect_quantity(candidate) is not None:
+            continue
+
+        if detect_payment_method(candidate) is not None:
+            continue
+
+        if detect_address_id(candidate) is not None:
+            continue
+
+        if detect_address_text(candidate) is not None:
+            continue
+
+        return candidate
+
+    return None
 
 
 # =========================================================
@@ -1161,63 +1288,6 @@ def detect_product_fallback(
                 continue
 
             return candidate
-
-    return None
-
-
-# =========================================================
-# Explicit Product Statement Detection (current message)
-# =========================================================
-#
-# ADDED: entity_node()'s deterministic_turn check calls
-# detect_product_from_message(message), which was also never
-# defined. Unlike detect_product_fallback() above (which looks
-# back through history for continuation turns), this checks only
-# the CURRENT message for an explicit "order/buy/get X" statement.
-# =========================================================
-
-
-def detect_product_from_message(
-    message: str,
-) -> Optional[str]:
-    """
-    Detect an explicit product order statement in the CURRENT
-    message only (no history lookback).
-
-    Examples:
-        "I want to order Amul milk" -> "Amul milk"
-        "Buy bread"                 -> "bread"
-    """
-
-    if not message:
-        return None
-
-    patterns = (
-        r"\bi\s+(?:want|need)\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
-        r"\bi\s+(?:want|need)\s+(?:to\s+)?(?:order|buy|get)\s+(.+?)\s*$",
-        r"\bi(?:'d|\s+would)\s+like\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
-        r"\b(?:order|buy|get|purchase)\s+(.+?)\s*$",
-    )
-
-    for pattern in patterns:
-
-        match = re.search(pattern, message, flags=re.IGNORECASE)
-
-        if not match:
-            continue
-
-        candidate = match.group(1).strip().rstrip(".!?,")
-
-        if not candidate:
-            continue
-
-        if detect_quantity(candidate) is not None:
-            continue
-
-        if detect_payment_method(candidate) is not None:
-            continue
-
-        return candidate
 
     return None
 
@@ -1372,10 +1442,27 @@ def _fallback_current_turn_intent(
     if continuation and (checkout_id or entities.get("product_name")) and not completed:
         return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
 
+    # When an active checkout is collecting and the user sends a short
+    # reply (e.g. a product name like "Maggi"), treat it as a checkout
+    # continuation even if product_name is not yet populated (since
+    # that is exactly what is being collected).
+    active_checkout = (
+        checkout_id
+        and not completed
+        and str(state.get("checkout_status") or "").casefold()
+        in {"collecting", "ready", ""}
+    )
+
+    if text and active_checkout and len(text.split()) <= 5:
+        return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
+
     if text and not completed and entities.get("product_name") and state.get("checkout_status") in {"collecting", "ready", None}:
         # A short continuation/reference can still belong to checkout.
         if len(text.split()) <= 5:
             return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
+
+    if detect_product_from_message(text):
+        return IntentDecision(intent="cart", order_action="none", confidence=0.0)
 
     return IntentDecision(intent="general", order_action="none", confidence=0.0)
 
@@ -1487,14 +1574,11 @@ Classify the current message independently.
             f" {type(exc).__name__}: {exc}"
         )
 
-    # Fail closed.
-    #
-    # A failed intent decision must NEVER create an order from
-    # stale entities. General is the safest fallback.
-    return IntentDecision(
-        intent="general",
-        order_action="none",
-        confidence=0.0,
+    # Fail closed to deterministic fallback
+    # instead of strictly returning general.
+    return _fallback_current_turn_intent(
+        state=state,
+        message=message,
     )
 
 
@@ -1505,14 +1589,27 @@ Classify the current message independently.
 def _is_new_order_request(
     message: str,
 ) -> bool:
-    """
-    Deprecated compatibility helper.
+    """Detect an explicit request to start a new order.
 
-    Natural-language new-order detection is now performed by the
-    AI intent classifier. This function intentionally does not make
-    a language-specific decision.
+    This fallback is intentionally separate from cart handling.
+    It does not resolve products or execute backend operations.
     """
-    return False
+    text = (message or "").strip()
+    if not text:
+        return False
+
+    patterns = (
+        r"^\s*i\s+(?:want|need)\s+to\s+order\b",
+        r"^\s*i(?:'d|\s+would)\s+like\s+to\s+order\b",
+        r"^\s*i\s+(?:want|need)\s+to\s+(?:buy|get|purchase)\b",
+        r"^\s*i(?:'d|\s+would)\s+like\s+to\s+(?:buy|get|purchase)\b",
+        r"^\s*(?:order|purchase)\b",
+        r"^\s*(?:buy|get)\s+\d+\b",
+        r"^\s*(?:please\s+)?place\s+(?:an?\s+)?order\b",
+        r"^\s*i(?:'d|\s+would)\s+like\s+(?:an?\s+)?order\b",
+    )
+
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _is_explicit_tracking_request(
@@ -1723,6 +1820,22 @@ def get_missing_fields(
             )
 
     # =====================================================
+    # Cart
+    # =====================================================
+
+    elif intent == "cart":
+        action = entities.cart_action
+        if action in {"add_item", "remove_item", "update_quantity"}:
+            if entities.product_id is None and not entities.product_name:
+                missing.append("product_reference")
+            elif action in {"add_item", "update_quantity"} and (
+                entities.quantity is None or entities.quantity <= 0
+            ):
+                missing.append("quantity")
+        elif action is None:
+            missing.append("cart_action")
+
+    # =====================================================
     # Tracking
     # =====================================================
 
@@ -1910,14 +2023,28 @@ def entity_node(
     # become the intent of the next user message.
     # =====================================================
 
-    intent_decision = resolve_current_turn_intent(
-        state=state,
-        message=message,
-    )
-
-    resolved_current_intent = (
-        intent_decision.intent
-    )
+    # intent_node already classified the CURRENT turn. Trust it for
+    # cart and all non-order turns. Re-running a second classifier here
+    # was the source of the cart Literal validation failure.
+    if str(original_intent or "general").strip().lower() != "order_create":
+        resolved_current_intent = str(original_intent or "general").strip().lower()
+        if resolved_current_intent not in {
+            "product_search", "order_tracking", "order_cancel",
+            "customer_support", "cart", "general",
+        }:
+            resolved_current_intent = "general"
+        intent_decision = IntentDecision(
+            intent=resolved_current_intent,
+            order_action="none",
+            cart_action="none",
+            confidence=1.0,
+        )
+    else:
+        intent_decision = resolve_current_turn_intent(
+            state=state,
+            message=message,
+        )
+        resolved_current_intent = intent_decision.intent
 
     new_order = (
         resolved_current_intent
@@ -2099,6 +2226,14 @@ def entity_node(
     explicit_payment = detect_payment_method(
         message
     )
+
+    # Direct order product extraction. Cart logic is untouched.
+    explicit_order_product = None
+    if resolved_current_intent == "order_create":
+        explicit_order_product = detect_product_from_message(message)
+
+    if explicit_order_product:
+        entities["product_name"] = explicit_order_product
 
     # =====================================================
     # Quantity
@@ -2631,6 +2766,9 @@ def entity_node(
         ),
         payment_method=entities.get(
             "payment_method"
+        ),
+        cart_action=entities.get(
+            "cart_action"
         ),
     )
 

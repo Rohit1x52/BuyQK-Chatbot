@@ -1453,6 +1453,12 @@ def _tool_fallback(
                 f"Payment: {payment_method}."
             )
 
+        if order_id is not None:
+
+            parts.append(
+                "Would you like me to track your order?"
+            )
+
         return " ".join(
             parts
         )

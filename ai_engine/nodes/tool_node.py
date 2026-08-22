@@ -19,6 +19,8 @@
 #   - Track orders
 #   - Cancel orders
 #   - Create support tickets
+#   - Execute CartService operations
+#   - Prepare / validate Cart checkout
 #   - Return structured tool_result
 #
 # IMPORTANT:
@@ -72,6 +74,24 @@ from backend.services.support_service import (
 
 from backend.services.address_service import (
     get_user_addresses,
+)
+
+from backend.services.cart_service import (
+    add_item as cart_add_item,
+    remove_item as cart_remove_item,
+    remove_product as cart_remove_product,
+    update_quantity as cart_update_quantity,
+    update_item_quantity as cart_update_item_quantity,
+    clear_cart as cart_clear_cart,
+    get_cart as cart_get_cart,
+    calculate_cart as cart_calculate_cart,
+    commit_cart,
+    CartServiceError,
+    ProductNotFoundError,
+    ProductUnavailableError,
+    InsufficientStockError,
+    CartItemNotFoundError,
+    InvalidQuantityError,
 )
 
 
@@ -1207,6 +1227,584 @@ def _serialize_bill(
 
 
 # =========================================================
+# Cart Helpers
+# =========================================================
+
+
+def _resolve_cart_product(
+    db: Session,
+    entities: dict[str, Any],
+) -> tuple[int | None, str | None, list[Any]]:
+    """
+    Resolve the product required by a Cart operation.
+
+    Priority:
+        1. A backend-resolved product_id already present in entities.
+        2. A natural-language product_name resolved against Product.
+
+    The CartService remains authoritative for availability and stock.
+    This helper only resolves the product identity required by the
+    CartService API.
+    """
+
+    product_id = entities.get("product_id")
+
+    # -----------------------------------------------------
+    # Existing authoritative product ID
+    # -----------------------------------------------------
+
+    if product_id is not None:
+        try:
+            normalized_id = int(product_id)
+        except (TypeError, ValueError):
+            return None, "Invalid product ID.", []
+
+        if normalized_id <= 0:
+            return None, "Invalid product ID.", []
+
+        product = (
+            db.query(Product)
+            .filter(Product.id == normalized_id)
+            .first()
+        )
+
+        if product is None:
+            return (
+                None,
+                f"Product {normalized_id} does not exist.",
+                [],
+            )
+
+        return (
+            normalized_id,
+            _product_name(product),
+            [],
+        )
+
+    # -----------------------------------------------------
+    # Natural-language product name
+    # -----------------------------------------------------
+
+    product_name = entities.get("product_name")
+
+    if not _has_value(product_name):
+        return (
+            None,
+            "Please tell me which product you want to modify.",
+            [],
+        )
+
+    product, candidates = _resolve_product(
+        db=db,
+        product_name=str(product_name).strip(),
+    )
+
+    if product is None:
+        if candidates:
+            return (
+                None,
+                (
+                    f"I found multiple products matching "
+                    f"'{product_name}'. Please choose one."
+                ),
+                candidates,
+            )
+
+        return (
+            None,
+            f"No product found for '{product_name}'.",
+            [],
+        )
+
+    resolved_product_id = _product_id(product)
+
+    try:
+        resolved_product_id = int(resolved_product_id)
+    except (TypeError, ValueError):
+        return (
+            None,
+            "The selected product has an invalid product ID.",
+            [],
+        )
+
+    if resolved_product_id <= 0:
+        return (
+            None,
+            "The selected product has an invalid product ID.",
+            [],
+        )
+
+    return (
+        resolved_product_id,
+        _product_name(product),
+        [],
+    )
+
+
+def _cart_state_from_result(
+    cart: Any,
+    *,
+    checkout_ready: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Convert the authoritative CartService response into the GraphState
+    fields consumed by Planner/Response/frontend integration.
+
+    No cart calculations are performed here.
+    """
+
+    if not isinstance(cart, dict):
+        return {}
+
+    summary = cart.get("summary")
+    items = cart.get("items")
+
+    result: dict[str, Any] = {
+        "cart_id": cart.get("cart_id"),
+        "cart_status": cart.get("status"),
+        "cart_items": items if isinstance(items, list) else [],
+        "cart_summary": summary,
+    }
+
+    if checkout_ready is not None:
+        result["cart_checkout_ready"] = checkout_ready
+
+    return result
+
+
+def _cart_tool_error(
+    *,
+    action: str,
+    error: str,
+    candidates: list[Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a consistent Cart tool error response.
+    """
+
+    result: dict[str, Any] = {
+        "success": False,
+        "type": action,
+        "error": error,
+    }
+
+    if candidates:
+        result["products"] = [
+            _serialize_product(candidate)
+            for candidate in candidates
+        ]
+
+    return result
+
+
+def _execute_cart_mutation(
+    db: Session,
+    user_id: int,
+    tool_name: str,
+    entities: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Execute one Cart mutation through CartService.
+
+    IMPORTANT:
+        No Cart business rules are implemented here.
+        Product identity is resolved here because CartService accepts
+        product_id, while the AI may provide product_name.
+
+    Returns:
+        (tool_result, GraphState updates)
+    """
+
+    # -----------------------------------------------------
+    # Validate user
+    # -----------------------------------------------------
+
+    if user_id is None:
+        return (
+            _cart_tool_error(
+                action=tool_name,
+                error="User ID is required.",
+            ),
+            {},
+        )
+
+    try:
+        normalized_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return (
+            _cart_tool_error(
+                action=tool_name,
+                error="Invalid user ID.",
+            ),
+            {},
+        )
+
+    if normalized_user_id <= 0:
+        return (
+            _cart_tool_error(
+                action=tool_name,
+                error="Invalid user ID.",
+            ),
+            {},
+        )
+
+    # -----------------------------------------------------
+    # Resolve product for product-based operations
+    # -----------------------------------------------------
+
+    if tool_name in {
+        "add_to_cart",
+        "remove_from_cart",
+        "update_cart_item",
+    }:
+        (
+            product_id,
+            resolved_product_name,
+            candidates,
+        ) = _resolve_cart_product(
+            db=db,
+            entities=entities,
+        )
+
+        if product_id is None:
+            return (
+                _cart_tool_error(
+                    action=tool_name,
+                    error=(
+                        "Unable to resolve the requested product."
+                    )
+                    if not candidates
+                    else (
+                        f"I found multiple products matching "
+                        f"'{entities.get('product_name')}'. "
+                        "Please choose one."
+                    ),
+                    candidates=candidates,
+                ),
+                {},
+            )
+
+    else:
+        product_id = None
+        resolved_product_name = None
+
+    # -----------------------------------------------------
+    # ADD
+    # -----------------------------------------------------
+
+    if tool_name == "add_to_cart":
+
+        quantity = _normalize_quantity(
+            entities.get("quantity")
+        )
+
+        if quantity is None:
+            return (
+                _cart_tool_error(
+                    action="add_to_cart",
+                    error="Quantity must be a positive number.",
+                ),
+                {},
+            )
+
+        try:
+            cart = cart_add_item(
+                db=db,
+                user_id=normalized_user_id,
+                product_id=product_id,
+                quantity=quantity,
+            )
+
+            # CartService intentionally leaves transaction ownership
+            # to its caller. Commit only after the service succeeds.
+            commit_cart(db)
+
+        except (
+            ProductNotFoundError,
+            ProductUnavailableError,
+            InsufficientStockError,
+            InvalidQuantityError,
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return (
+                _cart_tool_error(
+                    action="add_to_cart",
+                    error=str(exc),
+                ),
+                {},
+            )
+        except Exception as exc:
+            print(
+                "[TOOL add_to_cart ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return (
+                _cart_tool_error(
+                    action="add_to_cart",
+                    error=(
+                        "I could not add the product to your cart "
+                        "because of a backend error."
+                    ),
+                ),
+                {},
+            )
+
+        updates = _cart_state_from_result(
+            cart,
+            checkout_ready=bool(cart.get("items")),
+        )
+
+        updates["entities"] = {
+            **entities,
+            "cart_action": None,
+        }
+        
+        # Clear the added product so next cart action starts fresh
+        updates["entities"].pop("product_id", None)
+        updates["entities"].pop("product_name", None)
+        updates["entities"].pop("quantity", None)
+
+        return (
+            {
+                "success": True,
+                "type": "cart_add",
+                "action": "add_to_cart",
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": cart.get("items", []),
+                "summary": cart.get("summary"),
+            },
+            updates,
+        )
+
+    # -----------------------------------------------------
+    # REMOVE BY PRODUCT
+    # -----------------------------------------------------
+
+    if tool_name == "remove_from_cart":
+
+        try:
+            cart = cart_remove_product(
+                db=db,
+                user_id=normalized_user_id,
+                product_id=product_id,
+            )
+            commit_cart(db)
+
+        except (
+            CartItemNotFoundError,
+            ProductNotFoundError,
+            ProductUnavailableError,
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return (
+                _cart_tool_error(
+                    action="remove_from_cart",
+                    error=str(exc),
+                ),
+                {},
+            )
+        except Exception as exc:
+            print(
+                "[TOOL remove_from_cart ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return (
+                _cart_tool_error(
+                    action="remove_from_cart",
+                    error=(
+                        "I could not remove the product from your "
+                        "cart because of a backend error."
+                    ),
+                ),
+                {},
+            )
+
+        updates = _cart_state_from_result(
+            cart,
+            checkout_ready=bool(cart.get("items")),
+        )
+
+        updates["entities"] = {
+            **entities,
+            "cart_action": None,
+        }
+        updates["entities"].pop("product_id", None)
+        updates["entities"].pop("product_name", None)
+
+        return (
+            {
+                "success": True,
+                "type": "cart_remove",
+                "action": "remove_from_cart",
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": cart.get("items", []),
+                "summary": cart.get("summary"),
+            },
+            updates,
+        )
+
+    # -----------------------------------------------------
+    # UPDATE QUANTITY BY PRODUCT
+    # -----------------------------------------------------
+
+    if tool_name == "update_cart_item":
+
+        quantity = _normalize_quantity(
+            entities.get("quantity")
+        )
+
+        if quantity is None:
+            return (
+                _cart_tool_error(
+                    action="update_cart_item",
+                    error="Quantity must be a positive number.",
+                ),
+                {},
+            )
+
+        try:
+            cart = cart_update_item_quantity(
+                db=db,
+                user_id=normalized_user_id,
+                product_id=product_id,
+                quantity=quantity,
+            )
+            commit_cart(db)
+
+        except (
+            CartItemNotFoundError,
+            ProductNotFoundError,
+            ProductUnavailableError,
+            InsufficientStockError,
+            InvalidQuantityError,
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return (
+                _cart_tool_error(
+                    action="update_cart_item",
+                    error=str(exc),
+                ),
+                {},
+            )
+        except Exception as exc:
+            print(
+                "[TOOL update_cart_item ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return (
+                _cart_tool_error(
+                    action="update_cart_item",
+                    error=(
+                        "I could not update the cart item because "
+                        "of a backend error."
+                    ),
+                ),
+                {},
+            )
+
+        updates = _cart_state_from_result(
+            cart,
+            checkout_ready=bool(cart.get("items")),
+        )
+
+        updates["entities"] = {
+            **entities,
+            "cart_action": None,
+        }
+        updates["entities"].pop("product_id", None)
+        updates["entities"].pop("product_name", None)
+        updates["entities"].pop("quantity", None)
+
+        return (
+            {
+                "success": True,
+                "type": "cart_update",
+                "action": "update_cart_item",
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": cart.get("items", []),
+                "summary": cart.get("summary"),
+            },
+            updates,
+        )
+
+    # -----------------------------------------------------
+    # CLEAR
+    # -----------------------------------------------------
+
+    if tool_name == "clear_cart":
+
+        try:
+            cart = cart_clear_cart(
+                db=db,
+                user_id=normalized_user_id,
+            )
+            commit_cart(db)
+
+        except (
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return (
+                _cart_tool_error(
+                    action="clear_cart",
+                    error=str(exc),
+                ),
+                {},
+            )
+        except Exception as exc:
+            print(
+                "[TOOL clear_cart ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return (
+                _cart_tool_error(
+                    action="clear_cart",
+                    error=(
+                        "I could not clear your cart because "
+                        "of a backend error."
+                    ),
+                ),
+                {},
+            )
+
+        updates = _cart_state_from_result(
+            cart,
+            checkout_ready=False,
+        )
+
+        return (
+            {
+                "success": True,
+                "type": "cart_clear",
+                "action": "clear_cart",
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": cart.get("items", []),
+                "summary": cart.get("summary"),
+            },
+            updates,
+        )
+
+    return (
+        _cart_tool_error(
+            action=tool_name,
+            error=f"Unsupported Cart mutation: {tool_name}.",
+        ),
+        {},
+    )
+
+
+# =========================================================
 # Tool Node
 # =========================================================
 
@@ -1462,6 +2060,240 @@ def tool_node(
                     ),
                 }
             }
+
+    # =====================================================
+    # CART: ADD / REMOVE / UPDATE / CLEAR
+    # =====================================================
+
+    if tool_name in {
+        "add_to_cart",
+        "remove_from_cart",
+        "update_cart_item",
+        "clear_cart",
+    }:
+
+        cart_result, cart_updates = _execute_cart_mutation(
+            db=db,
+            user_id=user_id,
+            tool_name=tool_name,
+            entities=updated_entities,
+        )
+
+        result: GraphState = {
+            "tool_result": cart_result,
+        }
+
+        result.update(cart_updates)
+
+        return result
+
+    # =====================================================
+    # CART: SHOW
+    # =====================================================
+
+    if tool_name == "show_cart":
+
+        if user_id is None:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_view",
+                    "error": "User ID is required.",
+                },
+            }
+
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_view",
+                    "error": "Invalid user ID.",
+                },
+            }
+
+        if normalized_user_id <= 0:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_view",
+                    "error": "Invalid user ID.",
+                },
+            }
+
+        try:
+            cart = cart_get_cart(
+                db=db,
+                user_id=normalized_user_id,
+            )
+        except (
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_view",
+                    "error": str(exc),
+                },
+            }
+        except Exception as exc:
+            print(
+                "[TOOL show_cart ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_view",
+                    "error": (
+                        "I could not load your cart because "
+                        "of a backend error."
+                    ),
+                },
+            }
+
+        has_items = bool(cart.get("items"))
+
+        return {
+            "tool_result": {
+                "success": True,
+                "type": "cart_view",
+                "action": "show_cart",
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": cart.get("items", []),
+                "summary": cart.get("summary"),
+            },
+            **_cart_state_from_result(
+                cart,
+                checkout_ready=has_items,
+            ),
+        }
+
+    # =====================================================
+    # CART: CHECKOUT PREPARATION / VALIDATION
+    # =====================================================
+
+    if tool_name == "checkout_cart":
+
+        if user_id is None:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "error": "User ID is required.",
+                },
+            }
+
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "error": "Invalid user ID.",
+                },
+            }
+
+        if normalized_user_id <= 0:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "error": "Invalid user ID.",
+                },
+            }
+
+        try:
+            cart = cart_get_cart(
+                db=db,
+                user_id=normalized_user_id,
+            )
+        except (
+            CartServiceError,
+            ValueError,
+        ) as exc:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "error": str(exc),
+                },
+            }
+        except Exception as exc:
+            print(
+                "[TOOL checkout_cart ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "error": (
+                        "I could not prepare your cart for checkout "
+                        "because of a backend error."
+                    ),
+                },
+            }
+
+        items = cart.get("items", [])
+        has_items = bool(items)
+
+        # CartService has already calculated the authoritative
+        # summary. This node does not calculate totals.
+        if not has_items:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "cart_checkout",
+                    "action": "checkout_cart",
+                    "checkout_ready": False,
+                    "error": "Your cart is empty.",
+                    "cart": cart,
+                    "cart_id": cart.get("cart_id"),
+                    "items": [],
+                    "summary": cart.get("summary"),
+                },
+                **_cart_state_from_result(
+                    cart,
+                    checkout_ready=False,
+                ),
+            }
+
+        # IMPORTANT:
+        # checkout_cart prepares/validates the cart only.
+        #
+        # It does NOT:
+        #   - create an order
+        #   - create a payment
+        #   - reserve stock
+        #   - calculate a new bill
+        #
+        # Address and payment selection remain part of the
+        # existing checkout flow and are validated by the
+        # authoritative order path before order creation.
+        return {
+            "tool_result": {
+                "success": True,
+                "type": "cart_checkout",
+                "action": "checkout_cart",
+                "checkout_ready": True,
+                "cart": cart,
+                "cart_id": cart.get("cart_id"),
+                "items": items,
+                "summary": cart.get("summary"),
+                "next_step": "address_selection",
+            },
+            **_cart_state_from_result(
+                cart,
+                checkout_ready=True,
+            ),
+        }
 
     # =====================================================
     # CREATE ORDER

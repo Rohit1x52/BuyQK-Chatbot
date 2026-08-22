@@ -6,7 +6,7 @@
 # Validate the AI Planner's proposed action before allowing
 # the Tool Node to execute anything.
 #
-# Phase 2 architecture:
+# Architecture:
 #
 #   Context
 #      ↓
@@ -17,6 +17,8 @@
 #   Policy / Validator
 #      ↓
 #   Tool
+#      ↓
+#   Backend Service
 #
 # IMPORTANT:
 #
@@ -44,10 +46,6 @@
 #
 # Those responsibilities belong to backend services.
 #
-# The Policy Node protects backend tools from invalid AI
-# proposals and prevents completed transactions from being
-# executed again.
-#
 # =========================================================
 
 
@@ -63,11 +61,36 @@ from ai_engine.graph.state import GraphState
 # =========================================================
 
 SUPPORTED_TOOLS = {
+    # -----------------------------------------------------
+    # Product
+    # -----------------------------------------------------
     "search_products",
+
+    # -----------------------------------------------------
+    # Cart
+    # -----------------------------------------------------
+    "add_to_cart",
+    "remove_from_cart",
+    "update_cart_item",
+    "clear_cart",
+    "show_cart",
+    "checkout_cart",
+
+    # -----------------------------------------------------
+    # Order
+    # -----------------------------------------------------
     "create_order",
     "track_order",
     "cancel_order",
+
+    # -----------------------------------------------------
+    # Support
+    # -----------------------------------------------------
     "create_support_ticket",
+
+    # -----------------------------------------------------
+    # Address
+    # -----------------------------------------------------
     "list_saved_addresses",
 }
 
@@ -87,6 +110,34 @@ NON_TOOL_ACTIONS = {
 
 
 # =========================================================
+# Cart Actions
+# =========================================================
+
+CART_ACTIONS = {
+    "ADD_CART_ITEM",
+    "REMOVE_CART_ITEM",
+    "UPDATE_CART_ITEM",
+    "CLEAR_CART",
+    "SHOW_CART",
+    "CHECKOUT_CART",
+}
+
+
+# =========================================================
+# Cart Tool Mapping
+# =========================================================
+
+CART_TOOL_MAPPING = {
+    "ADD_CART_ITEM": "add_to_cart",
+    "REMOVE_CART_ITEM": "remove_from_cart",
+    "UPDATE_CART_ITEM": "update_cart_item",
+    "CLEAR_CART": "clear_cart",
+    "SHOW_CART": "show_cart",
+    "CHECKOUT_CART": "checkout_cart",
+}
+
+
+# =========================================================
 # Utility
 # =========================================================
 
@@ -97,7 +148,10 @@ def _has_value(
     Determine whether a value is meaningfully present.
 
     Empty strings and None are considered absent.
-    Numeric zero remains a valid value.
+
+    Numeric zero remains a valid value for generic state
+    checks, although quantity validation separately rejects
+    zero.
     """
 
     if value is None:
@@ -114,8 +168,25 @@ def _has_value(
     return True
 
 
-def _failure(reason: str, *, action: str | None = None, tool: str | None = None, retryable: bool = False) -> GraphState:
-    result = {"allowed": False, "action": action, "tool": tool, "reason": reason, "retryable": retryable}
+def _failure(
+    reason: str,
+    *,
+    action: str | None = None,
+    tool: str | None = None,
+    retryable: bool = False,
+) -> GraphState:
+    """
+    Build a consistent Policy rejection result.
+    """
+
+    result = {
+        "allowed": False,
+        "action": action,
+        "tool": tool,
+        "reason": reason,
+        "retryable": retryable,
+    }
+
     return {
         "policy_result": result,
         "policy_error": result,
@@ -129,8 +200,20 @@ def _failure(reason: str, *, action: str | None = None, tool: str | None = None,
     }
 
 
-def _success(action: str, tool: str | None) -> GraphState:
-    result = {"allowed": True, "action": action, "tool": tool}
+def _success(
+    action: str,
+    tool: str | None,
+) -> GraphState:
+    """
+    Build a consistent Policy approval result.
+    """
+
+    result = {
+        "allowed": True,
+        "action": action,
+        "tool": tool,
+    }
+
     return {
         "policy_result": result,
         "policy_error": None,
@@ -145,6 +228,289 @@ def _success(action: str, tool: str | None) -> GraphState:
 
 
 # =========================================================
+# Planned Arguments
+# =========================================================
+
+def _get_planned_arguments(
+    state: GraphState,
+) -> dict[str, Any]:
+    """
+    Safely retrieve Planner arguments.
+
+    The current planner_node stores arguments in:
+
+        planner_args
+
+    The canonical GraphState compatibility field is:
+
+        planned_arguments
+
+    The legacy flat field is:
+
+        arguments
+    """
+
+    planned_arguments = state.get(
+        "planned_arguments"
+    )
+
+    if isinstance(
+        planned_arguments,
+        dict,
+    ):
+        return planned_arguments
+
+    planner_args = state.get(
+        "planner_args"
+    )
+
+    if isinstance(
+        planner_args,
+        dict,
+    ):
+        return planner_args
+
+    arguments = state.get(
+        "arguments"
+    )
+
+    if isinstance(
+        arguments,
+        dict,
+    ):
+        return arguments
+
+    return {}
+
+
+# =========================================================
+# Argument Value Resolver
+# =========================================================
+
+def _get_argument(
+    state: GraphState,
+    *keys: str,
+) -> Any:
+    """
+    Retrieve a value from Planner arguments first and then
+    from GraphState.
+
+    This allows the Policy node to work with both:
+
+        planned_arguments
+        state fields
+
+    without allowing the LLM to bypass the state contract.
+    """
+
+    arguments = _get_planned_arguments(
+        state
+    )
+
+    for key in keys:
+        if key in arguments:
+            value = arguments.get(key)
+
+            if _has_value(value):
+                return value
+
+    for key in keys:
+        value = state.get(key)
+
+        if _has_value(value):
+            return value
+
+    return None
+
+
+# =========================================================
+# Product Reference Validation
+# =========================================================
+
+def _get_product_reference(
+    state: GraphState,
+) -> Any:
+    """
+    Retrieve the product reference supplied by the Planner.
+
+    Preferred representation:
+
+        product_name
+
+    A product_id may already exist in authoritative GraphState
+    after backend resolution, so it is accepted as a fallback.
+
+    The Policy node does NOT resolve product names and does NOT
+    verify that the product exists.
+    """
+
+    return _get_argument(
+        state,
+        "product_name",
+        "product",
+        "product_reference",
+        "product_id",
+    )
+
+
+def _validate_product_reference(
+    state: GraphState,
+    action: str,
+    tool: str,
+) -> GraphState | None:
+    """
+    Validate that a Cart operation targeting a specific product
+    has a product reference.
+
+    Returns:
+        None when valid.
+        GraphState rejection when invalid.
+    """
+
+    product_reference = _get_product_reference(
+        state
+    )
+
+    if not _has_value(
+        product_reference
+    ):
+        return _failure(
+            "missing_product_reference",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    return None
+
+
+# =========================================================
+# Quantity Validation
+# =========================================================
+
+def _get_quantity(
+    state: GraphState,
+) -> Any:
+    """
+    Retrieve the requested quantity from Planner arguments
+    or GraphState.
+    """
+
+    return _get_argument(
+        state,
+        "quantity",
+    )
+
+
+def _validate_positive_quantity(
+    state: GraphState,
+    action: str,
+    tool: str,
+) -> GraphState | None:
+    """
+    Validate that a Cart quantity is a positive integer.
+
+    Business constraints such as maximum stock remain the
+    responsibility of Cart Service/backend.
+    """
+
+    quantity = _get_quantity(
+        state
+    )
+
+    if quantity is None:
+        return _failure(
+            "missing_quantity",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    # bool is technically an int in Python.
+    # It must not be accepted as a quantity.
+    if isinstance(
+        quantity,
+        bool,
+    ):
+        return _failure(
+            "invalid_quantity",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    if not isinstance(
+        quantity,
+        int,
+    ):
+        return _failure(
+            "invalid_quantity",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    if quantity <= 0:
+        return _failure(
+            "invalid_quantity",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    return None
+
+
+# =========================================================
+# Cart State Helpers
+# =========================================================
+
+def _get_cart_items(
+    state: GraphState,
+) -> list[Any]:
+    """
+    Safely retrieve the current cart items from GraphState.
+
+    An unavailable cart snapshot is represented as an empty
+    list for Policy purposes.
+
+    The Policy node does not query the database itself.
+    """
+
+    cart_items = state.get(
+        "cart_items",
+        [],
+    )
+
+    if isinstance(
+        cart_items,
+        list,
+    ):
+        return cart_items
+
+    return []
+
+
+def _cart_has_items(
+    state: GraphState,
+) -> bool:
+    """
+    Determine whether the current state contains at least one
+    cart item.
+
+    This is a state-level readiness check only.
+
+    The backend remains authoritative.
+    """
+
+    cart_items = _get_cart_items(
+        state
+    )
+
+    return len(cart_items) > 0
+
+
+# =========================================================
 # Completed Transaction Guard
 # =========================================================
 
@@ -155,21 +521,7 @@ def _transaction_already_completed(
     Determine whether this checkout already resulted in a
     successfully created order.
 
-    This is the critical Phase 1 → Phase 2 duplicate-order
-    protection.
-
-    Example:
-
-        Order created
-            ↓
-        user: "Thank you"
-            ↓
-        planner proposes ANSWER
-            ↓
-        allowed
-
-    Even if the planner incorrectly proposes CREATE_ORDER,
-    the policy layer prevents another transaction.
+    This protects against duplicate order creation.
     """
 
     order_created = bool(
@@ -194,15 +546,26 @@ def _transaction_already_completed(
         "order_id"
     )
 
-    # The authoritative order_created flag is sufficient.
+    # -----------------------------------------------------
+    # Authoritative order_created flag
+    # -----------------------------------------------------
+
     if order_created:
         return True
 
-    # A persisted order ID means an order already exists.
-    if _has_value(order_id):
+    # -----------------------------------------------------
+    # Persisted order ID
+    # -----------------------------------------------------
+
+    if _has_value(
+        order_id
+    ):
         return True
 
-    # A terminal completed checkout should not be recreated.
+    # -----------------------------------------------------
+    # Terminal checkout status
+    # -----------------------------------------------------
+
     if (
         isinstance(
             checkout_status,
@@ -217,6 +580,10 @@ def _transaction_already_completed(
         }
     ):
         return True
+
+    # -----------------------------------------------------
+    # Explicit checkout completion
+    # -----------------------------------------------------
 
     if checkout_completed:
         return True
@@ -248,17 +615,19 @@ def _checkout_has_required_state(
     missing: list[str] = []
 
     if not (
-        _has_value(state.get("product_id"))
-        or _has_value(state.get("product_name"))
+        _has_value(
+            state.get("product_id")
+        )
+        or _has_value(
+            state.get("product_name")
+        )
     ):
         missing.append(
             "product_name"
         )
 
     if not _has_value(
-        state.get(
-            "quantity"
-        )
+        state.get("quantity")
     ):
         missing.append(
             "quantity"
@@ -273,7 +642,9 @@ def _checkout_has_required_state(
     )
 
     if not (
-        _has_value(address_id)
+        _has_value(
+            address_id
+        )
         or _has_value(
             selected_address_id
         )
@@ -363,6 +734,217 @@ def _validate_tool(
 
 
 # =========================================================
+# Validate Cart Action
+# =========================================================
+
+def _validate_cart_action(
+    state: GraphState,
+    action: str,
+    tool: str | None,
+) -> GraphState:
+    """
+    Validate a Cart action proposed by the Planner.
+
+    This function validates ONLY what can safely be checked
+    at the Policy layer.
+
+    It does NOT:
+        - query Product
+        - query stock
+        - calculate price
+        - calculate totals
+        - modify Cart
+        - create an order
+
+    Those operations belong to Cart Service/backend.
+    """
+
+    # -----------------------------------------------------
+    # Action → canonical tool mapping
+    # -----------------------------------------------------
+
+    expected_tool = CART_TOOL_MAPPING.get(
+        action
+    )
+
+    if expected_tool is None:
+        return _failure(
+            "invalid_cart_action",
+            action=action,
+            tool=tool,
+            retryable=False,
+        )
+
+    if tool != expected_tool:
+        return _failure(
+            "cart_action_tool_mismatch",
+            action=action,
+            tool=tool,
+            retryable=False,
+        )
+
+    # -----------------------------------------------------
+    # ADD_CART_ITEM
+    # -----------------------------------------------------
+
+    if action == "ADD_CART_ITEM":
+
+        product_error = _validate_product_reference(
+            state,
+            action,
+            tool,
+        )
+
+        if product_error is not None:
+            return product_error
+
+        quantity_error = _validate_positive_quantity(
+            state,
+            action,
+            tool,
+        )
+
+        if quantity_error is not None:
+            return quantity_error
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # REMOVE_CART_ITEM
+    # -----------------------------------------------------
+
+    if action == "REMOVE_CART_ITEM":
+
+        product_error = _validate_product_reference(
+            state,
+            action,
+            tool,
+        )
+
+        if product_error is not None:
+            return product_error
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # UPDATE_CART_ITEM
+    # -----------------------------------------------------
+
+    if action == "UPDATE_CART_ITEM":
+
+        product_error = _validate_product_reference(
+            state,
+            action,
+            tool,
+        )
+
+        if product_error is not None:
+            return product_error
+
+        quantity_error = _validate_positive_quantity(
+            state,
+            action,
+            tool,
+        )
+
+        if quantity_error is not None:
+            return quantity_error
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # CLEAR_CART
+    # -----------------------------------------------------
+
+    if action == "CLEAR_CART":
+
+        # Clearing an already empty cart is safe.
+        #
+        # We intentionally do NOT reject it because DELETE /
+        # clear operations should be idempotent.
+        #
+        # Backend Cart Service remains responsible for the
+        # actual operation.
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # SHOW_CART
+    # -----------------------------------------------------
+
+    if action == "SHOW_CART":
+
+        # Viewing an empty cart is valid.
+        #
+        # Therefore no cart_items requirement exists here.
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # CHECKOUT_CART
+    # -----------------------------------------------------
+
+    if action == "CHECKOUT_CART":
+
+        # Checkout cannot meaningfully proceed with an empty
+        # cart.
+
+        if not _cart_has_items(
+            state
+        ):
+            return _failure(
+                "empty_cart",
+                action=action,
+                tool=tool,
+                retryable=True,
+            )
+
+        # If an order has already been created, do not allow
+        # checkout to execute again.
+
+        if _transaction_already_completed(
+            state
+        ):
+            return _failure(
+                "checkout_already_completed",
+                action=action,
+                tool=tool,
+                retryable=False,
+            )
+
+        return _success(
+            action,
+            tool,
+        )
+
+    # -----------------------------------------------------
+    # Defensive fallback
+    # -----------------------------------------------------
+
+    return _failure(
+        "unsupported_cart_action",
+        action=action,
+        tool=tool,
+        retryable=False,
+    )
+
+
+# =========================================================
 # Validate CREATE_ORDER
 # =========================================================
 
@@ -398,12 +980,6 @@ def _validate_create_order(
     # -----------------------------------------------------
     # Checkout ID
     # -----------------------------------------------------
-    #
-    # Durable idempotency requires a checkout ID.
-    #
-    # The Policy Node does not generate one.
-    #
-    # -----------------------------------------------------
 
     checkout_id = state.get(
         "checkout_id"
@@ -430,25 +1006,26 @@ def _validate_create_order(
     )
 
     if not ready:
+        result = {
+            "allowed": False,
+            "action": action,
+            "tool": tool,
+            "reason": "checkout_incomplete",
+            "missing_fields": missing,
+            "retryable": True,
+        }
+
         return {
-            "policy_result": {
-                "allowed": False,
-                "action": action,
-                "tool": tool,
-                "reason": "checkout_incomplete",
-                "missing_fields": missing,
-                "retryable": True,
-            },
-            "policy_error": {
-                "allowed": False,
-                "action": action,
-                "tool": tool,
-                "reason": "checkout_incomplete",
-                "missing_fields": missing,
-                "retryable": True,
-            },
+            "policy_result": result,
+            "policy_error": result,
+            "policy_decision": "deny",
+            "policy_allowed": False,
+            "policy_reason": "checkout_incomplete",
             "tool_name": None,
             "missing_fields": missing,
+            "planner_action": action,
+            "planner_tool": tool,
+            "planner_status": "rejected",
         }
 
     return _success(
@@ -477,9 +1054,8 @@ def _validate_track_order(
         "order_id"
     )
 
-    planned_arguments = state.get(
-        "planned_arguments",
-        {},
+    planned_arguments = _get_planned_arguments(
+        state
     )
 
     planned_order_id = None
@@ -495,7 +1071,9 @@ def _validate_track_order(
         )
 
     if not (
-        _has_value(order_id)
+        _has_value(
+            order_id
+        )
         or _has_value(
             planned_order_id
         )
@@ -534,9 +1112,8 @@ def _validate_cancel_order(
         "order_id"
     )
 
-    planned_arguments = state.get(
-        "planned_arguments",
-        {},
+    planned_arguments = _get_planned_arguments(
+        state
     )
 
     planned_order_id = None
@@ -552,7 +1129,9 @@ def _validate_cancel_order(
         )
 
     if not (
-        _has_value(order_id)
+        _has_value(
+            order_id
+        )
         or _has_value(
             planned_order_id
         )
@@ -614,47 +1193,90 @@ def policy_node(
         Is the actual operation valid?
     """
 
-    planner_decision = state.get("planner_decision")
+    # =====================================================
+    # Resolve Planner Decision
+    # =====================================================
 
-    if not isinstance(planner_decision, dict):
-        planner = state.get("planner")
-        if isinstance(planner, dict):
+    planner_decision = state.get(
+        "planner_decision"
+    )
+
+    # -----------------------------------------------------
+    # Compatibility: planner object
+    # -----------------------------------------------------
+
+    if not isinstance(
+        planner_decision,
+        dict,
+    ):
+
+        planner = state.get(
+            "planner"
+        )
+
+        if isinstance(
+            planner,
+            dict,
+        ):
             planner_decision = {
-                "action": planner.get("action"),
-                "tool": planner.get("tool") or planner.get("tool_name"),
-                "arguments": planner.get("arguments", {}),
+                "action": planner.get(
+                    "action"
+                ),
+                "tool": (
+                    planner.get("tool")
+                    or planner.get("tool_name")
+                ),
+                "arguments": planner.get(
+                    "arguments",
+                    {},
+                ),
             }
-        elif _has_value(state.get("planner_action")):
+
+        # -------------------------------------------------
+        # Compatibility: planner_* fields
+        # -------------------------------------------------
+
+        elif _has_value(
+            state.get(
+                "planner_action"
+            )
+        ):
             planner_decision = {
-                "action": state.get("planner_action"),
-                "tool": state.get("planner_tool"),
-                "arguments": state.get("planner_args", {}),
+                "action": state.get(
+                    "planner_action"
+                ),
+                "tool": state.get(
+                    "planner_tool"
+                ),
+                "arguments": state.get(
+                    "planner_args",
+                    {},
+                ),
             }
-        elif _has_value(state.get("action")):
-            # =============================================
-            # FIX:
-            #
-            # AI Planner Node (per its debug log — "action =
-            # 'answer'", "arguments = {}") writes its decision
-            # as FLAT keys directly on GraphState: "action",
-            # "tool" / "tool_name", "arguments". None of the
-            # three shapes above matched this, so every turn
-            # fell through to planner_decision = {"action":
-            # None, ...}, which is not a string, which then hit
-            # _failure("invalid_planner_action") with no action/
-            # tool passed through — producing exactly the
-            # "allowed=False, action=None, tool=None" seen in
-            # Decision Node's log for every message, including
-            # plain greetings.
-            #
-            # This branch reads the planner's actual output
-            # shape instead of failing closed.
-            # =============================================
+
+        # -------------------------------------------------
+        # Compatibility: flat planner output
+        # -------------------------------------------------
+
+        elif _has_value(
+            state.get(
+                "action"
+            )
+        ):
             planner_decision = {
-                "action": state.get("action"),
-                "tool": state.get("tool") or state.get("tool_name"),
-                "arguments": state.get("arguments", {}),
+                "action": state.get(
+                    "action"
+                ),
+                "tool": (
+                    state.get("tool")
+                    or state.get("tool_name")
+                ),
+                "arguments": state.get(
+                    "arguments",
+                    {},
+                ),
             }
+
         else:
             planner_decision = {
                 "action": None,
@@ -663,27 +1285,16 @@ def policy_node(
             }
 
     # =====================================================
-    # DEBUG
-    # =====================================================
-    #
-    # No debug output previously existed for this node, which is
-    # why the "missing_planner_decision" failure above was
-    # invisible until Decision Node's log was cross-referenced
-    # with AI Planner Node's log. Printing here going forward
-    # makes a future mismatch immediately visible at the source.
+    # Validate Planner Decision
     # =====================================================
 
-    print(
-        "\n"
-        "====================================================\n"
-        "[POLICY NODE]\n"
-        "====================================================\n"
-        f"planner_decision = {planner_decision!r}\n"
-        "====================================================\n"
-    )
-
-    if not isinstance(planner_decision, dict):
-        return _failure("missing_planner_decision")
+    if not isinstance(
+        planner_decision,
+        dict,
+    ):
+        return _failure(
+            "missing_planner_decision"
+        )
 
     action = planner_decision.get(
         "action"
@@ -699,15 +1310,87 @@ def policy_node(
 
     action = action.strip().upper()
 
-    tool = planner_decision.get("tool")
-    if not tool and action in {"CREATE_ORDER", "TRACK_ORDER", "CANCEL_ORDER"}:
-        tool = {"CREATE_ORDER":"create_order","TRACK_ORDER":"track_order","CANCEL_ORDER":"cancel_order"}.get(action)
+    # =====================================================
+    # Resolve Tool
+    # =====================================================
 
-    planned_arguments = planner_decision.get("arguments")
-    if isinstance(planned_arguments, dict):
-        # Compatibility mirror consumed by validators.
-        state = dict(state)
-        state["planned_arguments"] = planned_arguments
+    tool = planner_decision.get(
+        "tool"
+    )
+
+    if isinstance(
+        tool,
+        str,
+    ):
+        tool = tool.strip()
+
+    # -----------------------------------------------------
+    # Canonical tool mapping
+    #
+    # This protects against a planner returning:
+    #
+    # ADD_CART_ITEM + "cart_manager"
+    #
+    # We require:
+    #
+    # ADD_CART_ITEM + "add_to_cart"
+    # -----------------------------------------------------
+
+    if action in CART_TOOL_MAPPING:
+
+        expected_tool = CART_TOOL_MAPPING[
+            action
+        ]
+
+        if tool is None:
+            tool = expected_tool
+
+        elif tool != expected_tool:
+            return _failure(
+                "cart_action_tool_mismatch",
+                action=action,
+                tool=tool,
+                retryable=False,
+            )
+
+    elif not tool and action in {
+        "CREATE_ORDER",
+        "TRACK_ORDER",
+        "CANCEL_ORDER",
+    }:
+        tool = {
+            "CREATE_ORDER": "create_order",
+            "TRACK_ORDER": "track_order",
+            "CANCEL_ORDER": "cancel_order",
+        }.get(
+            action
+        )
+
+    # =====================================================
+    # Planner Arguments
+    # =====================================================
+
+    planned_arguments = planner_decision.get(
+        "arguments"
+    )
+
+    if not isinstance(
+        planned_arguments,
+        dict,
+    ):
+        planned_arguments = {}
+
+    # -----------------------------------------------------
+    # Compatibility mirror
+    # -----------------------------------------------------
+
+    state = dict(
+        state
+    )
+
+    state["planned_arguments"] = (
+        planned_arguments
+    )
 
     # =====================================================
     # Tool Validation
@@ -743,15 +1426,7 @@ def policy_node(
     if action in NON_TOOL_ACTIONS:
 
         # -------------------------------------------------
-        # Critical completed-order protection
-        # -------------------------------------------------
-        #
-        # A conversational message after a completed order
-        # is allowed to remain conversational.
-        #
-        # It must never be converted into create_order merely
-        # because checkout information remains in state.
-        #
+        # These actions intentionally do not execute tools.
         # -------------------------------------------------
 
         return _success(
@@ -760,12 +1435,23 @@ def policy_node(
         )
 
     # =====================================================
+    # CART ACTIONS
+    # =====================================================
+
+    if action in CART_ACTIONS:
+
+        return _validate_cart_action(
+            state,
+            action,
+            tool,
+        )
+
+    # =====================================================
     # CREATE_ORDER
     # =====================================================
 
     if action == "CREATE_ORDER":
 
-        # The planner must explicitly request the order tool.
         if tool != "create_order":
             return _failure(
                 "create_order_requires_create_order_tool",
