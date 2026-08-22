@@ -274,7 +274,9 @@ export default function AddressSelector({
     setCompleted(false);
     setError(null);
   }, [
-    metadata,
+    metadata.addresses,
+    metadata.prefill,
+    metadata.allow_new,
   ]);
 
 
@@ -363,11 +365,21 @@ export default function AddressSelector({
      *
      * It only sends the selected address ID to the
      * backend through the chat store.
+     *
+     * Also verify that the ID belongs to an address currently
+     * known to this selector. This is a UI integrity check only;
+     * the backend remains authoritative.
      */
+    const addressExists =
+      addresses.some(
+        (address) => address.id === addressId
+      );
+
     if (
       isBusy ||
       !Number.isInteger(addressId) ||
-      addressId <= 0
+      addressId <= 0 ||
+      !addressExists
     ) {
       return;
     }

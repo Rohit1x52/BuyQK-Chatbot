@@ -1,20 +1,43 @@
+// ============================================================
+// BuyQK Message Bubble
+// ============================================================
+//
+// Responsibility:
+// - Render one conversational message
+// - Keep message rendering separate from structured UI
+//
+// This component does NOT:
+// - call APIs
+// - modify Zustand state
+// - modify Cart state
+// - render the Cart itself
+// - calculate product/cart/order values
+//
+// Structured UI such as Cart, address selection, payment selection,
+// and bill rendering remains the responsibility of ChatWindow and
+// its dedicated components.
+//
+// ============================================================
+
 "use client";
 
-import type { ChatMessage } from "../../types/chat";
+import type {
+  ChatMessage,
+} from "../../types/chat";
 
 
-/* =========================================================
-   Props
-   ========================================================= */
+// ============================================================
+// Props
+// ============================================================
 
 interface MessageBubbleProps {
   message: ChatMessage;
 }
 
 
-/* =========================================================
-   Message Bubble
-   ========================================================= */
+// ============================================================
+// Message Bubble
+// ============================================================
 
 export default function MessageBubble({
   message,
@@ -23,28 +46,28 @@ export default function MessageBubble({
   const isUser =
     message.role === "user";
 
-
   const content =
     typeof message.content === "string"
       ? message.content.trim()
       : "";
 
-
-  /*
-   * Do not render an empty text bubble.
-   *
-   * Structured UI such as:
-   *
-   * - address selection
-   * - payment selection
-   * - bill
-   *
-   * is handled by ChatWindow.tsx from metadata.
-   */
+  // ----------------------------------------------------------
+  // Empty structured messages
+  // ----------------------------------------------------------
+  //
+  // Do not render an empty text bubble.
+  //
+  // Structured UI such as:
+  // - Cart
+  // - address selection
+  // - payment selection
+  // - bill
+  //
+  // is rendered by ChatWindow / dedicated components.
+  //
   if (!content) {
     return null;
   }
-
 
   return (
     <div
@@ -66,9 +89,9 @@ export default function MessageBubble({
         }}
       >
 
-        {/* =================================================
+        {/* ==================================================
             Message Content
-            ================================================= */}
+        ================================================== */}
 
         <div
           className="bubble"
@@ -83,19 +106,21 @@ export default function MessageBubble({
         </div>
 
 
-        {/* =================================================
+        {/* ==================================================
             Timestamp
-            ================================================= */}
+        ================================================== */}
 
         {message.created_at && (
+
           <div
             className="bubble-time"
             aria-label="Message time"
           >
             {formatMessageTime(
-              message.created_at
+              message.created_at,
             )}
           </div>
+
         )}
 
       </div>
@@ -105,12 +130,12 @@ export default function MessageBubble({
 }
 
 
-/* =========================================================
-   Format Message Time
-   ========================================================= */
+// ============================================================
+// Format Message Time
+// ============================================================
 
 function formatMessageTime(
-  timestamp: string
+  timestamp: string,
 ): string {
 
   if (
@@ -120,19 +145,16 @@ function formatMessageTime(
     return "";
   }
 
-
   const date =
     new Date(timestamp);
 
-
   if (
     Number.isNaN(
-      date.getTime()
+      date.getTime(),
     )
   ) {
     return "";
   }
-
 
   try {
 
@@ -141,7 +163,7 @@ function formatMessageTime(
       {
         hour: "2-digit",
         minute: "2-digit",
-      }
+      },
     );
 
   } catch {

@@ -41,6 +41,12 @@ import {
   useChatStore,
 } from "../../store/chatStore";
 
+import {
+  removeCartItem,
+  updateCartItem,
+  clearCart,
+} from "../../services/cart_service";
+
 import type {
   CartItem,
 } from "../../types/chat";
@@ -471,6 +477,16 @@ export default function Cart() {
       (state) => state.sendMessage,
     );
 
+  const userId =
+    useChatStore(
+      (state) => state.userId,
+    );
+
+  const setCart =
+    useChatStore(
+      (state) => state.setCart,
+    );
+
   const globalError =
     useChatStore(
       (state) => state.error,
@@ -481,6 +497,11 @@ export default function Cart() {
     actionError,
     setActionError,
   ] = useState<string | null>(null);
+
+  const [
+    actionBusy,
+    setActionBusy,
+  ] = useState(false);
 
 
   // ==========================================================
@@ -518,34 +539,51 @@ export default function Cart() {
 
     if (
       !Number.isInteger(quantity) ||
-      quantity <= 0
+      quantity <= 0 ||
+      actionBusy ||
+      userId === null
     ) {
       return;
     }
 
     setActionError(null);
+    setActionBusy(true);
 
     try {
-
-      // ------------------------------------------------------
-      // Send a semantic cart modification through the existing
-      // BuyQK AI pipeline.
+      // Direct Cart API operation.
       //
-      // The backend Cart Service validates the final quantity
-      // and stock.
-      // ------------------------------------------------------
+      // CartService remains authoritative for:
+      // - product ownership
+      // - stock
+      // - quantity validation
+      // - price
+      // - totals
+      const updatedCart =
+        await updateCartItem(
+          item.id,
+          {
+            user_id: userId,
+            quantity,
+          },
+        );
 
-      await sendMessage(
-        `change ${item.product_name} quantity to ${quantity}`,
-      );
+      // Replace Zustand only with the successful backend result.
+      const accepted =
+        setCart(updatedCart);
 
+      if (!accepted) {
+        throw new Error(
+          "Received invalid cart data from the backend.",
+        );
+      }
     } catch (error) {
-
       setActionError(
         error instanceof Error
           ? error.message
           : "Unable to update the cart.",
       );
+    } finally {
+      setActionBusy(false);
     }
   }
 
@@ -558,21 +596,40 @@ export default function Cart() {
     item: CartItem,
   ): Promise<void> {
 
+    if (
+      actionBusy ||
+      userId === null
+    ) {
+      return;
+    }
+
     setActionError(null);
+    setActionBusy(true);
 
     try {
+      // Direct Cart API operation.
+      const updatedCart =
+        await removeCartItem(
+          item.id,
+          userId,
+        );
 
-      await sendMessage(
-        `remove ${item.product_name} from my cart`,
-      );
+      const accepted =
+        setCart(updatedCart);
 
+      if (!accepted) {
+        throw new Error(
+          "Received invalid cart data from the backend.",
+        );
+      }
     } catch (error) {
-
       setActionError(
         error instanceof Error
           ? error.message
           : "Unable to remove the item.",
       );
+    } finally {
+      setActionBusy(false);
     }
   }
 
@@ -585,11 +642,12 @@ export default function Cart() {
 
     if (
       isLoading ||
-      items.length === 0
+      actionBusy ||
+      items.length === 0 ||
+      userId === null
     ) {
       return;
     }
-
 
     const confirmed =
       window.confirm(
@@ -600,22 +658,30 @@ export default function Cart() {
       return;
     }
 
-
     setActionError(null);
+    setActionBusy(true);
 
     try {
+      // Direct Cart API operation.
+      const updatedCart =
+        await clearCart(userId);
 
-      await sendMessage(
-        "clear my cart",
-      );
+      const accepted =
+        setCart(updatedCart);
 
+      if (!accepted) {
+        throw new Error(
+          "Received invalid cart data from the backend.",
+        );
+      }
     } catch (error) {
-
       setActionError(
         error instanceof Error
           ? error.message
           : "Unable to clear the cart.",
       );
+    } finally {
+      setActionBusy(false);
     }
   }
 
@@ -650,7 +716,9 @@ export default function Cart() {
 
     if (
       isLoading ||
-      items.length === 0
+      actionBusy ||
+      items.length === 0 ||
+      userId === null
     ) {
       return;
     }
@@ -746,7 +814,7 @@ export default function Cart() {
           <button
             type="button"
             onClick={handleClearCart}
-            disabled={isLoading}
+            disabled={isLoading || actionBusy}
             style={{
               border: "none",
               background: "transparent",
@@ -857,7 +925,7 @@ export default function Cart() {
                   key={item.id}
                   item={item}
                   currency={currency}
-                  busy={isLoading}
+                  busy={isLoading || actionBusy}
                   onUpdateQuantity={
                     handleUpdateQuantity
                   }
@@ -973,7 +1041,10 @@ export default function Cart() {
           <button
             type="button"
             onClick={handleCheckout}
-            disabled={isLoading}
+            disabled={
+              isLoading ||
+              actionBusy
+            }
             style={{
               width: "100%",
               marginTop: "18px",
@@ -995,7 +1066,7 @@ export default function Cart() {
                   : 1,
             }}
           >
-            {isLoading
+            {isLoading || actionBusy
               ? "Processing..."
               : "Checkout"}
           </button>

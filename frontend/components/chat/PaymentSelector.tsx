@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { useChatStore } from "../../store/chatStore";
 
@@ -221,6 +221,21 @@ export default function PaymentSelector({
 
 
   // ==========================================================
+  // Reset UI for a new payment-selection step
+  // ==========================================================
+
+  useEffect(() => {
+    setSelectedMethod(null);
+    setCompleted(false);
+    setError(null);
+    setSubmittingMethod(null);
+  }, [
+    metadata.methods,
+    metadata.payment_methods,
+  ]);
+
+
+  // ==========================================================
   // Payment Methods
   // ==========================================================
 
@@ -389,8 +404,8 @@ export default function PaymentSelector({
         aria-live="polite"
       >
         {selected
-          ? `${selected.label} selected. Placing your order...`
-          : "Payment method selected. Placing your order..."}
+          ? `${selected.label} selected. Continuing checkout...`
+          : "Payment method selected. Continuing checkout..."}
       </div>
     );
   }
