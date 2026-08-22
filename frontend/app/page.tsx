@@ -1,4 +1,7 @@
+"use client";
+
 import Link from "next/link";
+import SiteHeader from "../components/SiteHeader";
 
 export default function HomePage() {
   return (
