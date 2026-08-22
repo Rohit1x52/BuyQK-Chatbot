@@ -819,6 +819,9 @@ export interface ChatMetadata {
 
   tracking?: TrackingMetadata | null;
 
+  /** Backend-provided current tracking status. */
+  tracking_status?: string | null;
+
   can_track?: boolean;
 
 
