@@ -58,6 +58,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 from typing import Any
+import uuid
 
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
@@ -1139,6 +1140,15 @@ def create_order(
         address_id
     )
 
+    # Graph/checkout callers normally provide a stable checkout_id.
+    # Direct service callers may omit it; in that case the backend
+    # creates a unique transaction identity for this invocation.
+    # This preserves checkout-level idempotency whenever the caller
+    # supplies a checkout_id, while keeping the service API usable
+    # for direct backend operations and tests.
+    if checkout_id is None:
+        checkout_id = f"service-{uuid.uuid4().hex}"
+
     checkout_id = _normalize_checkout_id(
         checkout_id
     )
@@ -1200,6 +1210,12 @@ def create_order(
     # =====================================================
     # Validate payment
     # =====================================================
+
+    # Direct backend callers may omit payment_method in the MVP.
+    # Use the supported COD method as the service default. Graph
+    # checkout flows can still pass an explicit normalized method.
+    if payment_method is None:
+        payment_method = "cod"
 
     normalized_payment_method = (
         _validate_payment_method(

@@ -1,13 +1,8 @@
 """
-chat_schema.py will:
-Validate incoming chat messages.
-Identify the user/session associated with the conversation.
-Carry optional conversation context.
-Return the assistant's response.
-Return the session ID so the frontend can continue the same conversation.
-Return detected intent when available.
-Return structured metadata that the frontend can optionally use.
-Keep the API contract independent of the internal LangGraph state.
+BuyQK AI - Chat API Schemas
+
+The schema validates the public HTTP contract only.
+It does not contain LangGraph or transaction business logic.
 """
 
 from typing import Any
@@ -17,31 +12,60 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ChatRequest(BaseModel):
     """
-    Schema for a message sent by the user to the BuyQK AI assistant.
+    Schema for a message sent to the BuyQK AI assistant.
     """
 
-    # User's message
     message: str = Field(
         ...,
         min_length=1,
-        max_length=5000
+        max_length=5000,
     )
 
-    # Existing conversation session.
     session_id: str = Field(
-        max_length=100
+        ...,
+        min_length=1,
+        max_length=100,
     )
 
-    # ID of the user sending the message
-    user_id: int
+    user_id: int = Field(
+        ...,
+        gt=0,
+    )
 
-    # Optional saved address selected by the frontend.
-    # When provided, the graph can deterministically use
-    # this value as entities["address_id"].
-    selected_address_id: int | None = None
+    # --------------------------------------------------------
+    # Active checkout
+    # --------------------------------------------------------
+    #
+    # This is supplied only when the frontend already has
+    # a backend-created checkout.
+    #
+    # The API/graph remain authoritative.
+    # The frontend does not create this value.
+    #
+    checkout_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
 
-    # Optional payment method selected by the frontend.
-    payment_method: str | None = None
+    # --------------------------------------------------------
+    # Address
+    # --------------------------------------------------------
+
+    selected_address_id: int | None = Field(
+        default=None,
+        gt=0,
+    )
+
+    # --------------------------------------------------------
+    # Payment
+    # --------------------------------------------------------
+
+    payment_method: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
 
 
 class ChatResponse(BaseModel):
@@ -50,20 +74,11 @@ class ChatResponse(BaseModel):
     """
 
     model_config = ConfigDict(
-        from_attributes=True
+        from_attributes=True,
     )
 
-    # AI-generated response
     response: str
 
-    # Optional structured metadata.
-    #
-    # Examples:
-    # {
-    #     "products": [...],
-    #     "order_id": 101,
-    #     "ticket_id": 501
-    # }
     metadata: dict[str, Any] = Field(
-        default_factory=dict
+        default_factory=dict,
     )

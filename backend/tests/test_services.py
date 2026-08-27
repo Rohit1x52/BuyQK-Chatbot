@@ -10,19 +10,23 @@
 # do not modify the application's real database.
 
 
+from __future__ import annotations
+
 import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 # ---------------------------------------------------------
-# Make backend/ available for imports
+# Make project root available for imports
 # ---------------------------------------------------------
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------
@@ -47,7 +51,7 @@ from backend.database.base import Base
 # classes registered before create_all() is called.
 # ---------------------------------------------------------
 
-from backend import models
+from backend import models  # noqa: F401
 
 
 # ---------------------------------------------------------
@@ -65,20 +69,20 @@ from backend.models.product import Product
 # Services
 # ---------------------------------------------------------
 
-from services.product_service import (
+from backend.services.product_service import (
     search_products,
     get_product,
     check_product_availability,
 )
 
-from services.order_service import (
+from backend.services.order_service import (
     create_order,
     get_order,
     get_user_orders,
     cancel_order,
 )
 
-from services.support_service import (
+from backend.services.support_service import (
     create_ticket,
     get_ticket,
     get_user_tickets,
@@ -105,7 +109,7 @@ def create_test_database():
     engine = create_engine(
         f"sqlite:///{database_path}",
         connect_args={
-            "check_same_thread": False
+            "check_same_thread": False,
         },
     )
 
@@ -156,7 +160,7 @@ def seed_test_data(db):
 
     address = Address(
         user_id=user.id,
-        address_line_1="Test Address",
+        address="Test Address",
         city="Jaipur",
         state="Rajasthan",
         postal_code="302001",
@@ -246,6 +250,72 @@ def seed_test_data(db):
         "bread": bread,
         "unavailable_product": unavailable_product,
     }
+
+
+# =========================================================
+# Pytest Fixtures
+# =========================================================
+
+@pytest.fixture()
+def service_resources():
+    """
+    Create an isolated SQLite database and seed it for
+    every service test.
+
+    This allows pytest to inject the database and seeded
+    data into the test functions.
+    """
+
+    temporary_directory = None
+    engine = None
+    db = None
+
+    try:
+        (
+            temporary_directory,
+            engine,
+            SessionLocal,
+        ) = create_test_database()
+
+        db = SessionLocal()
+
+        data = seed_test_data(
+            db
+        )
+
+        yield {
+            "db": db,
+            "data": data,
+        }
+
+    finally:
+
+        if db is not None:
+            db.close()
+
+        if engine is not None:
+            engine.dispose()
+
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+
+
+@pytest.fixture()
+def db(service_resources):
+    """
+    Provide the SQLAlchemy session to service tests.
+    """
+
+    return service_resources["db"]
+
+
+@pytest.fixture()
+def data(service_resources):
+    """
+    Provide seeded service-test data.
+    """
+
+    return service_resources["data"]
 
 
 # =========================================================
