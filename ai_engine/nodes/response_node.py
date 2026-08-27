@@ -567,7 +567,7 @@ def _get_payment_methods(
         tool_result,
         dict,
     ):
-        return []
+        tool_result = {}
 
     methods = tool_result.get(
         "methods"
@@ -576,8 +576,9 @@ def _get_payment_methods(
     if not isinstance(
         methods,
         list,
-    ):
-        return []
+    ) or not methods:
+        from backend.services.order_service import PAYMENT_METHODS
+        return PAYMENT_METHODS
 
     return methods
 
@@ -2038,6 +2039,52 @@ def response_node(
     )
 
     # ---------------------------------------------------------
+    # Phase 2 follow-up question
+    #
+    # The Follow-up Node owns missing-field selection and question
+    # generation. Response Node only presents the result.
+    # ---------------------------------------------------------
+    follow_up_question = state.get(
+        "follow_up_question"
+    )
+    awaiting_user_input = bool(
+        state.get("awaiting_user_input")
+    )
+    current_missing_field = state.get(
+        "current_missing_field"
+    )
+
+    if (
+        awaiting_user_input
+        and isinstance(
+            follow_up_question,
+            str,
+        )
+        and follow_up_question.strip()
+    ):
+        question = follow_up_question.strip()
+
+        metadata.update(
+            {
+                "type": "follow_up",
+                "question": question,
+                "field": current_missing_field,
+                "missing_fields": missing_fields,
+                "awaiting_user_input": True,
+            }
+        )
+
+        return {
+            "response": question,
+            "metadata": metadata,
+            "missing_fields": missing_fields,
+            "next_missing": current_missing_field,
+            "current_missing_field": current_missing_field,
+            "follow_up_question": question,
+            "awaiting_user_input": True,
+        }
+
+    # ---------------------------------------------------------
     # Preserve graph-controlled checkout state.
     # ---------------------------------------------------------
     metadata["missing_fields"] = missing_fields
@@ -2092,6 +2139,14 @@ def response_node(
     # metadata.
     # ---------------------------------------------------------
     cart_result_types = {
+        # Canonical/current CartService result types.
+        "cart_add",
+        "cart_remove",
+        "cart_update",
+        "cart_clear",
+        "cart_view",
+        "cart_checkout",
+        # Backward-compatible result types.
         "cart_updated",
         "cart_cleared",
         "cart",
@@ -2146,7 +2201,7 @@ def response_node(
         }
 
         # checkout_cart starts checkout but does not create an order.
-        if tool_result.get("type") == "cart_checkout_ready":
+        if tool_result.get("type") in {"cart_checkout_ready", "cart_checkout"}:
             result.update(
                 {
                     "checkout_id": tool_result.get(
@@ -2456,3 +2511,25 @@ def response_node(
         "missing_fields": missing_fields,
         "next_missing": next_missing,
     }
+
+# =========================================================
+# Backward-Compatible Public API
+# =========================================================
+
+def generate_response(
+    state: GraphState,
+) -> GraphState:
+    """
+    Backward-compatible public wrapper.
+
+    Existing tests and callers may import generate_response().
+    The production implementation remains response_node().
+    """
+
+    return response_node(state)
+
+
+__all__ = [
+    "response_node",
+    "generate_response",
+]

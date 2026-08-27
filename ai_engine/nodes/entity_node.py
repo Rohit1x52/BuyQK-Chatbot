@@ -1461,9 +1461,6 @@ def _fallback_current_turn_intent(
         if len(text.split()) <= 5:
             return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
 
-    if detect_product_from_message(text):
-        return IntentDecision(intent="cart", order_action="none", confidence=0.0)
-
     return IntentDecision(intent="general", order_action="none", confidence=0.0)
 
 
@@ -1574,11 +1571,14 @@ Classify the current message independently.
             f" {type(exc).__name__}: {exc}"
         )
 
-    # Fail closed to deterministic fallback
-    # instead of strictly returning general.
-    return _fallback_current_turn_intent(
-        state=state,
-        message=message,
+    # Fail closed.
+    #
+    # A failed intent decision must NEVER create an order from
+    # stale entities. General is the safest fallback.
+    return IntentDecision(
+        intent="general",
+        order_action="none",
+        confidence=0.0,
     )
 
 

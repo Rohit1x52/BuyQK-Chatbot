@@ -38,7 +38,6 @@
 #    ↓
 # Response
 #
-#
 # =========================================================
 #
 # MEMORY ARCHITECTURE
@@ -50,38 +49,6 @@
 # SQLite:
 #
 #     Authoritative transactional state
-#
-#
-# IMPORTANT
-#
-# The runner must NOT make business decisions.
-#
-# It only:
-#
-#     - loads conversation context
-#     - restores graph state
-#     - injects current request data
-#     - executes LangGraph
-#     - persists resulting conversational state
-#
-#
-# The AI/nodes decide:
-#
-#     - intent
-#     - entities
-#     - user's goal
-#     - next conversational action
-#
-#
-# The backend decides:
-#
-#     - prices
-#     - stock
-#     - payment validity
-#     - order ID
-#     - order status
-#     - billing
-#     - transaction success/failure
 #
 # =========================================================
 
@@ -105,16 +72,13 @@ MEMORY_MESSAGE_LIMIT = 10
 
 
 # =========================================================
-# State Fields
+# Persisted Graph State
 # =========================================================
 #
-# These fields represent conversational/transaction state
-# that may need to survive between requests.
+# These fields survive between HTTP requests.
 #
-# The runner does NOT decide their values.
-#
-# It merely restores values that were previously produced by
-# the graph/backend.
+# The runner does not calculate them.
+# It only restores values that the graph previously produced.
 #
 # =========================================================
 
@@ -126,6 +90,8 @@ PERSISTED_STATE_FIELDS = (
     "checkout_id",
     "checkout_status",
     "order_created",
+    "order_creation_attempted",
+    "checkout_completed",
     "order_id",
 
     # -----------------------------------------------------
@@ -135,18 +101,21 @@ PERSISTED_STATE_FIELDS = (
     "product_id",
     "product_name",
     "quantity",
+    "selected_product",
 
     # -----------------------------------------------------
     # Address
     # -----------------------------------------------------
 
     "address_id",
+    "selected_address_id",
 
     # -----------------------------------------------------
     # Payment
     # -----------------------------------------------------
 
     "selected_payment_method",
+    "payment_method",
     "billing_payment_method",
 
     # -----------------------------------------------------
@@ -165,21 +134,39 @@ PERSISTED_STATE_FIELDS = (
     "currency",
 
     # -----------------------------------------------------
-    # Transaction/tool state
+    # Transaction / Tool
     # -----------------------------------------------------
 
     "tool_name",
     "tool_result",
+    "execution_result",
 
     # -----------------------------------------------------
-    # Planner/context state
+    # Planner / Context
     # -----------------------------------------------------
 
     "context",
     "planner",
     "planner_args",
+    "planner_decision",
+    "planned_action",
+    "planned_tool",
+    "planned_arguments",
+    "planner_confidence",
+
+    # -----------------------------------------------------
+    # Policy / Decision
+    # -----------------------------------------------------
+
+    "policy_result",
+    "policy_error",
     "policy",
     "decision",
+
+    # -----------------------------------------------------
+    # Tool arguments
+    # -----------------------------------------------------
+
     "tool_args",
 
     # -----------------------------------------------------
@@ -187,6 +174,54 @@ PERSISTED_STATE_FIELDS = (
     # -----------------------------------------------------
 
     "awaiting_order_tracking_confirmation",
+
+    # -----------------------------------------------------
+    # Phase 1 conversation/task memory
+    # -----------------------------------------------------
+
+    "active_task",
+    "task_status",
+
+    # -----------------------------------------------------
+    # Phase 2 follow-up state
+    # -----------------------------------------------------
+
+    "current_missing_field",
+    "follow_up_question",
+    "awaiting_user_input",
+    "next_missing",
+
+    # -----------------------------------------------------
+    # AI understanding
+    # -----------------------------------------------------
+
+    "user_goal",
+    "detected_language",
+    "references",
+
+    # -----------------------------------------------------
+    # Order request
+    # -----------------------------------------------------
+
+    "order_items",
+
+    # -----------------------------------------------------
+    # Cart state
+    # -----------------------------------------------------
+
+    "cart_id",
+    "cart_status",
+    "cart_items",
+    "cart_summary",
+    "cart_action",
+    "cart_result",
+    "cart_checkout_ready",
+
+    # -----------------------------------------------------
+    # Transaction error
+    # -----------------------------------------------------
+
+    "transaction_error",
 )
 
 
@@ -276,7 +311,6 @@ def _restore_previous_state(
     """
 
     if not conversation_history:
-
         return {}
 
     # -----------------------------------------------------
@@ -320,12 +354,7 @@ def _restore_previous_state(
                 )
 
         # -------------------------------------------------
-        # Entities
-        # -------------------------------------------------
-        #
-        # Entity state is separately persisted because it is
-        # the accumulated conversational understanding.
-        #
+        # Entity state
         # -------------------------------------------------
 
         entities = metadata.get(
@@ -377,6 +406,25 @@ def _restore_previous_state(
                 "next_missing"
             ]
 
+        # -------------------------------------------------
+        # Frontend metadata
+        # -------------------------------------------------
+
+        frontend_metadata = metadata.get(
+            "frontend_metadata"
+        )
+
+        if isinstance(
+            frontend_metadata,
+            dict,
+        ):
+
+            restored[
+                "frontend_metadata"
+            ] = deepcopy(
+                frontend_metadata
+            )
+
         return restored
 
     return {}
@@ -402,13 +450,12 @@ def _build_initial_state(
     """
     Build the GraphState for the current request.
 
-    The previous state is restored first.
+    Previous state is restored first.
 
     Current request data is then applied on top.
 
-    Frontend-authoritative selections always belong to the
-    current request and therefore override the corresponding
-    previous selection when explicitly provided.
+    Frontend-authoritative selections override previous
+    selections only when explicitly supplied.
     """
 
     # =====================================================
@@ -420,11 +467,19 @@ def _build_initial_state(
     )
 
     # =====================================================
-    # Current Frontend Checkout Selection
+    # Current Checkout ID
     # =====================================================
 
-    if checkout_id is not None and str(checkout_id).strip():
-        state["checkout_id"] = str(checkout_id).strip()
+    if (
+        checkout_id is not None
+        and str(checkout_id).strip()
+    ):
+
+        state[
+            "checkout_id"
+        ] = str(
+            checkout_id
+        ).strip()
 
     # =====================================================
     # Current User Input
@@ -451,7 +506,7 @@ def _build_initial_state(
     ] = db
 
     # =====================================================
-    # Conversation
+    # Conversation History
     # =====================================================
 
     state[
@@ -459,7 +514,7 @@ def _build_initial_state(
     ] = conversation_history
 
     # =====================================================
-    # Entities
+    # Entity State
     # =====================================================
 
     state[
@@ -475,11 +530,9 @@ def _build_initial_state(
     # Current Frontend Address Selection
     # =====================================================
     #
-    # None means the frontend did not provide a new
-    # selection.
+    # None means the frontend did not provide a new selection.
     #
-    # We therefore do not erase the existing conversational
-    # value.
+    # Therefore an existing address is not erased.
     #
     # =====================================================
 
@@ -520,11 +573,11 @@ def _build_initial_state(
     # Current Request Tool State
     # =====================================================
     #
-    # These fields describe the current graph execution.
+    # A previous tool result is still available through
+    # execution_result.
     #
-    # The previous transaction result remains available in
-    # the restored state, but the current execution starts
-    # without assuming that a tool has already run.
+    # But the current request starts without pretending that
+    # a new tool has already executed.
     #
     # =====================================================
 
@@ -545,18 +598,109 @@ def _build_initial_state(
     ] = None
 
     # =====================================================
-    # Metadata
+    # Current Graph Metadata
     # =====================================================
 
     state[
         "metadata"
     ] = {}
 
+    # =====================================================
+    # Phase 1 defaults
+    # =====================================================
+    #
+    # setdefault() is intentional.
+    #
+    # Existing state is preserved.
+    # New sessions receive sensible defaults.
+    #
+    # =====================================================
+
+    state.setdefault(
+        "active_task",
+        None,
+    )
+
+    state.setdefault(
+        "task_status",
+        "idle",
+    )
+
+    state.setdefault(
+        "execution_result",
+        None,
+    )
+
+    state.setdefault(
+        "selected_product",
+        None,
+    )
+
+    state.setdefault(
+        "missing_fields",
+        [],
+    )
+
+    state.setdefault(
+        "current_missing_field",
+        None,
+    )
+
+    state.setdefault(
+        "follow_up_question",
+        None,
+    )
+
+    state.setdefault(
+        "awaiting_user_input",
+        False,
+    )
+
+    state.setdefault(
+        "next_missing",
+        None,
+    )
+
+    state.setdefault(
+        "entities",
+        {},
+    )
+
+    state.setdefault(
+        "order_created",
+        False,
+    )
+
+    state.setdefault(
+        "order_creation_attempted",
+        False,
+    )
+
+    state.setdefault(
+        "checkout_completed",
+        False,
+    )
+
+    state.setdefault(
+        "cart_items",
+        [],
+    )
+
+    state.setdefault(
+        "order_items",
+        [],
+    )
+
+    state.setdefault(
+        "references",
+        {},
+    )
+
     return state
 
 
 # =========================================================
-# Persistable State
+# Build Memory Metadata
 # =========================================================
 
 
@@ -564,19 +708,18 @@ def _build_memory_metadata(
     result: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Convert the final graph state into short-term conversation
-    memory metadata.
+    Convert final graph state into serializable short-term
+    conversation memory metadata.
 
-    Only serializable graph information should be stored.
+    Only conversational/serializable graph information is stored.
 
-    The database remains the source of truth for durable
-    transactional information.
+    Database session objects are never persisted.
     """
 
     metadata: dict[str, Any] = {}
 
     # =====================================================
-    # Graph State
+    # Persist Graph State
     # =====================================================
 
     for field in PERSISTED_STATE_FIELDS:
@@ -589,17 +732,26 @@ def _build_memory_metadata(
         )
 
         # -------------------------------------------------
-        # Skip database session objects.
+        # Never persist DB sessions.
         # -------------------------------------------------
 
         if field == "db":
             continue
 
-        metadata[
-            field
-        ] = deepcopy(
-            value
-        )
+        try:
+
+            metadata[
+                field
+            ] = deepcopy(
+                value
+            )
+
+        except Exception:
+
+            # A single unserializable optional field must not
+            # prevent the entire conversational state from
+            # being persisted.
+            continue
 
     # =====================================================
     # Entity State
@@ -631,7 +783,10 @@ def _build_memory_metadata(
     # Next Missing
     # =====================================================
 
-    if "next_missing" in result:
+    if (
+        "next_missing"
+        in result
+    ):
 
         metadata[
             "next_missing"
@@ -662,6 +817,267 @@ def _build_memory_metadata(
 
 
 # =========================================================
+# Phase 1 Conversation-State Bookkeeping
+# =========================================================
+
+
+def _update_conversation_state(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Update short-term task state from the already-produced
+    graph result.
+
+    IMPORTANT:
+
+    This function does NOT run another intent classifier.
+
+    It only records the outcome of the graph so the next
+    HTTP turn can resume from the same conversational state.
+    """
+
+    updated = deepcopy(
+        result
+    )
+
+    # =====================================================
+    # Read Graph Output
+    # =====================================================
+
+    intent = str(
+        updated.get(
+            "intent"
+        )
+        or ""
+    ).strip().lower()
+
+    planner = updated.get(
+        "planner"
+    )
+
+    if not isinstance(
+        planner,
+        dict,
+    ):
+
+        planner = {}
+
+    action = str(
+        planner.get(
+            "action"
+        )
+        or ""
+    ).strip().lower()
+
+    missing = updated.get(
+        "missing_fields"
+    )
+
+    if not isinstance(
+        missing,
+        list,
+    ):
+
+        missing = []
+
+    order_created = bool(
+        updated.get(
+            "order_created",
+            False,
+        )
+    )
+
+    checkout_completed = bool(
+        updated.get(
+            "checkout_completed",
+            False,
+        )
+    )
+
+    tool_result = updated.get(
+        "tool_result"
+    )
+
+    transaction_error = updated.get(
+        "transaction_error"
+    )
+
+    # =====================================================
+    # Active Task
+    # =====================================================
+    #
+    # The graph's current intent is authoritative.
+    #
+    # We do not independently classify the message here.
+    #
+    # =====================================================
+
+    if (
+        intent
+        and intent != "general"
+    ):
+
+        updated[
+            "active_task"
+        ] = intent
+
+    elif action in {
+        "answer",
+        "end_conversation",
+    }:
+
+        # Preserve an already active task unless the graph
+        # explicitly finished it.
+        if (
+            not updated.get(
+                "active_task"
+            )
+        ):
+
+            updated[
+                "active_task"
+            ] = None
+
+    # =====================================================
+    # Task Status
+    # =====================================================
+
+    if (
+        order_created
+        or checkout_completed
+    ):
+
+        updated[
+            "task_status"
+        ] = "completed"
+
+    elif transaction_error:
+
+        updated[
+            "task_status"
+        ] = "failed"
+
+    elif missing:
+
+        updated[
+            "task_status"
+        ] = "collecting"
+
+    elif (
+        tool_result is not None
+        or action
+        not in {
+            "",
+            "answer",
+            "ask_clarification",
+        }
+    ):
+
+        updated[
+            "task_status"
+        ] = "executing"
+
+    elif (
+        intent
+        and intent != "general"
+    ):
+
+        updated[
+            "task_status"
+        ] = "active"
+
+    else:
+
+        updated[
+            "task_status"
+        ] = "idle"
+
+    # =====================================================
+    # Execution Result
+    # =====================================================
+    #
+    # This is the latest result from actual graph execution.
+    #
+    # It is not an LLM-generated replacement for backend
+    # authority.
+    #
+    # =====================================================
+
+    updated[
+        "execution_result"
+    ] = deepcopy(
+        tool_result
+    )
+
+    # =====================================================
+    # Selected Product
+    # =====================================================
+    #
+    # Keep a convenient conversational product reference.
+    #
+    # Never invent a product ID.
+    #
+    # =====================================================
+
+    product_id = updated.get(
+        "product_id"
+    )
+
+    product_name = updated.get(
+        "product_name"
+    )
+
+    if (
+        product_id is not None
+        or (
+            isinstance(
+                product_name,
+                str,
+            )
+            and product_name.strip()
+        )
+    ):
+
+        selected_product: dict[str, Any] = {}
+
+        if product_id is not None:
+
+            selected_product[
+                "product_id"
+            ] = deepcopy(
+                product_id
+            )
+
+        if (
+            isinstance(
+                product_name,
+                str,
+            )
+            and product_name.strip()
+        ):
+
+            selected_product[
+                "product_name"
+            ] = product_name.strip()
+
+        updated[
+            "selected_product"
+        ] = selected_product
+
+    # =====================================================
+    # Keep Missing Fields Canonical
+    # =====================================================
+
+    updated[
+        "missing_fields"
+    ] = list(
+        missing
+    )
+
+    return updated
+
+
+# =========================================================
 # Run Chat
 # =========================================================
 
@@ -676,7 +1092,7 @@ def run_chat(
     checkout_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Execute the BuyQK Phase-2 AI graph.
+    Execute the BuyQK AI graph.
 
     ========================================================
     INPUT
@@ -725,10 +1141,13 @@ def run_chat(
     # Validate Message
     # =====================================================
 
-    if not isinstance(
-        message,
-        str,
-    ) or not message.strip():
+    if (
+        not isinstance(
+            message,
+            str,
+        )
+        or not message.strip()
+    ):
 
         raise ValueError(
             "message is required."
@@ -738,10 +1157,13 @@ def run_chat(
     # Validate Session
     # =====================================================
 
-    if not isinstance(
-        session_id,
-        str,
-    ) or not session_id.strip():
+    if (
+        not isinstance(
+            session_id,
+            str,
+        )
+        or not session_id.strip()
+    ):
 
         raise ValueError(
             "session_id is required."
@@ -771,14 +1193,19 @@ def run_chat(
     # Load Conversation History
     # =====================================================
     #
-    # Current message is deliberately NOT stored before the
-    # graph executes.
+    # IMPORTANT:
     #
-    # The graph therefore receives:
+    # Current user message is NOT saved before graph
+    # execution.
     #
-    #     previous conversation
+    # Therefore the graph receives:
+    #
+    #     previous history
     #             +
-    #        current message
+    #     current message
+    #
+    # This prevents the current message from being duplicated
+    # inside the graph's conversation history.
     #
     # =====================================================
 
@@ -841,6 +1268,14 @@ def run_chat(
         )
 
     # =====================================================
+    # Phase 1 Conversation-State Update
+    # =====================================================
+
+    result = _update_conversation_state(
+        result
+    )
+
+    # =====================================================
     # Extract Response
     # =====================================================
 
@@ -848,10 +1283,13 @@ def run_chat(
         "response"
     )
 
-    if not isinstance(
-        response,
-        str,
-    ) or not response.strip():
+    if (
+        not isinstance(
+            response,
+            str,
+        )
+        or not response.strip()
+    ):
 
         raise RuntimeError(
             "BuyQK AI graph completed without a response."
@@ -885,6 +1323,16 @@ def run_chat(
 
     # =====================================================
     # Save Assistant Message
+    # =====================================================
+    #
+    # The assistant message contains:
+    #
+    #     response
+    #     +
+    #     complete short-term state snapshot
+    #
+    # The next request restores this metadata.
+    #
     # =====================================================
 
     conversation_memory.add_message(

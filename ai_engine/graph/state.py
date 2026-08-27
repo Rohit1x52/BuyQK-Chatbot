@@ -113,6 +113,56 @@ class GraphState(TypedDict, total=False):
     conversation_history: list[dict[str, Any]]
 
     # =========================================================
+    # CONVERSATION / TASK MEMORY - PHASE 1
+    # =========================================================
+
+    # Current conversational task selected by the AI workflow.
+    #
+    # Examples:
+    #
+    #   product_search
+    #   order_create
+    #   order_tracking
+    #   order_cancel
+    #   customer_support
+    #   cart
+    #   general
+    #
+    active_task: str | None
+
+    # Lifecycle of the current conversational task.
+    #
+    # Examples:
+    #
+    #   idle
+    #   active
+    #   collecting
+    #   executing
+    #   completed
+    #   failed
+    #
+    task_status: str | None
+
+    # Last authoritative execution result exposed to the
+    # conversation layer.
+    execution_result: Any
+
+    # Currently selected product reference for conversational
+    # continuity.
+    #
+    # Product identity remains backend-authoritative once
+    # resolved.
+    #
+    # Example:
+    #
+    # {
+    #     "product_id": 10,
+    #     "product_name": "Tata Tea"
+    # }
+    #
+    selected_product: dict[str, Any] | None
+
+    # =========================================================
     # AI UNDERSTANDING
     # =========================================================
 
@@ -162,9 +212,32 @@ class GraphState(TypedDict, total=False):
     # These values are not automatically authoritative.
     entities: dict[str, Any]
 
+    # Canonical multi-product order request understood from
+    # the user.
+    #
+    # Product IDs remain backend-authoritative and are resolved
+    # later.
+    order_items: list[dict[str, Any]]
+
     # Information currently missing from the conversation
     # or current transaction.
     missing_fields: list[str]
+
+    # =========================================================
+    # FOLLOW-UP / MISSING-INFORMATION STATE - PHASE 2
+    # =========================================================
+
+    # The single field currently being collected.
+    current_missing_field: str | None
+
+    # Natural-language question generated for that field.
+    follow_up_question: str | None
+
+    # True only while the graph is waiting for the user's answer.
+    awaiting_user_input: bool
+
+    # Compatibility alias used by the frontend/memory layer.
+    next_missing: str | None
 
     # =========================================================
     # AI PLANNER
@@ -194,8 +267,8 @@ class GraphState(TypedDict, total=False):
     #     planner
     #     planner_args
     #
-    # Keep these fields explicitly represented in GraphState so the
-    # planner -> policy -> decision -> tool contract is typed.
+    # Keep these fields explicitly represented in GraphState so
+    # the planner -> policy -> decision -> tool contract is typed.
     planner: dict[str, Any]
 
     # Canonical planner arguments consumed by downstream nodes.
@@ -255,36 +328,8 @@ class GraphState(TypedDict, total=False):
     # =========================================================
     # CART STATE - PHASE 3
     # =========================================================
-    #
-    # The cart is now a first-class state in the conversation.
-    #
-    # IMPORTANT:
-    #
-    # These fields represent the latest backend-authoritative
-    # cart snapshot.
-    #
-    # The graph MUST NOT directly mutate the database.
-    #
-    # Cart mutations happen through:
-    #
-    #     planner
-    #        ↓
-    #     policy
-    #        ↓
-    #     tool
-    #        ↓
-    #     cart_service
-    #        ↓
-    #     database
-    #
-    # The resulting backend state is then written back into
-    # these GraphState fields.
-    #
-    # =========================================================
 
     # Persistent cart identifier.
-    #
-    # This is NOT an order ID.
     cart_id: int | None
 
     # Current cart lifecycle status.
@@ -311,14 +356,6 @@ class GraphState(TypedDict, total=False):
     #         "quantity": 3,
     #         "unit_price": 15,
     #         "line_total": 45
-    #     },
-    #     {
-    #         "id": 2,
-    #         "product_id": 20,
-    #         "product_name": "Biscuits",
-    #         "quantity": 2,
-    #         "unit_price": 20,
-    #         "line_total": 40
     #     }
     # ]
     #
@@ -327,20 +364,6 @@ class GraphState(TypedDict, total=False):
     cart_items: list[dict[str, Any]]
 
     # Backend-authoritative cart calculation.
-    #
-    # Example:
-    #
-    # {
-    #     "subtotal": 85,
-    #     "delivery_charge": 0,
-    #     "discount": 0,
-    #     "tax": 0,
-    #     "total": 85,
-    #     "currency": "INR"
-    # }
-    #
-    # The AI may explain this data but must not calculate or
-    # override it.
     cart_summary: dict[str, Any] | None
 
     # Requested cart operation.
@@ -354,36 +377,13 @@ class GraphState(TypedDict, total=False):
     #   show_cart
     #   checkout
     #
-    # This is a semantic/action classification.
-    # It is not itself a database mutation.
     cart_action: str | None
 
     # Authoritative result returned by Cart Service.
-    #
-    # Example:
-    #
-    # {
-    #     "success": True,
-    #     "cart_id": 1,
-    #     "items": [...],
-    #     "summary": {...}
-    # }
-    #
-    # Or:
-    #
-    # {
-    #     "success": False,
-    #     "error": {...}
-    # }
-    #
-    # Tool execution may also expose the same authoritative result
-    # through tool_result for the generic tool contract.
     cart_result: dict[str, Any] | None
 
     # Whether the backend says the current cart is ready
     # for checkout.
-    #
-    # This must be determined by backend validation.
     cart_checkout_ready: bool
 
     # =========================================================
@@ -528,26 +528,6 @@ class GraphState(TypedDict, total=False):
     # =========================================================
 
     # Primary authoritative billing object.
-    #
-    # Example:
-    #
-    # {
-    #     "items": [
-    #         {
-    #             "product_id": 9,
-    #             "product_name": "Maggi",
-    #             "quantity": 3,
-    #             "unit_price": 15,
-    #             "line_total": 45
-    #         }
-    #     ],
-    #     "subtotal": 45,
-    #     "delivery_charge": 0,
-    #     "discount": 0,
-    #     "tax": 0,
-    #     "total": 45,
-    #     "currency": "INR"
-    # }
     billing: dict[str, Any]
 
     # Backward-compatible billing alias.

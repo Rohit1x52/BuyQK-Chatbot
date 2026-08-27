@@ -526,20 +526,9 @@ def _normalize_plan(
     # Canonical contract
     # -----------------------------------------------------
 
-    tool_name = action
-    if isinstance(action, str) and action.upper() in {
-        "ANSWER",
-        "ASK_CLARIFICATION",
-        "CONFIRM",
-        "END_CONVERSATION",
-        "START_CHECKOUT",
-        "MODIFY_CHECKOUT",
-    }:
-        tool_name = None
-
     return {
         "action": action,
-        "tool_name": tool_name,
+        "tool_name": action,
         "arguments": arguments,
         "missing_fields": missing_fields,
         "confidence": confidence,
@@ -834,7 +823,7 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         if cart_capability is None:
             return {
                 "action": "ask_clarification",
-                "tool_name": None,
+                "tool_name": "ask_clarification",
                 "arguments": {},
                 "missing_fields": ["cart_action"],
                 "confidence": 0.0,
@@ -870,7 +859,7 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         if cart_missing_fields:
             return {
                 "action": "ask_clarification",
-                "tool_name": None,
+                "tool_name": "ask_clarification",
                 "arguments": arguments,
                 "missing_fields": cart_missing_fields,
                 "confidence": 0.0,
@@ -966,33 +955,6 @@ def planner_node(
 
     This node does NOT execute backend operations.
     """
-
-    # -----------------------------------------------------
-    # Deterministic cart orchestration
-    # -----------------------------------------------------
-    # Cart mutations are transactional. Once Entity Node has
-    # deterministically understood the cart action/product/quantity,
-    # do not send the same request through a second free-form LLM.
-    # This eliminates planner JSON/tool-call failures and prevents
-    # a valid cart request from falling back to checkout clarification.
-    # -----------------------------------------------------
-    if str(state.get("intent") or "").strip().lower() == "cart":
-        plan = _deterministic_plan_fallback(state)
-        result = {
-            "planner": plan,
-            "planner_args": dict(plan.get("arguments", {})),
-            "missing_fields": list(plan.get("missing_fields", [])),
-            "cart_action": state.get("cart_action")
-                or (state.get("entities") or {}).get("cart_action"),
-            "cart_capability": plan.get("action")
-                if plan.get("action") != "ask_clarification"
-                else None,
-        }
-        print("[AI PLANNER NODE] deterministic cart plan")
-        print(f"action          = {plan.get('action')!r}")
-        print(f"arguments       = {plan.get('arguments')!r}")
-        print(f"missing_fields  = {plan.get('missing_fields')!r}")
-        return result
 
     # -----------------------------------------------------
     # Deterministic checkout orchestration
@@ -1120,15 +1082,7 @@ def planner_node(
         "action"
     )
 
-    if action is None:
-
-        plan["action"] = "answer"
-        plan["tool_name"] = None
-        plan["reason"] = (
-            "Planner returned valid JSON but omitted the action field. Defaulting to answer."
-        )
-
-    elif (
+    if (
         action is not None
         and action not in PLANNER_ACTIONS
     ):

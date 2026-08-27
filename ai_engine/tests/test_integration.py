@@ -37,13 +37,11 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 
 # =========================================================
 # Project Path
-# =========================================================
-#
-# This allows the test to work when executed directly
-# from the project root.
 # =========================================================
 
 PROJECT_ROOT = os.path.abspath(
@@ -54,10 +52,7 @@ PROJECT_ROOT = os.path.abspath(
 )
 
 if PROJECT_ROOT not in sys.path:
-    sys.path.insert(
-        0,
-        PROJECT_ROOT,
-    )
+    sys.path.insert(0, PROJECT_ROOT)
 
 
 # =========================================================
@@ -65,7 +60,6 @@ if PROJECT_ROOT not in sys.path:
 # =========================================================
 
 from sqlalchemy import create_engine
-
 from sqlalchemy.orm import sessionmaker
 
 
@@ -102,7 +96,8 @@ def create_test_database():
     """
     Create a temporary SQLite database for integration tests.
 
-    The database exists only for the duration of the test.
+    The database is isolated from the application's real
+    database.
     """
 
     temp_file = tempfile.NamedTemporaryFile(
@@ -123,15 +118,15 @@ def create_test_database():
         },
     )
 
-    # Create all model tables.
-    Base.metadata.create_all(
-        bind=engine
-    )
-
     SessionLocal = sessionmaker(
         bind=engine,
         autocommit=False,
         autoflush=False,
+    )
+
+    # Create all model tables.
+    Base.metadata.create_all(
+        bind=engine
     )
 
     db = SessionLocal()
@@ -158,8 +153,6 @@ def seed_test_data(db):
     # -----------------------------------------------------
 
     user = User(
-        # Adjust these fields if your User model has
-        # different required columns.
         name="Test User",
         email="test@buyqk.com",
         phone="9999999999",
@@ -167,7 +160,6 @@ def seed_test_data(db):
     )
 
     db.add(user)
-
     db.flush()
 
     # -----------------------------------------------------
@@ -176,7 +168,7 @@ def seed_test_data(db):
 
     address = Address(
         user_id=user.id,
-        address_line_1="123 Test Street",
+        address="123 Test Street",
         city="Jaipur",
         state="Rajasthan",
         postal_code="302001",
@@ -207,7 +199,6 @@ def seed_test_data(db):
     )
 
     db.add(category)
-
     db.flush()
 
     # -----------------------------------------------------
@@ -236,6 +227,90 @@ def seed_test_data(db):
         "address": address,
         "product": product,
     }
+
+
+# =========================================================
+# Pytest Fixtures
+# =========================================================
+
+@pytest.fixture()
+def integration_resources():
+    """
+    Create an isolated SQLite database and seed it for
+    every integration test.
+
+    This replaces the manual database setup that previously
+    existed only inside main().
+    """
+
+    db = None
+    engine = None
+    database_file = None
+
+    try:
+        (
+            db,
+            engine,
+            database_file,
+        ) = create_test_database()
+
+        data = seed_test_data(db)
+
+        yield {
+            "db": db,
+            "engine": engine,
+            "database_file": database_file,
+            "data": data,
+        }
+
+    finally:
+        if db is not None:
+            db.close()
+
+        if engine is not None:
+            engine.dispose()
+
+        if (
+            database_file
+            and os.path.exists(database_file)
+        ):
+            os.remove(database_file)
+
+
+@pytest.fixture()
+def db(integration_resources):
+    """
+    Provide the SQLAlchemy session to integration tests.
+    """
+
+    return integration_resources["db"]
+
+
+@pytest.fixture()
+def user(integration_resources):
+    """
+    Provide the seeded test user.
+    """
+
+    return integration_resources["data"]["user"]
+
+
+@pytest.fixture()
+def address(integration_resources):
+    """
+    Provide the seeded test address.
+    """
+
+    return integration_resources["data"]["address"]
+
+
+@pytest.fixture()
+def product(integration_resources):
+    """
+    Provide the seeded test product.
+    """
+
+    return integration_resources["data"]["product"]
 
 
 # =========================================================

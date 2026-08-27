@@ -16,6 +16,7 @@
 #   - Collect address/payment selections
 #   - Collect previous backend/tool results
 #   - Collect order/billing state
+#   - Collect Phase 1 task/memory state
 #
 # IMPORTANT:
 #
@@ -36,6 +37,7 @@
 #
 # =========================================================
 
+
 from __future__ import annotations
 
 from typing import Any
@@ -47,6 +49,7 @@ from ai_engine.graph.state import GraphState
 # Safe Value Helpers
 # =========================================================
 
+
 def _copy_dict(
     value: Any,
 ) -> dict[str, Any]:
@@ -57,10 +60,16 @@ def _copy_dict(
     the original GraphState dictionary.
     """
 
-    if not isinstance(value, dict):
+    if not isinstance(
+        value,
+        dict,
+    ):
+
         return {}
 
-    return dict(value)
+    return dict(
+        value
+    )
 
 
 def _copy_list(
@@ -70,15 +79,22 @@ def _copy_list(
     Return a shallow copy of a list.
     """
 
-    if not isinstance(value, list):
+    if not isinstance(
+        value,
+        list,
+    ):
+
         return []
 
-    return list(value)
+    return list(
+        value
+    )
 
 
 # =========================================================
 # Conversation Context
 # =========================================================
+
 
 def _build_conversation_context(
     state: GraphState,
@@ -93,9 +109,6 @@ def _build_conversation_context(
         "make it five"
         "same address"
         "the other order"
-
-    The history is contextual information and is NOT treated
-    as authoritative transaction state.
     """
 
     return {
@@ -109,8 +122,84 @@ def _build_conversation_context(
 
 
 # =========================================================
+# Phase 1 Task / Memory Context
+# =========================================================
+
+
+def _build_task_memory_context(
+    state: GraphState,
+) -> dict[str, Any]:
+    """
+    Build the short-term conversational task state.
+
+    This is the key Phase 1 addition.
+
+    Example:
+
+        active_task = "order_create"
+        task_status = "collecting"
+
+    This allows the AI to understand that:
+
+        "Three"
+
+    is likely a continuation of the active checkout rather
+    than a brand-new unrelated request.
+    """
+
+    return {
+        # -------------------------------------------------
+        # Current conversational task
+        # -------------------------------------------------
+
+        "active_task": state.get(
+            "active_task"
+        ),
+
+        # -------------------------------------------------
+        # Task lifecycle
+        # -------------------------------------------------
+
+        "task_status": state.get(
+            "task_status"
+        ),
+
+        # -------------------------------------------------
+        # Missing information
+        # -------------------------------------------------
+
+        "missing_fields": _copy_list(
+            state.get(
+                "missing_fields",
+                [],
+            )
+        ),
+
+        # -------------------------------------------------
+        # Selected product
+        # -------------------------------------------------
+
+        "selected_product": _copy_dict(
+            state.get(
+                "selected_product",
+                {},
+            )
+        ),
+
+        # -------------------------------------------------
+        # Last execution result
+        # -------------------------------------------------
+
+        "execution_result": state.get(
+            "execution_result"
+        ),
+    }
+
+
+# =========================================================
 # AI Understanding Context
 # =========================================================
+
 
 def _build_understanding_context(
     state: GraphState,
@@ -128,29 +217,54 @@ def _build_understanding_context(
         "intent": state.get(
             "intent"
         ),
+
         "user_goal": state.get(
             "user_goal"
         ),
+
         "detected_language": state.get(
             "detected_language"
         ),
+
         "entities": _copy_dict(
             state.get(
                 "entities",
                 {},
             )
         ),
+
         "references": _copy_dict(
             state.get(
                 "references",
                 {},
             )
         ),
+
         "missing_fields": _copy_list(
             state.get(
                 "missing_fields",
                 [],
             )
+        ),
+
+        # Phase 1 state
+        "active_task": state.get(
+            "active_task"
+        ),
+
+        "task_status": state.get(
+            "task_status"
+        ),
+
+        "selected_product": _copy_dict(
+            state.get(
+                "selected_product",
+                {},
+            )
+        ),
+
+        "execution_result": state.get(
+            "execution_result"
         ),
     }
 
@@ -158,6 +272,7 @@ def _build_understanding_context(
 # =========================================================
 # Checkout Context
 # =========================================================
+
 
 def _build_checkout_context(
     state: GraphState,
@@ -176,45 +291,58 @@ def _build_checkout_context(
         "checkout_id": state.get(
             "checkout_id"
         ),
+
         "checkout_status": state.get(
             "checkout_status"
         ),
+
         "product_id": state.get(
             "product_id"
         ),
+
         "product_name": state.get(
             "product_name"
         ),
+
         "quantity": state.get(
             "quantity"
         ),
+
         "address_id": state.get(
             "address_id"
         ),
+
         "selected_address_id": state.get(
             "selected_address_id"
         ),
+
         "selected_payment_method": state.get(
             "selected_payment_method"
         ),
+
         "payment_method": state.get(
             "payment_method"
         ),
+
         "order_created": state.get(
             "order_created",
             False,
         ),
+
         "order_creation_attempted": state.get(
             "order_creation_attempted",
             False,
         ),
+
         "checkout_completed": state.get(
             "checkout_completed",
             False,
         ),
+
         "order_id": state.get(
             "order_id"
         ),
+
         "awaiting_order_tracking_confirmation": state.get(
             "awaiting_order_tracking_confirmation",
             False,
@@ -223,8 +351,66 @@ def _build_checkout_context(
 
 
 # =========================================================
+# Cart Context
+# =========================================================
+
+
+def _build_cart_context(
+    state: GraphState,
+) -> dict[str, Any]:
+    """
+    Build backend-authoritative cart context.
+
+    Cart values are copied from GraphState.
+
+    No cart calculations are performed here.
+    """
+
+    return {
+        "cart_id": state.get(
+            "cart_id"
+        ),
+
+        "cart_status": state.get(
+            "cart_status"
+        ),
+
+        "cart_items": _copy_list(
+            state.get(
+                "cart_items",
+                [],
+            )
+        ),
+
+        "cart_summary": _copy_dict(
+            state.get(
+                "cart_summary",
+                {},
+            )
+        ),
+
+        "cart_action": state.get(
+            "cart_action"
+        ),
+
+        "cart_result": _copy_dict(
+            state.get(
+                "cart_result",
+                {},
+            )
+        ),
+
+        "cart_checkout_ready": state.get(
+            "cart_checkout_ready",
+            False,
+        ),
+    }
+
+
+# =========================================================
 # Backend / Tool Context
 # =========================================================
+
 
 def _build_backend_context(
     state: GraphState,
@@ -243,21 +429,29 @@ def _build_backend_context(
         "tool_name": state.get(
             "tool_name"
         ),
+
         "tool_result": state.get(
             "tool_result"
         ),
+
+        "execution_result": state.get(
+            "execution_result"
+        ),
+
         "transaction_error": _copy_dict(
             state.get(
                 "transaction_error",
                 {},
             )
         ),
+
         "policy_result": _copy_dict(
             state.get(
                 "policy_result",
                 {},
             )
         ),
+
         "policy_error": _copy_dict(
             state.get(
                 "policy_error",
@@ -270,6 +464,7 @@ def _build_backend_context(
 # =========================================================
 # Billing Context
 # =========================================================
+
 
 def _build_billing_context(
     state: GraphState,
@@ -296,33 +491,42 @@ def _build_billing_context(
         "billing": _copy_dict(
             billing
         ),
+
         "bill": _copy_dict(
             bill
         ),
+
         "billing_items": _copy_list(
             state.get(
                 "billing_items",
                 [],
             )
         ),
+
         "subtotal": state.get(
             "subtotal"
         ),
+
         "delivery_charge": state.get(
             "delivery_charge"
         ),
+
         "discount": state.get(
             "discount"
         ),
+
         "tax": state.get(
             "tax"
         ),
+
         "total_amount": state.get(
             "total_amount"
         ),
+
         "currency": state.get(
             "currency"
         ),
+
         "billing_payment_method": state.get(
             "billing_payment_method"
         ),
@@ -332,6 +536,7 @@ def _build_billing_context(
 # =========================================================
 # Build Complete Context
 # =========================================================
+
 
 def build_context(
     state: GraphState,
@@ -344,8 +549,10 @@ def build_context(
     domains so the AI can distinguish:
 
         conversational information
+        task/memory state
         semantic understanding
         checkout state
+        cart state
         backend results
         billing state
 
@@ -353,6 +560,7 @@ def build_context(
     """
 
     return {
+
         # -------------------------------------------------
         # Current user request
         # -------------------------------------------------
@@ -361,9 +569,11 @@ def build_context(
             "user_id": state.get(
                 "user_id"
             ),
+
             "session_id": state.get(
                 "session_id"
             ),
+
             "message": state.get(
                 "message",
                 "",
@@ -375,6 +585,14 @@ def build_context(
         # -------------------------------------------------
 
         "conversation": _build_conversation_context(
+            state
+        ),
+
+        # -------------------------------------------------
+        # Phase 1 task/memory
+        # -------------------------------------------------
+
+        "task_memory": _build_task_memory_context(
             state
         ),
 
@@ -391,6 +609,14 @@ def build_context(
         # -------------------------------------------------
 
         "checkout": _build_checkout_context(
+            state
+        ),
+
+        # -------------------------------------------------
+        # Cart
+        # -------------------------------------------------
+
+        "cart": _build_cart_context(
             state
         ),
 
@@ -416,12 +642,13 @@ def build_context(
 # Context Node
 # =========================================================
 
+
 def context_node(
     state: GraphState,
 ) -> GraphState:
     """
-    LangGraph node responsible for preparing Phase 2
-    contextual information.
+    LangGraph node responsible for preparing contextual
+    information.
 
     Input:
         GraphState

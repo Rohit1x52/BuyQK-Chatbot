@@ -87,6 +87,10 @@ from ai_engine.nodes.entity_node import (
     entity_node,
 )
 
+from ai_engine.nodes.followup_node import (
+    followup_node,
+)
+
 from ai_engine.nodes.planner_node import (
     planner_node,
 )
@@ -278,6 +282,11 @@ def build_graph(
     )
 
     graph.add_node(
+        "followup",
+        followup_node,
+    )
+
+    graph.add_node(
         "planner",
         planner_node,
     )
@@ -355,6 +364,11 @@ def build_graph(
 
     graph.add_edge(
         "entity",
+        "followup",
+    )
+
+    graph.add_edge(
+        "followup",
         "planner",
     )
 

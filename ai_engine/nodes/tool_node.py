@@ -1558,13 +1558,13 @@ def _execute_cart_mutation(
 
         updates["entities"] = {
             **entities,
-            "cart_action": None,
+            "product_id": product_id,
+            "product_name": (
+                resolved_product_name
+                or entities.get("product_name")
+            ),
+            "quantity": quantity,
         }
-        
-        # Clear the added product so next cart action starts fresh
-        updates["entities"].pop("product_id", None)
-        updates["entities"].pop("product_name", None)
-        updates["entities"].pop("quantity", None)
 
         return (
             {
@@ -1631,10 +1631,12 @@ def _execute_cart_mutation(
 
         updates["entities"] = {
             **entities,
-            "cart_action": None,
+            "product_id": product_id,
+            "product_name": (
+                resolved_product_name
+                or entities.get("product_name")
+            ),
         }
-        updates["entities"].pop("product_id", None)
-        updates["entities"].pop("product_name", None)
 
         return (
             {
@@ -1717,11 +1719,13 @@ def _execute_cart_mutation(
 
         updates["entities"] = {
             **entities,
-            "cart_action": None,
+            "product_id": product_id,
+            "product_name": (
+                resolved_product_name
+                or entities.get("product_name")
+            ),
+            "quantity": quantity,
         }
-        updates["entities"].pop("product_id", None)
-        updates["entities"].pop("product_name", None)
-        updates["entities"].pop("quantity", None)
 
         return (
             {
