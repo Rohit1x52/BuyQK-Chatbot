@@ -71,6 +71,8 @@ from typing import Any
 
 from typing_extensions import TypedDict
 
+from ai_engine.tools.results import ToolResult
+
 
 class GraphState(TypedDict, total=False):
 
@@ -322,6 +324,10 @@ class GraphState(TypedDict, total=False):
     # Result of policy validation.
     policy_result: dict[str, Any]
 
+    # Executable route produced by decision_node.
+    # This is routing state, not business logic.
+    decision_route: str | None
+
     # Structured policy error.
     policy_error: dict[str, Any] | None
 
@@ -493,7 +499,7 @@ class GraphState(TypedDict, total=False):
     #   - tracking
     #   - support
     #   - validation errors
-    tool_result: Any
+    tool_result: ToolResult | None
 
     # =========================================================
     # ORDER STATE

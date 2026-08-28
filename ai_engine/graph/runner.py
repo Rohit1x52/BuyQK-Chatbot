@@ -62,6 +62,7 @@ from sqlalchemy.orm import Session
 
 from ai_engine.graph.builder import app
 from ai_engine.memory.redis_memory import conversation_memory
+from ai_engine.tools.results import ToolResult
 
 
 # =========================================================
@@ -138,7 +139,6 @@ PERSISTED_STATE_FIELDS = (
     # -----------------------------------------------------
 
     "tool_name",
-    "tool_result",
     "execution_result",
 
     # -----------------------------------------------------
@@ -162,6 +162,7 @@ PERSISTED_STATE_FIELDS = (
     "policy_error",
     "policy",
     "decision",
+    "decision_route",
 
     # -----------------------------------------------------
     # Tool arguments
@@ -739,12 +740,18 @@ def _build_memory_metadata(
             continue
 
         try:
-
-            metadata[
-                field
-            ] = deepcopy(
-                value
-            )
+            # ToolResult is the canonical in-graph contract, but conversation
+            # memory must receive JSON-safe data.
+            if isinstance(value, ToolResult):
+                metadata[
+                    field
+                ] = value.to_dict()
+            else:
+                metadata[
+                    field
+                ] = deepcopy(
+                    value
+                )
 
         except Exception:
 
@@ -836,9 +843,11 @@ def _update_conversation_state(
     HTTP turn can resume from the same conversational state.
     """
 
-    updated = deepcopy(
-        result
-    )
+    # GraphState can contain request-scoped infrastructure objects such as
+    # a live SQLAlchemy Session.  Do not deepcopy the whole graph state.
+    # Copy only the top-level mapping; individual serializable values are
+    # copied when they are actually persisted or reused below.
+    updated = dict(result)
 
     # =====================================================
     # Read Graph Output
@@ -1003,11 +1012,14 @@ def _update_conversation_state(
     #
     # =====================================================
 
-    updated[
-        "execution_result"
-    ] = deepcopy(
-        tool_result
-    )
+    try:
+        updated[
+            "execution_result"
+        ] = deepcopy(tool_result)
+    except Exception:
+        updated[
+            "execution_result"
+        ] = tool_result
 
     # =====================================================
     # Selected Product
@@ -1042,11 +1054,14 @@ def _update_conversation_state(
 
         if product_id is not None:
 
-            selected_product[
-                "product_id"
-            ] = deepcopy(
-                product_id
-            )
+            try:
+                selected_product[
+                    "product_id"
+                ] = deepcopy(product_id)
+            except Exception:
+                selected_product[
+                    "product_id"
+                ] = product_id
 
         if (
             isinstance(
@@ -1253,6 +1268,26 @@ def run_chat(
     result = app.invoke(
         initial_state
     )
+
+    # =====================================================
+    # Validate ToolResult Contract
+    # =====================================================
+
+    tool_result = (
+        result.get("tool_result")
+        if isinstance(result, dict)
+        else None
+    )
+
+    if (
+        tool_result is not None
+        and not isinstance(tool_result, ToolResult)
+    ):
+        raise RuntimeError(
+            "Graph produced an invalid tool_result. "
+            "Expected ToolResult, got "
+            f"{type(tool_result).__name__}."
+        )
 
     # =====================================================
     # Validate Result

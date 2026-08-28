@@ -140,16 +140,18 @@ def _route_after_decision(
             No backend capability is required.
     """
 
-    tool_name = state.get(
-        "tool_name"
-    )
+    decision_route = state.get("decision_route")
 
-    if isinstance(
-        tool_name,
-        str,
-    ):
-        if tool_name.strip():
-            return "tool"
+    if isinstance(decision_route, str):
+        route = decision_route.strip().lower()
+        if route in {"tool", "response"}:
+            return route
+
+    # Compatibility with decision implementations that expose only
+    # tool_name. The graph still performs structural routing only.
+    tool_name = state.get("tool_name")
+    if isinstance(tool_name, str) and tool_name.strip():
+        return "tool"
 
     return "response"
 
