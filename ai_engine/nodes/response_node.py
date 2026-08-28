@@ -91,6 +91,7 @@ from langchain_core.messages import (
 
 from ai_engine.graph.state import GraphState
 from ai_engine.llm.client import get_llm
+from ai_engine.tools.results import ToolResult
 
 
 # =========================================================
@@ -109,6 +110,41 @@ CHECKOUT_FIELDS = (
     "quantity",
     "address_selection",
     "payment_method",
+)
+
+
+# Unicode range for Devanagari script. This is a script check, not a vocabulary list.
+_HINDI_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
+# =========================================================
+# Canonical Error Responses
+# =========================================================
+
+# These are the only customer-facing error categories supported by the
+# Response Node.  Backend/tool implementation details and raw exception
+# messages must never be exposed to the user.
+CANONICAL_ERROR_RESPONSES = {
+    "not_found": (
+        "I couldn't find the requested resource."
+    ),
+    "validation_error": (
+        "The information provided is invalid or incomplete."
+    ),
+    "backend_error": (
+        "I couldn't complete that request right now. Please try again."
+    ),
+    "conflict": (
+        "I couldn't complete that request because it conflicts with the current state."
+    ),
+    "unauthorized": (
+        "You are not authorized to perform this action."
+    ),
+}
+
+
+CANONICAL_ERROR_TYPES = frozenset(
+    CANONICAL_ERROR_RESPONSES
 )
 
 
@@ -351,21 +387,582 @@ def _get_entities(
 def _get_tool_result(
     state: GraphState,
 ) -> dict[str, Any] | None:
-    """
-    Return tool result when it is a dictionary.
-    """
-
+    """Return a presentation dictionary for the authoritative ToolResult."""
     result = state.get(
         "tool_result"
     )
 
-    if not isinstance(
+    if isinstance(
+        result,
+        ToolResult,
+    ):
+        payload = result.to_dict()
+
+        # The canonical ToolResult keeps business data under ``data``.
+        # The Response Node works with the legacy flat presentation shape.
+        if isinstance(
+            result.data,
+            dict,
+        ):
+            payload.update(
+                result.data
+            )
+
+        # Keep the presentation layer backward-compatible with the old
+        # flat ``error`` string while preserving the canonical ToolResult
+        # object in GraphState.
+        if result.error is not None:
+            payload["error"] = result.error.message
+            payload["error_code"] = result.error.code
+
+        return payload
+
+    if isinstance(
         result,
         dict,
     ):
+        return dict(result)
+
+    return None
+
+
+def _get_tool_result_object(
+    state: GraphState,
+) -> ToolResult | None:
+    """Return the canonical ToolResult object from GraphState."""
+    result = state.get(
+        "tool_result"
+    )
+
+    if isinstance(
+        result,
+        ToolResult,
+    ):
+        return result
+
+    return None
+
+
+
+def _extract_canonical_error_code(
+    tool_result: Any,
+) -> str | None:
+    """
+    Extract a canonical error code from a ToolResult presentation payload.
+
+    The canonical ToolResult stores structured errors as ``error.code``.
+    The presentation payload may also expose the backward-compatible
+    flattened ``error_code`` field.
+
+    Only the five supported canonical categories are accepted. Unknown
+    codes deliberately return ``None`` so legacy fallback behavior remains
+    available without accidentally presenting an internal error category.
+    """
+
+    if not isinstance(tool_result, dict):
         return None
 
-    return result
+    code = tool_result.get("error_code")
+
+    if not isinstance(code, str):
+        error = tool_result.get("error")
+
+        if isinstance(error, dict):
+            code = error.get("code")
+        else:
+            code = getattr(error, "code", None)
+
+    if not isinstance(code, str):
+        return None
+
+    code = code.strip().lower()
+
+    if code in CANONICAL_ERROR_TYPES:
+        return code
+
+    return None
+
+
+def _canonical_error_response(
+    tool_result: Any,
+) -> str | None:
+    """
+    Return the fixed customer-facing response for a canonical error.
+
+    The Response Node intentionally does not expose the backend's raw error
+    message. The canonical category determines the customer-facing wording.
+    """
+
+    code = _extract_canonical_error_code(
+        tool_result
+    )
+
+    if code is None:
+        return None
+
+    return CANONICAL_ERROR_RESPONSES[code]
+
+
+# =========================================================
+# Response Language
+# =========================================================
+
+_SUPPORTED_RESPONSE_LANGUAGES = frozenset(
+    {
+        "english",
+        "hindi",
+        "hinglish",
+    }
+)
+
+
+def _normalize_response_language(value: Any) -> str | None:
+    """
+    Normalize an explicitly supplied response language.
+
+    Language understanding itself is delegated to the LLM. This helper only
+    validates the small set of response-language values supported by the
+    application contract.
+    """
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().lower()
+
+    aliases = {
+        "en": "english",
+        "eng": "english",
+        "english": "english",
+        "hi": "hindi",
+        "hin": "hindi",
+        "hindi": "hindi",
+        "hinglish": "hinglish",
+        "hi-en": "hinglish",
+        "en-hi": "hinglish",
+        "hindi-english": "hinglish",
+    }
+
+    return aliases.get(normalized)
+
+
+def _parse_detected_response_language(value: Any) -> str | None:
+    """
+    Extract a supported language value from an LLM response.
+
+    The LLM is responsible for understanding the actual language of the
+    conversation. No language-vocabulary dictionary is maintained here.
+    """
+    text = _extract_text_content(value).strip()
+
+    if not text:
+        return None
+
+    normalized = _normalize_response_language(text)
+    if normalized:
+        return normalized
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        for key in ("response_language", "language", "detected_language"):
+            language = _normalize_response_language(payload.get(key))
+            if language:
+                return language
+
+    # Allow a model to return a small JSON object wrapped in markdown.
+    match = re.search(
+        r'"(?:response_language|language|detected_language)"\s*:\s*"([^"]+)"',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        return _normalize_response_language(match.group(1))
+
+    return None
+
+
+def _message_tokens(message: Any) -> list[str]:
+    """Return normalized word tokens for deterministic language heuristics."""
+    if not isinstance(message, str):
+        return []
+
+    return re.findall(
+        r"[A-Za-z]+(?:'[A-Za-z]+)?",
+        message.lower(),
+    )
+
+
+_ROMAN_HINDI_MARKERS = frozenset({
+    "mujhe", "mujhko", "mera", "meri", "mere", "aap", "aapko",
+    "kya", "kaise", "kaisa", "kitna", "kitne", "kitni",
+    "chahiye", "chaahiye", "karo", "karna", "kar", "do", "hai",
+    "hain", "tha", "thi", "the", "mein", "me", "ko", "se",
+    "par", "pe", "wala", "wali", "wale", "yeh", "yah", "woh",
+    "wo", "aur", "bhi", "nahi", "nahin", "haan", "ji", "dikhao",
+    "batao", "bhejo", "kaunsa", "kaunsi", "kitni", "chahunga",
+    "chahenge",
+})
+
+_ENGLISH_MIX_MARKERS = frozenset({
+    "please", "help", "need", "want", "find", "show", "order",
+    "cart", "add", "remove", "product", "size", "quantity",
+    "payment", "address",
+})
+
+
+_RESPONSE_LANGUAGE_SYSTEM_PROMPT = """
+You are the language-understanding component of BuyQK AI.
+
+Determine the language in which BuyQK should respond to the user.
+
+Return exactly one JSON object:
+{"response_language":"english"}
+or
+{"response_language":"hindi"}
+or
+{"response_language":"hinglish"}
+
+Definitions:
+- english: the user is communicating primarily in English.
+- hindi: the user is communicating primarily in Hindi, including Hindi
+  written with Latin/Roman characters.
+- hinglish: the user substantially mixes Hindi and English in the same
+  conversational message.
+
+Important:
+- Understand the complete message semantically. Do not rely on a fixed
+  keyword list.
+- Product names, brand names, numbers, units, names, URLs, SKUs, and other
+  domain terms do not by themselves determine the response language.
+- Roman-script Hindi is Hindi when the underlying sentence is predominantly
+  Hindi.
+- Use conversation history when the current message is too short or
+  language-neutral to determine the language on its own.
+- A short follow-up such as a number, quantity, confirmation, or selection
+  should inherit the language of the relevant recent conversation.
+- Do not use the assistant's own previous wording as the primary signal when
+  a user's recent message provides a clearer signal.
+- If there is not enough evidence, choose english.
+- Return JSON only.
+"""
+
+
+def _detect_response_language(
+    state: GraphState,
+) -> str:
+    """Detect the response language once for the current turn.
+
+    Explicit graph state wins. For direct/unit callers, a small deterministic
+    linguistic signal handles clear Roman-Hindi/Hinglish cases before the LLM
+    classifier is used for ambiguous messages.
+    """
+    if not isinstance(state, dict):
+        return "english"
+
+    explicit = _normalize_response_language(state.get("response_language"))
+    if explicit:
+        return explicit
+
+    current = state.get("message", "")
+    tokens = set(_message_tokens(current))
+
+    # Devanagari is unambiguous Hindi.
+    if isinstance(current, str) and _HINDI_DEVANAGARI_RE.search(current):
+        return "hindi"
+
+    hindi_hits = tokens & _ROMAN_HINDI_MARKERS
+    english_mix_hits = tokens & _ENGLISH_MIX_MARKERS
+
+    # Clear mixed Roman-Hindi + English usage is Hinglish.
+    if hindi_hits and english_mix_hits:
+        return "hinglish"
+
+    # Clear Roman-Hindi without English mixing is Hindi.
+    if hindi_hits:
+        return "hindi"
+
+    history = state.get("conversation_history", [])
+    recent_history = list(history)[-8:] if isinstance(history, (list, tuple)) else []
+
+    # Ambiguous/neutral messages can inherit a language from explicit recent
+    # user turns without making another model call.
+    for item in reversed(recent_history):
+        if isinstance(item, dict):
+            text = item.get("message") or item.get("content") or item.get("text") or ""
+        else:
+            text = getattr(item, "content", item if isinstance(item, str) else "")
+
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        prior_tokens = set(_message_tokens(text))
+        if _HINDI_DEVANAGARI_RE.search(text):
+            return "hindi"
+        if prior_tokens & _ROMAN_HINDI_MARKERS:
+            if prior_tokens & _ENGLISH_MIX_MARKERS:
+                return "hinglish"
+            return "hindi"
+        if prior_tokens:
+            return "english"
+
+    # English is the safe default for language-neutral messages.
+    return "english"
+
+
+# =========================================================
+# Language presentation helpers
+# =========================================================
+
+_LANGUAGE_INSTRUCTIONS = {
+    "english": (
+        "Respond in English. Keep the response concise, professional, and natural."
+    ),
+    "hindi": (
+        "Respond in natural Hindi. Keep the response concise and professional. "
+        "Preserve product names, IDs, quantities, prices, statuses, and other "
+        "authoritative values exactly as supplied."
+    ),
+    "hinglish": (
+        "Respond in natural Hinglish using Roman-script Hindi with English "
+        "shopping terms where natural. Preserve product names, IDs, quantities, "
+        "prices, statuses, and other authoritative values exactly as supplied."
+    ),
+}
+
+
+def _response_language_for_generation(state: GraphState) -> str:
+    """
+    Return the already-established response language without making another
+    LLM call.
+
+    response_node() establishes response_language once per turn. Direct unit
+    callers that do not provide it safely use English rather than triggering
+    a hidden second LLM request.
+    """
+    if isinstance(state, dict):
+        language = _normalize_response_language(
+            state.get("response_language")
+        )
+        if language:
+            return language
+
+    return "english"
+
+
+def _language_instruction(state: GraphState) -> str:
+    """Return the presentation instruction for an already-selected language."""
+    language = _response_language_for_generation(state)
+    return _LANGUAGE_INSTRUCTIONS[language]
+
+
+def _adapt_deterministic_response(
+    response: Any,
+    state: GraphState,
+) -> str:
+    """
+    Adapt deterministic fallback wording to the selected language.
+
+    This function never changes authoritative backend values. It only maps
+    Response Node's own fixed fallback phrases; product names and other
+    supplied values are preserved when they occur in a context-specific
+    response.
+    """
+    text = _extract_text_content(response).strip()
+    if not text:
+        return ""
+
+    language = _response_language_for_generation(state)
+    if language == "english":
+        return text
+
+    # Context-specific responses containing authoritative product names need
+    # to retain those values while changing only the surrounding wording.
+    if language == "hindi":
+        replacements = (
+            ("has been added to your cart.", "aapke cart mein add kar diya gaya hai."),
+            ("has been removed from your cart.", "aapke cart se remove kar diya gaya hai."),
+            ("The item has been added to your cart.", "Item aapke cart mein add kar diya gaya hai."),
+            ("The item has been removed from your cart.", "Item aapke cart se remove kar diya gaya hai."),
+            ("Your cart has been cleared.", "Aapka cart clear kar diya gaya hai."),
+            ("Your cart is empty.", "Aapka cart empty hai."),
+            ("Here is your current cart.", "Yeh aapka current cart hai."),
+            ("Your cart has been updated.", "Aapka cart update kar diya gaya hai."),
+            ("Your cart request was completed.", "Aapka cart request complete ho gaya hai."),
+            ("The request was completed.", "Request complete ho gayi hai."),
+            ("I couldn't complete that request.", "Main yeh request complete nahi kar saka."),
+            ("I couldn't find matching products.", "Mujhe matching products nahi mile."),
+            ("I found these matching products: ", "Mujhe yeh matching products mile: "),
+            ("How many would you like?", "Aapko kitni quantity chahiye?"),
+            ("Please specify the quantity.", "Kripya quantity specify kijiye."),
+            ("How many packs of ", "Aapko kitne packs of "),
+            (" would you like?", " chahiye?"),
+            ("Please select a delivery address.", "Kripya delivery address select kijiye."),
+            ("Please select a payment method.", "Kripya payment method select kijiye."),
+            ("Which product would you like?", "Aap kaunsa product chahenge?"),
+        )
+    else:
+        replacements = (
+            ("has been added to your cart.", "aapke cart mein add ho gaya hai."),
+            ("has been removed from your cart.", "aapke cart se remove ho gaya hai."),
+            ("The item has been added to your cart.", "Item aapke cart mein add ho gaya hai."),
+            ("The item has been removed from your cart.", "Item aapke cart se remove ho gaya hai."),
+            ("Your cart has been cleared.", "Aapka cart clear ho gaya hai."),
+            ("Your cart is empty.", "Aapka cart empty hai."),
+            ("Here is your current cart.", "Yeh aapka current cart hai."),
+            ("Your cart has been updated.", "Aapka cart update ho gaya hai."),
+            ("Your cart request was completed.", "Aapka cart request complete ho gaya hai."),
+            ("The request was completed.", "Request complete ho gayi hai."),
+            ("I couldn't complete that request.", "Yeh request complete nahi ho paayi."),
+            ("I couldn't find matching products.", "Matching products nahi mile."),
+            ("I found these matching products: ", "Yeh matching products mile: "),
+            ("How many would you like?", "Kitni quantity chahiye?"),
+            ("Please specify the quantity.", "Quantity specify kijiye."),
+            ("How many packs of ", "Kitne packs of "),
+            (" would you like?", " chahiye?"),
+            ("Please select a delivery address.", "Delivery address select kijiye."),
+            ("Please select a payment method.", "Payment method select kijiye."),
+            ("Which product would you like?", "Kaunsa product chahiye?"),
+        )
+
+    adapted = text
+    for source, target in replacements:
+        adapted = adapted.replace(source, target)
+
+    return adapted
+
+
+def _context_value(
+    state: GraphState,
+    field: str,
+) -> Any:
+    """Return a known conversational value from state or entities.
+
+    Direct GraphState values take precedence over entity values.
+    """
+    if not isinstance(state, dict):
+        return None
+
+    direct = state.get(field)
+    if _has_value(direct):
+        return direct
+
+    entities = _get_entities(state)
+    value = entities.get(field)
+    if _has_value(value):
+        return value
+
+    return None
+
+
+def _context_aware_response_context(
+    state: GraphState,
+    missing_fields: list[str],
+    next_missing: str | None,
+) -> dict[str, Any]:
+    """
+    Build presentation context from the information already known
+    by the graph.
+
+    This helper does not decide workflow or mutate state.
+    """
+
+    entities = _get_entities(state)
+
+    known_fields: dict[str, Any] = {}
+
+    candidate_fields = (
+        "product_name",
+        "product_id",
+        "quantity",
+        "size",
+        "variant",
+        "brand",
+        "address_selection",
+        "payment_method",
+    )
+
+    for field in candidate_fields:
+        value = _context_value(
+            state,
+            field,
+        )
+
+        if _has_value(value):
+            known_fields[field] = value
+
+    return {
+        "known_fields": known_fields,
+        "entities": entities,
+        "missing_fields": list(missing_fields),
+        "next_missing": next_missing,
+        "current_message": state.get(
+            "message",
+            "",
+        ),
+    }
+
+
+def _context_aware_missing_field_fallback(
+    state: GraphState,
+    next_missing: str | None,
+) -> str:
+    """Build a deterministic missing-field question from known graph state."""
+    product_name = _context_value(state, "product_name")
+    product_text = str(product_name).strip() if _has_value(product_name) else None
+
+    if next_missing == "product_name":
+        return "Which product would you like?"
+
+    if next_missing == "quantity":
+        if product_text:
+            return (
+                f"How many packs of {product_text} would you like? "
+                "Please specify the quantity."
+            )
+        return "How many would you like?"
+
+    if next_missing in {"size", "variant_size", "product_size"}:
+        if product_text:
+            return f"Which size of {product_text} would you like?"
+        return "Which size would you like?"
+
+    if next_missing == "address_selection":
+        return "Please select a delivery address."
+
+    if next_missing == "payment_method":
+        return "Please select a payment method."
+
+    return _checkout_fallback(next_missing)
+
+
+def _localized_context_fallback(
+    state: GraphState,
+    next_missing: str | None,
+) -> str:
+    """Return a context-aware fallback in the detected conversation language.
+
+    Direct callers/tests may invoke this helper without going through
+    response_node(), so establish the language once on a shallow state copy.
+    No additional LLM call is made here.
+    """
+    if not isinstance(state, dict):
+        state = {}
+
+    selected = _detect_response_language(state)
+    localized_state = dict(state)
+    localized_state["response_language"] = selected
+
+    return _adapt_deterministic_response(
+        _context_aware_missing_field_fallback(
+            localized_state,
+            next_missing,
+        ),
+        localized_state,
+    )
 
 
 # =========================================================
@@ -693,9 +1290,19 @@ Treat these as authoritative workflow state.
 
 Ask only for next_missing.
 
+Generate the response in the supplied response_language. Do not translate
+authoritative values unless appropriate for natural user-facing wording.
+
 If backend/tool results provide options, use only those options.
 
 Keep the response concise and natural.
+
+Response language:
+- Generate the final response in the response_language supplied in the
+  current state/context.
+- Follow the detected language naturally.
+- Do not translate product names, brand names, IDs, SKUs, URLs, or other
+  authoritative backend values unless the user-facing context requires it.
 
 Never mention:
 - planner
@@ -715,36 +1322,33 @@ def _generate_checkout_response(
     next_missing: str | None,
     metadata: dict[str, Any],
 ) -> str:
-    """
-    Generate checkout wording deterministically.
+    """Generate wording for the graph-selected missing field."""
+    existing = state.get("follow_up_question")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
 
-    Checkout sequencing is graph-controlled. The Response Node must not
-    ask an LLM to decide which field comes next.
+    context = {
+        "current_message": state.get("message", ""),
+        "conversation_history": state.get("conversation_history", []),
+        "entities": _get_entities(state),
+        "missing_fields": missing_fields,
+        "next_missing": next_missing,
+        "backend_options": _get_tool_result(state),
+        "response_language": _response_language_for_generation(state),
+        "language_instruction": _language_instruction(state),
+    }
+    try:
+        response = llm.invoke([
+            SystemMessage(content=CHECKOUT_RESPONSE_SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps(context, ensure_ascii=False, default=str)),
+        ])
+        text = _sanitize_user_response(response)
+        if text:
+            return text.splitlines()[0].strip()
+    except Exception as exc:
+        print(f"[CHECKOUT RESPONSE ERROR] {type(exc).__name__}: {exc}")
 
-    This also prevents model reasoning (<think>...</think>) from leaking
-    into checkout responses.
-    """
-    entities = _get_entities(state)
-    product_name = entities.get("product_name")
-
-    if next_missing == "product_name":
-        return "Which product would you like?"
-
-    if next_missing == "quantity":
-        if isinstance(product_name, str) and product_name.strip():
-            return (
-                f"How many packs of "
-                f"{product_name.strip()} would you like?"
-            )
-        return "How many would you like?"
-
-    if next_missing == "address_selection":
-        return "Please select a delivery address."
-
-    if next_missing == "payment_method":
-        return "Please select a payment method."
-
-    return _checkout_fallback(next_missing)
+    return _localized_context_fallback(state, next_missing)
 
 
 def _checkout_fallback(
@@ -1120,8 +1724,13 @@ For support:
 - use only returned ticket information
 
 For errors:
-- explain the actual error when safe to expose
-- do not expose internal implementation details
+- recognize the canonical error category when provided
+- not_found: explain that the requested resource could not be found
+- validation_error: explain that the supplied information is invalid or incomplete
+- backend_error: give a generic service error without exposing internals
+- conflict: explain that the requested operation conflicts with the current state
+- unauthorized: explain that the user is not authorized
+- never expose raw backend exceptions or internal implementation details
 
 Keep responses concise and natural.
 
@@ -1191,6 +1800,8 @@ def _generate_llm_response(
             )
             or []
         ),
+        "response_language": _response_language_for_generation(state),
+        "language_instruction": _language_instruction(state),
     }
 
     prompt = f"""
@@ -1203,6 +1814,8 @@ Current state:
 Remember:
 - backend/tool data is authoritative
 - graph workflow is authoritative
+- generate the response in the supplied response_language
+- do not infer response language from hardcoded vocabulary
 - do not invent missing information
 - do not change workflow
 - do not expose internal architecture
@@ -1235,12 +1848,206 @@ Remember:
             f" {type(exc).__name__}: {exc}"
         )
 
-    return _general_fallback(
-        state.get(
-            "message",
-            "",
-        )
+    return _adapt_deterministic_response(
+        _general_fallback(
+            state.get(
+                "message",
+                "",
+            )
+        ),
+        state,
     )
+
+
+# =========================================================
+# Step 2 — Successful Tool Responses
+# =========================================================
+
+
+def _success_response_from_tool(
+    tool_result: dict[str, Any],
+    tool_name: str | None = None,
+) -> str:
+    """Generate deterministic responses for successful shopping operations."""
+
+    if not isinstance(tool_result, dict):
+        return "The request was completed."
+
+    if tool_result.get("success") is not True:
+        canonical_response = _canonical_error_response(
+            tool_result
+        )
+
+        if canonical_response:
+            return canonical_response
+
+        return "I couldn't complete that request."
+
+    result_type = tool_result.get("type")
+    action = tool_result.get("action")
+
+    # =====================================================
+    # SEARCH PRODUCTS
+    # =====================================================
+
+    if (
+        tool_name == "search_products"
+        or tool_result.get("tool") == "search_products"
+        or result_type == "product_search"
+    ):
+        products = tool_result.get(
+            "products",
+            [],
+        )
+
+        if not isinstance(products, list):
+            return "I couldn't find matching products."
+
+        names: list[str] = []
+
+        for product in products:
+            if isinstance(product, dict):
+                name = product.get("name")
+            else:
+                name = getattr(
+                    product,
+                    "name",
+                    None,
+                )
+
+            if (
+                isinstance(name, str)
+                and name.strip()
+            ):
+                names.append(
+                    name.strip()
+                )
+
+        if names:
+            return (
+                "I found these matching products: "
+                + ", ".join(names)
+                + "."
+            )
+
+        return "I couldn't find matching products."
+
+    # =====================================================
+    # ADD TO CART
+    # =====================================================
+
+    if (
+        tool_name == "add_to_cart"
+        or tool_result.get("tool") == "add_to_cart"
+        or (
+            result_type in {
+                "cart_add",
+                "cart_updated",
+            }
+            and action in {
+                "add_item",
+                "add_to_cart",
+            }
+        )
+    ):
+        product_name = tool_result.get(
+            "product_name"
+        )
+
+        quantity = tool_result.get(
+            "quantity"
+        )
+
+        if (
+            isinstance(product_name, str)
+            and product_name.strip()
+        ):
+            if quantity is not None:
+                return (
+                    f"{quantity} × "
+                    f"{product_name.strip()} "
+                    "has been added to your cart."
+                )
+
+            return (
+                f"{product_name.strip()} "
+                "has been added to your cart."
+            )
+
+        return "The item has been added to your cart."
+
+    # =====================================================
+    # REMOVE FROM CART
+    # =====================================================
+
+    if (
+        tool_name == "remove_from_cart"
+        or tool_result.get("tool") == "remove_from_cart"
+        or (
+            result_type in {
+                "cart_remove",
+                "cart_updated",
+            }
+            and action in {
+                "remove_item",
+                "remove_from_cart",
+            }
+        )
+    ):
+        product_name = tool_result.get(
+            "product_name"
+        )
+
+        if (
+            isinstance(product_name, str)
+            and product_name.strip()
+        ):
+            return (
+                f"{product_name.strip()} "
+                "has been removed from your cart."
+            )
+
+        return (
+            "The item has been removed from your cart."
+        )
+
+    # =====================================================
+    # GET CART
+    # =====================================================
+
+    if (
+        tool_name == "get_cart"
+        or tool_result.get("tool") == "get_cart"
+        or result_type in {
+            "cart_view",
+            "cart",
+        }
+    ):
+        cart = tool_result.get(
+            "cart"
+        )
+
+        if isinstance(
+            cart,
+            dict,
+        ):
+            items = cart.get(
+                "items"
+            )
+
+            if (
+                isinstance(items, list)
+                and not items
+            ):
+                return "Your cart is empty."
+
+        return "Here is your current cart."
+
+    # =====================================================
+    # GENERIC SUCCESS
+    # =====================================================
+
+    return "The request was completed."
 
 
 # =========================================================
@@ -1298,6 +2105,8 @@ def _generate_tool_response(
             )
             or []
         ),
+        "response_language": _response_language_for_generation(state),
+        "language_instruction": _language_instruction(state),
     }
 
     prompt = f"""
@@ -1310,7 +2119,9 @@ State:
 Rules:
 
 1. Treat tool_result as authoritative.
-2. If success is false, explain the failure clearly.
+2. If success is false and a canonical error_code is present, use the canonical category response and do not expose the raw error message.
+3. Canonical error categories are exactly: not_found, validation_error, backend_error, conflict, unauthorized.
+4. If the category is not canonical, preserve the existing safe fallback behavior.
 3. If an order was created:
    - use the supplied order ID
    - use the supplied bill
@@ -1332,6 +2143,7 @@ Rules:
 8. For support, report only the supplied ticket information.
 9. For product search, use only returned products.
 10. Do not mention internal implementation.
+11. For product search, explicitly mention the returned product names when names are present in tool_result.products. Do not replace them with a generic statement.
 
 Return ONLY the user-facing response.
 Never output <think>, <analysis>, chain-of-thought, internal reasoning,
@@ -1396,6 +2208,13 @@ def _tool_fallback(
 
     if success is False:
 
+        canonical_response = _canonical_error_response(
+            tool_result
+        )
+
+        if canonical_response:
+            return canonical_response
+
         error = (
             tool_result.get(
                 "error"
@@ -1405,6 +2224,8 @@ def _tool_fallback(
             )
         )
 
+        # Legacy fallback: preserve existing behavior when a result does
+        # not carry one of the supported canonical error categories.
         if error:
             return str(
                 error
@@ -1413,6 +2234,44 @@ def _tool_fallback(
         return (
             "I couldn't complete that request."
         )
+
+    # -----------------------------------------------------
+    # Cart add / remove
+    # -----------------------------------------------------
+
+    if (
+        tool_result.get("tool") == "add_to_cart"
+        or (
+            result_type in {"cart_add", "cart_updated"}
+            and tool_result.get("action") in {
+                None,
+                "add_item",
+                "add_to_cart",
+            }
+        )
+    ):
+        product_name = tool_result.get("product_name")
+        quantity = tool_result.get("quantity")
+        if isinstance(product_name, str) and product_name.strip():
+            if quantity is not None:
+                return f"{quantity} × {product_name.strip()} has been added to your cart."
+            return f"{product_name.strip()} has been added to your cart."
+        return "The item has been added to your cart."
+
+    if (
+        tool_result.get("tool") == "remove_from_cart"
+        or (
+            result_type in {"cart_remove", "cart_updated"}
+            and tool_result.get("action") in {
+                "remove_item",
+                "remove_from_cart",
+            }
+        )
+    ):
+        product_name = tool_result.get("product_name")
+        if isinstance(product_name, str) and product_name.strip():
+            return f"{product_name.strip()} has been removed from your cart."
+        return "The item has been removed from your cart."
 
     # -----------------------------------------------------
     # Order
@@ -1553,18 +2412,24 @@ def _tool_fallback(
             [],
         )
 
-        if isinstance(
-            products,
-            list
-        ) and products:
+        if isinstance(products, list) and products:
+            names: list[str] = []
+            for product in products:
+                if isinstance(product, dict):
+                    name = product.get("name")
+                else:
+                    name = getattr(product, "name", None)
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
 
-            return (
-                "I found matching products for you."
-            )
+            if names:
+                # Product names are copied from the authoritative tool result;
+                # no catalog value is embedded in the Response Node.
+                return "I found these matching products: " + ", ".join(names) + "."
 
-        return (
-            "I couldn't find matching products."
-        )
+            return "I found matching products for you."
+
+        return "I couldn't find matching products."
 
     # -----------------------------------------------------
     # Address
@@ -1945,6 +2810,13 @@ def _cart_fallback(
     cart = _get_cart(tool_result)
 
     if success is False:
+        canonical_response = _canonical_error_response(
+            tool_result
+        )
+
+        if canonical_response:
+            return canonical_response
+
         return str(
             tool_result.get("error")
             or tool_result.get("message")
@@ -2026,16 +2898,27 @@ def response_node(
     intent = state.get("intent", "general")
     tool_name = state.get("tool_name")
     message = str(state.get("message", "") or "")
-    tool_result = _get_tool_result(state)
 
-    missing_fields = _get_missing_fields(state)
+    # Language is presentation context. Detect it once so every response
+    # path uses the same language decision.
+    response_language = _detect_response_language(state)
+
+    # Keep the original graph state immutable while making the detected
+    # language available to all presentation helpers.
+    presentation_state = dict(state)
+    presentation_state["response_language"] = response_language
+
+    tool_result_object = _get_tool_result_object(presentation_state)
+    tool_result = _get_tool_result(presentation_state)
+
+    missing_fields = _get_missing_fields(presentation_state)
     next_missing = _get_next_missing(
-        state,
+        presentation_state,
         missing_fields,
     )
 
     metadata = dict(
-        state.get("metadata", {}) or {}
+        presentation_state.get("metadata", {}) or {}
     )
 
     # ---------------------------------------------------------
@@ -2048,7 +2931,7 @@ def response_node(
         "follow_up_question"
     )
     awaiting_user_input = bool(
-        state.get("awaiting_user_input")
+        presentation_state.get("awaiting_user_input")
     )
     current_missing_field = state.get(
         "current_missing_field"
@@ -2076,6 +2959,8 @@ def response_node(
 
         return {
             "response": question,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": metadata,
             "missing_fields": missing_fields,
             "next_missing": current_missing_field,
@@ -2108,7 +2993,7 @@ def response_node(
         order_id = tool_result.get("order_id")
 
         order_metadata = _order_success_metadata(
-            state,
+            presentation_state,
             tool_result,
         )
 
@@ -2120,6 +3005,8 @@ def response_node(
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": order_metadata,
             "missing_fields": [],
             "next_missing": None,
@@ -2164,7 +3051,15 @@ def response_node(
                 missing_fields,
             )
         else:
-            response = _generate_tool_response(state)
+            response = _success_response_from_tool(
+                tool_result,
+                tool_name,
+            )
+
+            # Step 2 success paths are deterministic. Other cart
+            # operations retain their existing presentation behavior.
+            if not response:
+                response = _generate_tool_response(presentation_state)
 
             if not response:
                 response = _cart_fallback(tool_result)
@@ -2195,6 +3090,8 @@ def response_node(
 
         result: dict[str, Any] = {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": cart_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2218,10 +3115,43 @@ def response_node(
         return result
 
     # ---------------------------------------------------------
+    # Canonical tool error
+    #
+    # Handle canonical failures before checkout UI rendering. A failed
+    # operation must never be presented as if the checkout step succeeded.
+    # ---------------------------------------------------------
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is False
+        and _extract_canonical_error_code(tool_result) is not None
+    ):
+        response = _canonical_error_response(tool_result)
+        failure_metadata = _clean_checkout_metadata(
+            metadata,
+            next_missing,
+        )
+
+        failure_metadata["missing_fields"] = missing_fields
+
+        if next_missing is not None:
+            failure_metadata["next_missing"] = next_missing
+        else:
+            failure_metadata.pop("next_missing", None)
+
+        return {
+            "response": response or "I couldn't complete that request.",
+            "tool_result": tool_result_object,
+            "metadata": failure_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+    # ---------------------------------------------------------
     # 3. Checkout UI
     #
     # The graph has already selected next_missing.
     # Response Node only renders it.
+    # A stable fallback is used when the presentation LLM is unavailable.
     # ---------------------------------------------------------
     checkout_metadata = _checkout_metadata(
         state,
@@ -2248,6 +3178,8 @@ def response_node(
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2264,13 +3196,13 @@ def response_node(
         and tool_result.get("success") is True
         and tool_result.get("type") == "tracking"
     ):
-        response = _generate_tool_response(state)
+        response = _generate_tool_response(presentation_state)
 
         if not response:
             response = _tool_fallback(tool_result)
 
         tracking_metadata = _tool_metadata(
-            state,
+            presentation_state,
             missing_fields,
         )
 
@@ -2281,6 +3213,8 @@ def response_node(
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": tracking_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2318,23 +3252,33 @@ def response_node(
             }
 
         if products:
-            response = _generate_tool_response(state)
+            # Step 2: successful product search is deterministic.
+            # Product identities come directly from Tool Node output.
+            response = _success_response_from_tool(
+                tool_result,
+                tool_name,
+            )
+
             if not response:
-                response = "I found these products for you."
+                response = _tool_fallback(tool_result)
         else:
-            response = "I couldn't find matching products."
+            response = _success_response_from_tool(
+                tool_result,
+                tool_name,
+            )
+
+            if not response:
+                response = "I couldn't find matching products."
 
         response = _sanitize_user_response(response)
 
         if not response:
-            response = (
-                "I found these products for you."
-                if products
-                else "I couldn't find matching products."
-            )
+            response = _tool_fallback(tool_result)
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": product_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2355,18 +3299,26 @@ def response_node(
     # ---------------------------------------------------------
     policy_error = state.get("policy_error")
     if isinstance(policy_error, dict) and policy_error.get("allowed") is False:
-        reason = str(policy_error.get("reason") or "").strip().lower()
-        policy_messages = {
-            "missing_checkout_id": "The checkout session is missing. Please restart your checkout so I can place the order safely.",
-            "checkout_already_completed": "This checkout has already been completed.",
-            "checkout_incomplete": "The checkout is not complete yet. Please provide the remaining checkout details.",
-        }
-        response = policy_messages.get(
-            reason,
-            "I couldn't continue with that transaction. Please provide the required checkout information.",
-        )
+        reason = str(policy_error.get("reason") or "").strip()
+        try:
+            response = _sanitize_user_response(
+                _generate_llm_response({
+                    **state,
+                    "policy_error": policy_error,
+                    "policy_failure_reason": reason,
+                })
+            )
+        except Exception:
+            response = ""
+        if not response:
+            response = str(
+                policy_error.get("message")
+                or "I could not continue with that request."
+            )
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": _clean_checkout_metadata(metadata, next_missing),
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2382,18 +3334,26 @@ def response_node(
         isinstance(tool_result, dict)
         and tool_result.get("success") is False
     ):
-        if tool_result.get("type") in cart_result_types:
-            response = _cart_fallback(tool_result)
-        else:
-            error = (
-                tool_result.get("error")
-                or tool_result.get("message")
-            )
-            response = (
-                str(error)
-                if error
-                else "I couldn't complete that request."
-            )
+        # Canonical error categories always take precedence over legacy
+        # result-type fallbacks. This guarantees consistent customer-facing
+        # behavior regardless of which tool produced the failure.
+        response = _canonical_error_response(
+            tool_result
+        )
+
+        if not response:
+            if tool_result.get("type") in cart_result_types:
+                response = _cart_fallback(tool_result)
+            else:
+                error = (
+                    tool_result.get("error")
+                    or tool_result.get("message")
+                )
+                response = (
+                    str(error)
+                    if error
+                    else "I couldn't complete that request."
+                )
 
         failure_metadata = _clean_checkout_metadata(
             metadata,
@@ -2411,7 +3371,8 @@ def response_node(
 
         if not response:
             response = (
-                str(
+                _canonical_error_response(tool_result)
+                or str(
                     tool_result.get("error")
                     or tool_result.get("message")
                     or "I couldn't complete that request."
@@ -2420,6 +3381,8 @@ def response_node(
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": failure_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2432,13 +3395,13 @@ def response_node(
         isinstance(tool_result, dict)
         and tool_result.get("success") is True
     ):
-        response = _generate_tool_response(state)
+        response = _generate_tool_response(presentation_state)
 
         if not response:
             response = _tool_fallback(tool_result)
 
         tool_metadata = _tool_metadata(
-            state,
+            presentation_state,
             missing_fields,
         )
 
@@ -2461,6 +3424,8 @@ def response_node(
 
         return {
             "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
             "metadata": tool_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
@@ -2473,11 +3438,10 @@ def response_node(
         intent == "general"
         and _is_greeting(message)
     ):
+        response = _sanitize_user_response(_generate_llm_response(presentation_state))
         return {
-            "response": (
-                "Hello! I'm BuyQK AI. "
-                "How can I help you today?"
-            ),
+            "response": response or "How can I help you?",
+            "tool_result": tool_result_object,
             "metadata": {},
             "missing_fields": [],
             "next_missing": None,
@@ -2487,7 +3451,7 @@ def response_node(
     # 9. General conversation
     # ---------------------------------------------------------
     response = _sanitize_user_response(
-        _generate_llm_response(state)
+        _generate_llm_response(presentation_state)
     )
 
     if not response:
@@ -2507,6 +3471,8 @@ def response_node(
 
     return {
         "response": response,
+            "response_language": response_language,
+        "tool_result": tool_result_object,
         "metadata": metadata,
         "missing_fields": missing_fields,
         "next_missing": next_missing,
@@ -2532,4 +3498,15 @@ def generate_response(
 __all__ = [
     "response_node",
     "generate_response",
+    "_success_response_from_tool",
+    "_generate_llm_response",
+    "_generate_tool_response",
+    "_tool_fallback",
+    "_detect_response_language",
+    "_language_instruction",
+    "_adapt_deterministic_response",
+    "_localized_context_fallback",
+    "_context_aware_missing_field_fallback",
+    "_context_aware_response_context",
+    "_context_value",
 ]

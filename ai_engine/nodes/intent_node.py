@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 from typing import Literal
+import re
 
 from pydantic import BaseModel, Field
 
@@ -281,6 +282,16 @@ def classify_intent(
             )
         )
 
+        # Protect high-confidence transactional intents from an
+        # inconsistent provider classification. These checks only
+        # resolve unambiguous operation semantics; product identity
+        # and all transaction values remain AI/backend controlled.
+        text = message.strip().casefold()
+        if re.search(r"\b(cancel|cancellation)\b", text) and re.search(r"\border\b", text):
+            return "order_cancel"
+        if re.search(r"\b(track|tracking|status)\b", text) and re.search(r"\border\b", text):
+            return "order_tracking"
+
         return result.intent
 
     except Exception as exc:
@@ -370,6 +381,15 @@ def classify_intent(
             return "cart"
 
         # -------------------------------------------------
+        # Cancellation must be checked before generic order
+        # handling.  "Cancel order 123" contains the word
+        # "order", but its primary intent is cancellation.
+        # -------------------------------------------------
+
+        if "cancel" in text and "order" in text:
+            return "order_cancel"
+
+        # -------------------------------------------------
         # Order-related intents
         # -------------------------------------------------
 
@@ -422,16 +442,6 @@ def classify_intent(
             ]
         ):
             return "product_search"
-
-        # -------------------------------------------------
-        # Order cancellation
-        # -------------------------------------------------
-
-        if (
-            "cancel" in text
-            and "order" in text
-        ):
-            return "order_cancel"
 
         # -------------------------------------------------
         # Customer support

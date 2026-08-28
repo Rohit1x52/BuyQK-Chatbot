@@ -52,6 +52,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ai_engine.graph.state import GraphState
+from ai_engine.tools.results import ToolErrorResult, ToolResult
 
 from backend.models.product import Product
 
@@ -226,55 +227,93 @@ def _product_name(
     ).strip()
 
 
-def _serialize_product(
-    product: Any,
-) -> dict[str, Any]:
+class ProductResult(dict):
     """
-    Convert product into JSON-safe data.
+    JSON-compatible product result.
+
+    Behaves like a normal dictionary while also supporting
+    attribute access:
+
+        product["name"]
+        product.name
+
+    This keeps tool_result compatible with API/JSON consumers
+    while preserving compatibility with existing integration
+    code that expects Product-style attribute access.
     """
 
-    return {
-        "id": _product_value(
-            product,
-            "id",
-        ),
-        "name": _product_value(
-            product,
-            "name",
-        ),
-        "description": _product_value(
-            product,
-            "description",
-        ),
-        "brand": _product_value(
-            product,
-            "brand",
-        ),
-        "price": _product_value(
-            product,
-            "price",
-        ),
-        "stock": _product_value(
-            product,
-            "stock",
-        ),
-        "image_url": _product_value(
-            product,
-            "image_url",
-        ),
-        "is_available": _product_value(
-            product,
-            "is_available",
-        ),
-        "merchant_id": _product_value(
-            product,
-            "merchant_id",
-        ),
-        "category_id": _product_value(
-            product,
-            "category_id",
-        ),
-    }
+    def __getattr__(
+        self,
+        name: str,
+    ) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(
+                f"{type(self).__name__!s} has no attribute {name!r}"
+            ) from exc
+
+
+def _serialize_product(
+    product: Any,
+) -> ProductResult:
+    """
+    Convert a SQLAlchemy Product or dictionary into a
+    JSON-compatible ProductResult.
+
+    ProductResult supports both:
+
+        product["name"]
+
+    and:
+
+        product.name
+    """
+
+    return ProductResult(
+        {
+            "id": _product_value(
+                product,
+                "id",
+            ),
+            "name": _product_value(
+                product,
+                "name",
+            ),
+            "description": _product_value(
+                product,
+                "description",
+            ),
+            "brand": _product_value(
+                product,
+                "brand",
+            ),
+            "price": _product_value(
+                product,
+                "price",
+            ),
+            "stock": _product_value(
+                product,
+                "stock",
+            ),
+            "image_url": _product_value(
+                product,
+                "image_url",
+            ),
+            "is_available": _product_value(
+                product,
+                "is_available",
+            ),
+            "merchant_id": _product_value(
+                product,
+                "merchant_id",
+            ),
+            "category_id": _product_value(
+                product,
+                "category_id",
+            ),
+        }
+    )
 
 
 def _deduplicate_products(
@@ -1813,7 +1852,7 @@ def _execute_cart_mutation(
 # =========================================================
 
 
-def tool_node(
+def _tool_node_impl(
     state: GraphState,
     db: Session,
 ) -> GraphState:
@@ -1836,6 +1875,32 @@ def tool_node(
     tool_name = state.get(
         "tool_name"
     )
+
+    # -----------------------------------------------------
+    # Canonicalize legacy tool aliases
+    # -----------------------------------------------------
+
+    if isinstance(tool_name, str):
+        tool_name = tool_name.strip().lower()
+
+        tool_aliases = {
+            "search_product": "search_products",
+            "product_search": "search_products",
+
+            "track": "track_order",
+            "tracking": "track_order",
+            "order_tracking": "track_order",
+            "tracking_order": "track_order",
+
+            "cancel": "cancel_order",
+            "order_cancel": "cancel_order",
+            "order_cancellation": "cancel_order",
+        }
+
+        tool_name = tool_aliases.get(
+            tool_name,
+            tool_name,
+        )
 
     entities = (
         state.get(
@@ -1944,17 +2009,29 @@ def tool_node(
                     products
                 ]
 
+            serialized_products = [
+                _serialize_product(
+                    product
+                )
+                for product in products
+            ]
+
             return {
+                "tool_name": "search_products",
+
                 "tool_result": {
                     "success": True,
                     "type": "product_search",
-                    "products": [
-                        _serialize_product(
-                            product
-                        )
-                        for product in products
-                    ],
-                }
+                    "products": serialized_products,
+                },
+
+                "entities": updated_entities,
+
+                "selected_product": (
+                    serialized_products[0]
+                    if len(serialized_products) == 1
+                    else None
+                ),
             }
 
         except Exception as exc:
@@ -2084,6 +2161,7 @@ def tool_node(
         )
 
         result: GraphState = {
+            "tool_name": tool_name,
             "tool_result": cart_result,
         }
 
@@ -3048,6 +3126,7 @@ def tool_node(
         print(f"    total    = {currency} {total_amount}")
 
         return {
+            "tool_name": "create_order",
             "tool_result": {
                 "success": True,
                 "type": "order_success",
@@ -3115,6 +3194,7 @@ def tool_node(
         if not order_id:
 
             return {
+                "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
@@ -3134,6 +3214,7 @@ def tool_node(
         ):
 
             return {
+                "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
@@ -3157,6 +3238,7 @@ def tool_node(
             )
 
             return {
+                "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
@@ -3167,6 +3249,7 @@ def tool_node(
         if order is None:
 
             return {
+                "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
@@ -3193,6 +3276,7 @@ def tool_node(
         ):
 
             return {
+                "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
@@ -3225,6 +3309,8 @@ def tool_node(
         )
 
         tracking_state = {
+            "tool_name": "track_order",
+
             "tool_result": {
                 "success": True,
                 "type": "tracking",
@@ -3309,6 +3395,7 @@ def tool_node(
         if user_id is None:
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
                     "error": "User ID is required.",
@@ -3328,6 +3415,7 @@ def tool_node(
         if not order_id:
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
                     "error": "Order ID is required.",
@@ -3346,6 +3434,7 @@ def tool_node(
         ):
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
                     "error": "Invalid order ID.",
@@ -3363,6 +3452,7 @@ def tool_node(
             )
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": True,
                     "type": "order_cancelled",
@@ -3386,6 +3476,7 @@ def tool_node(
         except ValueError as exc:
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_cancelled",
@@ -3402,6 +3493,7 @@ def tool_node(
             )
 
             return {
+                "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_cancelled",
@@ -3517,3 +3609,209 @@ def tool_node(
             ),
         }
     }
+
+
+# =========================================================
+# Canonical ToolResult Boundary
+# =========================================================
+
+def _normalize_tool_result(
+    tool_name: str | None,
+    raw_result: Any,
+) -> ToolResult | None:
+    """
+    Convert the legacy flat dictionary returned by the Tool Node
+    implementation into the canonical ToolResult contract.
+
+    The implementation above intentionally remains unchanged because
+    its individual branches contain the backend-specific result shape.
+    This function is the single contract boundary used by the graph.
+
+    Success:
+        {
+            "success": True,
+            "type": "...",
+            ...
+        }
+
+    becomes:
+        ToolResult(
+            success=True,
+            tool=tool_name,
+            data={
+                "type": "...",
+                ...
+            },
+        )
+
+    Failure:
+        {
+            "success": False,
+            "type": "...",
+            "error": "..."
+        }
+
+    becomes:
+        ToolResult(
+            success=False,
+            tool=tool_name,
+            error=ToolErrorResult(...),
+        )
+    """
+
+    if raw_result is None:
+        return None
+
+    if isinstance(raw_result, ToolResult):
+        return raw_result
+
+    if not isinstance(raw_result, dict):
+        return ToolResult.fail(
+            tool=str(tool_name or "unknown_tool"),
+            error=ToolErrorResult(
+                code="invalid_tool_result",
+                message="Tool returned an invalid result.",
+                details={
+                    "result_type": type(raw_result).__name__,
+                },
+            ),
+        )
+
+    canonical_tool = (
+        str(
+            raw_result.get("tool")
+            or tool_name
+            or "unknown_tool"
+        )
+        .strip()
+        .lower()
+    )
+
+    if not canonical_tool:
+        canonical_tool = "unknown_tool"
+
+    success = raw_result.get("success")
+
+    if success is True:
+        # Prefer an explicitly nested data payload if one exists.
+        nested_data = raw_result.get("data")
+
+        if isinstance(nested_data, dict):
+            data = dict(nested_data)
+
+            # Preserve any legacy top-level fields that are not envelope
+            # fields. This prevents data loss during the migration.
+            for key, value in raw_result.items():
+                if key not in {
+                    "success",
+                    "tool",
+                    "data",
+                    "error",
+                }:
+                    data.setdefault(key, value)
+        else:
+            data = {
+                key: value
+                for key, value in raw_result.items()
+                if key not in {
+                    "success",
+                    "tool",
+                    "data",
+                    "error",
+                }
+            }
+
+        return ToolResult.ok(
+            tool=canonical_tool,
+            data=data,
+        )
+
+    # Any non-True success value is treated as failure. This is safer than
+    # accidentally allowing a malformed result through the graph boundary.
+    raw_error = raw_result.get("error")
+
+    if isinstance(raw_error, ToolErrorResult):
+        error = raw_error
+    elif isinstance(raw_error, dict):
+        error = ToolErrorResult(
+            code=str(
+                raw_error.get("code")
+                or raw_error.get("type")
+                or "tool_execution_error"
+            ),
+            message=str(
+                raw_error.get("message")
+                or raw_error.get("error")
+                or "Tool execution failed."
+            ),
+            details=(
+                raw_error.get("details")
+                if isinstance(raw_error.get("details"), dict)
+                else None
+            ),
+        )
+    else:
+        error = ToolErrorResult(
+            code=str(
+                raw_result.get("error_code")
+                or raw_result.get("type")
+                or "tool_execution_error"
+            ),
+            message=str(
+                raw_error
+                or raw_result.get("message")
+                or "Tool execution failed."
+            ),
+            details=None,
+        )
+
+    return ToolResult.fail(
+        tool=canonical_tool,
+        error=error,
+    )
+
+
+def tool_node(
+    state: GraphState,
+    db: Session,
+) -> GraphState:
+    """
+    Public Tool Node.
+
+    All backend/tool branches execute through _tool_node_impl().
+    The returned tool_result is normalized exactly once at this
+    boundary so every downstream node receives ToolResult.
+    """
+
+    result = _tool_node_impl(
+        state=state,
+        db=db,
+    )
+
+    if not isinstance(result, dict):
+        result = {
+            "tool_result": {
+                "success": False,
+                "type": "invalid_tool_result",
+                "error": "Tool execution returned an invalid graph result.",
+            }
+        }
+
+    raw_tool_result = result.get("tool_result")
+
+    # If the implementation did not explicitly set tool_name on a branch,
+    # use the state value as the authoritative requested capability.
+    tool_name = result.get("tool_name") or state.get("tool_name")
+
+    normalized = _normalize_tool_result(
+        tool_name=tool_name,
+        raw_result=raw_tool_result,
+    )
+
+    result["tool_result"] = normalized
+
+    if tool_name:
+        result["tool_name"] = tool_name
+
+    return result
+

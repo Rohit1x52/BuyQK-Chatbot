@@ -64,6 +64,23 @@ from typing import Any
 
 from ai_engine.graph.state import GraphState
 
+ROUTE_TOOL = "tool"
+ROUTE_RESPONSE = "response"
+
+
+def _normalize_action(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value.upper().replace("-", "_").replace(" ", "_") if value else None
+
+
+def _normalize_tool(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value.casefold() if value else None
+
 
 # =========================================================
 # Supported Tools
@@ -814,404 +831,192 @@ def _is_general_request(
 # =========================================================
 
 
-def decision_node(
-    state: GraphState,
-) -> GraphState:
-    """
-    Determine the next safe graph operation.
-
-    The AI/entity node decides the user's current intent.
-
-    This node validates and routes that decision.
-
-    Routing priority:
-
-        1. order_create
-        2. order_tracking
-        3. order_cancel
-        4. general
-        5. other supported AI intent
-
-    =========================================================
-    ORDER CREATE
-    =========================================================
-
-    order_create
-        ↓
-    transaction already created?
-        ↓
-       YES
-        ↓
-    DO NOT create again
-
-    order_create
-        ↓
-    checkout incomplete?
-        ↓
-       YES
-        ↓
-    request required backend/frontend information
-
-    order_create
-        ↓
-    checkout complete
-        ↓
-    create_order
-
-    =========================================================
-    """
-
-    # =====================================================
-    # Read State
-    # =====================================================
-
-    intent = state.get(
-        "intent",
-        "general",
-    )
-
-    entities = _get_entities(
-        state
-    )
-
-    checkout_id = (
-        _get_checkout_id(
-            state
-        )
-    )
-
-    checkout_status = (
-        state.get(
-            "checkout_status"
-        )
-    )
-
-    order_created = bool(
-        state.get(
-            "order_created",
-            False,
-        )
-    )
-
-    order_id = state.get(
-        "order_id"
-    )
-
-    # =====================================================
-    # Calculate Transaction State
-    # =====================================================
-
-    missing_fields = (
-        _calculate_checkout_missing_fields(
-            state
-        )
-    )
-
-    next_missing_field = (
-        _get_next_missing_field(
-            missing_fields
-        )
-    )
-
-    checkout_complete = (
-        not missing_fields
-    )
-
-    active_checkout = (
-        _is_active_order_checkout(
-            state
-        )
-    )
-
-    transaction_completed = (
-        _checkout_is_already_completed(
-            state
-        )
-    )
-
-    block_order_creation = (
-        _should_block_order_creation(
-            state
-        )
-    )
-
-    # =====================================================
-    # Debug
-    # =====================================================
-
-    print(
-        "\n"
-        "====================================================\n"
-        "[DECISION NODE]\n"
-        "====================================================\n"
-        f"  intent            = {intent!r}\n"
-        f"  checkout_id      = {checkout_id!r}\n"
-        f"  checkout_status  = {checkout_status!r}\n"
-        f"  order_created    = {order_created!r}\n"
-        f"  order_id         = {order_id!r}\n"
-        f"  active_checkout  = {active_checkout!r}\n"
-        f"  transaction_done = {transaction_completed!r}\n"
-        f"  checkout_complete= {checkout_complete!r}\n"
-        f"  missing_fields   = {missing_fields!r}\n"
-        f"  next_missing     = {next_missing_field!r}\n"
-        f"  product_name     = "
-        f"{entities.get('product_name')!r}\n"
-        f"  product_id       = "
-        f"{state.get('product_id') or entities.get('product_id')!r}\n"
-        f"  quantity         = "
-        f"{state.get('quantity') or entities.get('quantity')!r}\n"
-        f"  address_id       = "
-        f"{_get_selected_address_id(state, entities)!r}\n"
-        f"  payment_method   = "
-        f"{_get_payment_method(state, entities)!r}\n"
-        f"  block_create     = "
-        f"{block_order_creation!r}\n"
-        "====================================================\n"
-    )
-
-    # =====================================================
-    # 1. ORDER CREATION
-    # =====================================================
-
-    if active_checkout:
-
-        # -------------------------------------------------
-        # DUPLICATE TRANSACTION PROTECTION
-        # -------------------------------------------------
-        #
-        # This is the most important transaction guard.
-        #
-        # If create_order already succeeded for this checkout,
-        # do not execute it again.
-        #
-        # No language-specific rule exists here.
-        #
-        # "Thank you"
-        # "Thanks"
-        # "Okay"
-        # "Dhanyavaad"
-        # etc.
-        #
-        # are NOT hardcoded.
-        #
-        # The AI determines their intent.
-        #
-        # This guard simply prevents an already-completed
-        # transaction from being executed again.
-        # -------------------------------------------------
-
-        if block_order_creation:
-
-            print(
-                "[DECISION NODE]"
-                " -> BLOCK duplicate order creation"
-                f" | checkout_id={checkout_id!r}"
-                f" | order_id={order_id!r}"
-            )
-
-            return {
-                #
-                # Do NOT route to create_order.
-                #
-                # Response node can explain/present the current
-                # order state using the authoritative backend
-                # result already present in GraphState.
-                #
-                "tool_name": None,
-                "missing_fields": [],
-                "next_missing_field": None,
-                "checkout_status": (
-                    checkout_status
-                    or "completed"
-                ),
-                "order_created": True,
-                "order_id": order_id,
+def _decision_result(*, route: str, allowed: bool, action: str | None,
+                     tool: str | None, reason: Any = None,
+                     **extra: Any) -> GraphState:
+    """Build the stable DecisionNode contract consumed by graph/tests."""
+    result: dict[str, Any] = {
+        "decision": {
+            "route": route,
+            "allowed": allowed,
+            "action": action,
+            "tool": tool,
+            "reason": reason,
+        },
+        "decision_route": route,
+        "tool_name": tool,
+        "policy_error": (
+            None
+            if allowed
+            else {
+                "allowed": False,
+                "action": action,
+                "reason": reason,
             }
-
-        # -------------------------------------------------
-        # CHECKOUT COMPLETE
-        # -------------------------------------------------
-        #
-        # Only the AI's current order_create intent AND a
-        # complete checkout state allow create_order.
-        #
-        # No prices or billing values are calculated here.
-        # -------------------------------------------------
-
-        if checkout_complete:
-
-            print(
-                "[DECISION NODE]"
-                " -> COMPLETE CHECKOUT"
-                " -> create_order"
-                f" | checkout_id={checkout_id!r}"
-            )
-
-            return {
-                "intent": "order_create",
-                "tool_name": "create_order",
-                "missing_fields": [],
-                "next_missing_field": None,
-                "checkout_status": "ready",
-                "checkout_id": state.get("checkout_id"),
-            }
-
-        # -------------------------------------------------
-        # CHECKOUT INCOMPLETE
-        # -------------------------------------------------
-        #
-        # Only backend-dependent information requires a
-        # backend listing tool.
-        #
-        # Product/quantity are conversational state already
-        # understood by the AI.
-        # -------------------------------------------------
-
-        if next_missing_field == (
-            "address_selection"
-        ):
-
-            tool_name = (
-                "list_saved_addresses"
-            )
-
-        elif next_missing_field == (
-            "payment_method"
-        ):
-
-            tool_name = (
-                "list_payment_methods"
-            )
-
-        else:
-
-            tool_name = None
-
-        print(
-            "[DECISION NODE]"
-            " -> INCOMPLETE CHECKOUT"
-            f" -> missing={next_missing_field!r}"
-            f" -> tool={tool_name!r}"
-        )
-
-        return {
-            "intent": "order_create",
-            "tool_name": tool_name,
-            "missing_fields": missing_fields,
-            "next_missing_field": (
-                next_missing_field
-            ),
-            "checkout_status": "collecting",
-        }
-
-    # =====================================================
-    # 2. TRACKING
-    # =====================================================
-
-    if _is_tracking_request(
-        state
-    ):
-
-        print(
-            "[DECISION NODE]"
-            " -> track_order"
-        )
-
-        return {
-            "intent": "order_tracking",
-            "tool_name": "track_order",
-            "missing_fields": [],
-            "next_missing_field": None,
-        }
-
-    # =====================================================
-    # 3. CANCELLATION
-    # =====================================================
-
-    if _is_cancel_request(
-        state
-    ):
-
-        print(
-            "[DECISION NODE]"
-            " -> cancel_order"
-        )
-
-        return {
-            "intent": "order_cancel",
-            "tool_name": "cancel_order",
-            "missing_fields": [],
-            "next_missing_field": None,
-        }
-
-    # =====================================================
-    # 4. GENERAL CONVERSATION
-    # =====================================================
-
-    if _is_general_request(
-        state
-    ):
-
-        print(
-            "[DECISION NODE]"
-            " -> general conversation"
-        )
-
-        return {
-            "intent": "general",
-            "tool_name": None,
-            "missing_fields": [],
-            "next_missing_field": None,
-        }
-
-    # =====================================================
-    # 5. OTHER AI-DETERMINED INTENT
-    # =====================================================
-    #
-    # We deliberately do not map order_create here.
-    #
-    # order_create has already been handled above because it
-    # requires transaction-state validation.
-    # =====================================================
-
-    tool_name = (
-        INTENT_TO_TOOL.get(
-            intent
-        )
-    )
-
-    # =====================================================
-    # Safety
-    # =====================================================
-
-    if (
-        tool_name is None
-        or tool_name not in SUPPORTED_TOOLS
-    ):
-
-        print(
-            "[DECISION NODE]"
-            " -> no supported tool"
-            f" | intent={intent!r}"
-        )
-
-        return {
-            "tool_name": None,
-            "missing_fields": [],
-            "next_missing_field": None,
-        }
-
-    # =====================================================
-    # TOOL SELECTED
-    # =====================================================
-
-    print(
-        "[DECISION NODE]"
-        f" -> {tool_name}"
-    )
-
-    return {
-        "tool_name": tool_name,
-        "missing_fields": [],
-        "next_missing_field": None,
+        ),
     }
+    result.update(extra)
+    return result
+
+
+def decision_node(state: GraphState) -> GraphState:
+    """Route the authoritative Policy result to Tool or Response.
+
+    The Policy node is the source of authorization.  Decision does not
+    re-validate business rules and never executes a tool itself.
+    """
+    policy = state.get("policy_result")
+
+    if not isinstance(policy, dict):
+        # Compatibility with callers that pass a legacy policy object.
+        policy = state.get("policy")
+
+    if not isinstance(policy, dict):
+        # Compatibility for the Phase-1/2 direct DecisionNode contract.
+        # The normal graph path should provide policy_result.  For legacy
+        # callers/tests, allow only deterministic read-only capabilities
+        # when the required entity is already present.  Never infer a
+        # transaction or cart mutation here.
+        intent = str(state.get("intent") or "").strip().lower()
+        entities = state.get("entities") or {}
+        if not isinstance(entities, dict):
+            entities = {}
+
+        if intent == "product_search" and entities.get("product_name"):
+            return _decision_result(
+                route=ROUTE_TOOL,
+                allowed=True,
+                action="SEARCH_PRODUCTS",
+                tool="search_products",
+                reason="legacy_direct_routing",
+            )
+
+        if intent == "order_tracking" and entities.get("order_id") is not None:
+            return _decision_result(
+                route=ROUTE_TOOL,
+                allowed=True,
+                action="TRACK_ORDER",
+                tool="track_order",
+                reason="legacy_direct_routing",
+            )
+
+        if intent == "order_cancel" and entities.get("order_id") is not None:
+            return _decision_result(
+                route=ROUTE_TOOL,
+                allowed=True,
+                action="CANCEL_ORDER",
+                tool="cancel_order",
+                reason="legacy_direct_routing",
+            )
+
+        print("[DECISION NODE] Missing policy_result")
+        return _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=False,
+            action=None,
+            tool=None,
+            reason="missing_policy_result",
+        )
+
+    allowed = bool(policy.get("allowed", False))
+    action = _normalize_action(policy.get("action"))
+    tool = _normalize_tool(policy.get("tool") or policy.get("tool_name"))
+    reason = policy.get("reason")
+
+    # Conversational actions are never tool-routed, even if a malformed
+    # policy payload contains a tool name.
+    if action in {
+        "ANSWER",
+        "ASK_CLARIFICATION",
+        "CONFIRM",
+        "END_CONVERSATION",
+        "START_CHECKOUT",
+        "MODIFY_CHECKOUT",
+    }:
+        if tool is not None:
+            return _decision_result(
+                route=ROUTE_RESPONSE,
+                allowed=False,
+                action=action,
+                tool=None,
+                reason="tool_not_allowed_for_toolless_action",
+            )
+        return _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=allowed,
+            action=action,
+            tool=None,
+            reason=reason,
+        )
+
+    if not allowed:
+        return _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=False,
+            action=action,
+            tool=None,
+            reason=reason or "policy_rejected",
+        )
+
+    # Canonical action/tool consistency.  Keep this mapping local to
+    # routing; it does not interpret the user's language.
+    canonical = {
+        "CREATE_ORDER": "create_order",
+        "TRACK_ORDER": "track_order",
+        "CANCEL_ORDER": "cancel_order",
+        "SEARCH_PRODUCTS": "search_products",
+        "REQUEST_SUPPORT": "create_support_ticket",
+        "LIST_PAYMENT_METHODS": "list_payment_methods",
+        "LIST_SAVED_ADDRESSES": "list_saved_addresses",
+        "ADD_TO_CART": "add_to_cart",
+        "REMOVE_FROM_CART": "remove_from_cart",
+        "UPDATE_CART_ITEM": "update_cart_item",
+        "CLEAR_CART": "clear_cart",
+        "SHOW_CART": "show_cart",
+        "CHECKOUT_CART": "checkout_cart",
+    }.get(action)
+
+    if canonical is not None:
+        if tool is None:
+            tool = canonical
+        elif tool != canonical:
+            return _decision_result(
+                route=ROUTE_RESPONSE,
+                allowed=False,
+                action=action,
+                tool=None,
+                reason=(
+                    "cart_action_tool_mismatch"
+                    if action in {
+                        "ADD_TO_CART", "REMOVE_FROM_CART", "UPDATE_CART_ITEM",
+                        "CLEAR_CART", "SHOW_CART", "CHECKOUT_CART",
+                    }
+                    else "action_tool_mismatch"
+                ),
+            )
+
+    if tool is None:
+        return _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=True,
+            action=action,
+            tool=None,
+            reason=reason,
+        )
+
+    return _decision_result(
+        route=ROUTE_TOOL,
+        allowed=True,
+        action=action,
+        tool=tool,
+        reason=reason,
+    )
+
+
+__all__ = [
+    "decision_node",
+    "SUPPORTED_TOOLS",
+    "INTENT_TO_TOOL",
+    "ROUTE_TOOL",
+    "ROUTE_RESPONSE",
+]

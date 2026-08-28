@@ -925,9 +925,20 @@ def detect_order_id(
     )
 
     if not match:
-        # Also accept "order #123" (hash directly after order)
+        # Also accept "order #123" (hash directly after order).
         match = re.search(
             r"\border\s*[#]\s*(\d+)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+
+    if not match:
+        # Context-safe shorthand such as "track order 123?" or
+        # "cancel order 123". The reference must terminate at the end
+        # of the message or at punctuation, preventing a purchase such
+        # as "order 11 Maggi" from becoming order_id=11.
+        match = re.search(
+            r"\border\s+(\d+)\s*(?=$|[.!?,;:])",
             message,
             flags=re.IGNORECASE,
         )
@@ -1142,21 +1153,42 @@ def detect_product_from_message(
     message: str,
 ) -> Optional[str]:
     """
-    Conservative product-name detector used only to identify turns
-    that contain an explicit product/order reference.
+    Deterministically extract a product reference from common
+    purchase/search utterances.
 
-    It does not resolve a database product_id.
+    This is intentionally conservative: it extracts the semantic
+    product phrase but never resolves a backend product_id.
+
+    Supported examples:
+        I want Amul milk
+        I want 2 Amul milk
+        I need 2 packets of Amul milk
+        Order 2 Amul milk
+        Buy Maggi
+        Find Amul milk
+        Search for Amul milk
     """
-
     if not message:
         return None
 
     text = str(message).strip()
+    if not text:
+        return None
 
     patterns = (
-        r"\bi\s+(?:want|need)\s+to\s+(?:order|buy|get|purchase)\s+(.+?)\s*$",
-        r"\bi(?:'d|\s+would)\s+like\s+to\s+(?:order|buy|get|purchase)\s+(.+?)\s*$",
-        r"\b(?:order|buy|purchase|get)\s+(.+?)\s*$",
+        # Purchase requests with optional quantity / packaging words.
+        r"^\s*i\s+(?:want|need)\s+(?:to\s+)?"
+        r"(?:order|buy|get|purchase)?\s*"
+        r"(?:\d+\s+(?:packets?|packs?|pieces?|pcs?|items?|units?|kg|kgs|kilograms?|g|grams?)\s+)?"
+        r"(?:of\s+)?(.+?)\s*$",
+
+        # Direct order/buy commands.
+        r"^\s*(?:order|buy|purchase|get)\s+"
+        r"(?:\d+\s+(?:packets?|packs?|pieces?|pcs?|items?|units?|kg|kgs|kilograms?|g|grams?)\s+)?"
+        r"(?:of\s+)?(.+?)\s*$",
+
+        # Search requests are product-search, not order_create.
+        r"^\s*(?:find|search(?:\s+for)?)\s+(.+?)\s*$",
     )
 
     for pattern in patterns:
@@ -1165,7 +1197,6 @@ def detect_product_from_message(
             text,
             flags=re.IGNORECASE,
         )
-
         if not match:
             continue
 
@@ -1178,27 +1209,33 @@ def detect_product_from_message(
         if not candidate:
             continue
 
-        # Strip leading quantity prefix: "11 Maggi" → "Maggi"
+        # Remove leading numeric quantity when it was not consumed
+        # by the pattern, e.g. "2 Amul milk".
         candidate = re.sub(
             r"^\d+\s+",
             "",
             candidate,
         ).strip()
 
+        # Remove common article/package prefixes that are not part of
+        # the product identity.
+        candidate = re.sub(
+            r"^(?:a|an|the)\s+",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+
         if not candidate:
             continue
 
-        # Do not mistake a quantity/payment/address continuation
-        # for a product request.
+        # A pure continuation is not a product name.
         if detect_quantity(candidate) is not None:
             continue
-
         if detect_payment_method(candidate) is not None:
             continue
-
         if detect_address_id(candidate) is not None:
             continue
-
         if detect_address_text(candidate) is not None:
             continue
 
@@ -1251,10 +1288,15 @@ def detect_product_fallback(
         return None
 
     patterns = (
-        r"\bi\s+(?:want|need)\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
-        r"\bi\s+(?:want|need)\s+(?:to\s+)?(?:order|buy|get)\s+(.+?)\s*$",
-        r"\bi(?:'d|\s+would)\s+like\s+to\s+(?:order|buy|get)\s+(.+?)\s*$",
-        r"\b(?:order|buy|get|purchase)\s+(.+?)\s*$",
+        r"\bi\s+(?:want|need)\s+(?:to\s+)?(?:order|buy|get|purchase)?\s*"
+        r"(?:\d+\s+(?:packets?|packs?|pieces?|pcs?|items?|units?|kg|kgs|kilograms?|g|grams?)\s+)?"
+        r"(?:of\s+)?(.+?)\s*$",
+        r"\bi(?:'d|\s+would)\s+like\s+(?:to\s+)?(?:order|buy|get|purchase)?\s*"
+        r"(?:\d+\s+(?:packets?|packs?|pieces?|pcs?|items?|units?|kg|kgs|kilograms?|g|grams?)\s+)?"
+        r"(?:of\s+)?(.+?)\s*$",
+        r"\b(?:order|buy|get|purchase)\s+"
+        r"(?:\d+\s+(?:packets?|packs?|pieces?|pcs?|items?|units?|kg|kgs|kilograms?|g|grams?)\s+)?"
+        r"(?:of\s+)?(.+?)\s*$",
     )
 
     for _, content in reversed(user_messages):
@@ -1615,23 +1657,34 @@ def _is_new_order_request(
 def _is_explicit_tracking_request(
     message: str,
 ) -> bool:
-    """
-    Deprecated compatibility helper.
+    """Recognize an explicit tracking request when upstream classification is unavailable.
 
-    Current-turn tracking intent is decided by the AI classifier.
+    This is a narrow fail-safe for operational reliability. It requires both
+    tracking language and an explicit order reference; it does not infer an
+    order from an arbitrary number.
     """
-    return False
+    text = (message or "").strip()
+    if not text or detect_order_id(text) is None:
+        return False
+    return bool(re.search(
+        r"\b(?:track|tracking|where\s+is|status|locate|find)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
 
 
 def _is_explicit_cancel_request(
     message: str,
 ) -> bool:
-    """
-    Deprecated compatibility helper.
-
-    Current-turn cancellation intent is decided by the AI classifier.
-    """
-    return False
+    """Recognize an explicit cancellation request with an order reference."""
+    text = (message or "").strip()
+    if not text or detect_order_id(text) is None:
+        return False
+    return bool(re.search(
+        r"\b(?:cancel|cancellation|abort|stop)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
 
 
 def _is_explicit_support_request(
@@ -2023,22 +2076,63 @@ def entity_node(
     # become the intent of the next user message.
     # =====================================================
 
-    # intent_node already classified the CURRENT turn. Trust it for
-    # cart and all non-order turns. Re-running a second classifier here
-    # was the source of the cart Literal validation failure.
-    if str(original_intent or "general").strip().lower() != "order_create":
-        resolved_current_intent = str(original_intent or "general").strip().lower()
-        if resolved_current_intent not in {
-            "product_search", "order_tracking", "order_cancel",
-            "customer_support", "cart", "general",
-        }:
-            resolved_current_intent = "general"
-        intent_decision = IntentDecision(
-            intent=resolved_current_intent,
-            order_action="none",
-            cart_action="none",
-            confidence=1.0,
+    # The upstream Intent Node is authoritative when it has a concrete
+    # transactional classification.  If it returned "general", however,
+    # this node performs a safe current-turn recovery.  This is important
+    # for direct node tests and for transient LLM failures: "I want Amul
+    # milk" must still enter an order workflow rather than losing the
+    # transaction at the entity boundary.
+    normalized_original_intent = str(
+        original_intent or "general"
+    ).strip().lower()
+
+    if normalized_original_intent == "general":
+        intent_decision = resolve_current_turn_intent(
+            state=state,
+            message=message,
         )
+        resolved_current_intent = intent_decision.intent
+    elif normalized_original_intent in {
+        "product_search",
+        "order_tracking",
+        "order_cancel",
+        "customer_support",
+        "cart",
+        "order_create",
+    }:
+        # For order_create we still need the order_action distinction.
+        if normalized_original_intent == "order_create":
+            if _is_new_order_request(message):
+                intent_decision = IntentDecision(
+                    intent="order_create",
+                    order_action="start_new_order",
+                    cart_action="none",
+                    confidence=1.0,
+                )
+            else:
+                intent_decision = resolve_current_turn_intent(
+                    state=state,
+                    message=message,
+                )
+                # If the classifier fails closed on a turn that the
+                # upstream Intent Node already classified as order_create,
+                # preserve that authoritative intent.
+                if intent_decision.intent == "general":
+                    intent_decision = IntentDecision(
+                        intent="order_create",
+                        order_action="continue_order",
+                        cart_action="none",
+                        confidence=0.0,
+                    )
+            resolved_current_intent = intent_decision.intent
+        else:
+            intent_decision = IntentDecision(
+                intent=normalized_original_intent,
+                order_action="none",
+                cart_action="none",
+                confidence=1.0,
+            )
+            resolved_current_intent = normalized_original_intent
     else:
         intent_decision = resolve_current_turn_intent(
             state=state,
@@ -2227,9 +2321,13 @@ def entity_node(
         message
     )
 
-    # Direct order product extraction. Cart logic is untouched.
+    # Direct product extraction for both purchase and search turns.
+    # Cart extraction remains governed by cart_action and existing state.
     explicit_order_product = None
-    if resolved_current_intent == "order_create":
+    if resolved_current_intent in {
+        "order_create",
+        "product_search",
+    }:
         explicit_order_product = detect_product_from_message(message)
 
     if explicit_order_product:
@@ -2838,6 +2936,7 @@ def entity_node(
         "payment_method": final_entities.get(
             "payment_method"
         ),
+        "order_id": final_entities.get("order_id"),
 
         # Transaction identity/state must survive every HTTP turn.
         "checkout_id": checkout_id,

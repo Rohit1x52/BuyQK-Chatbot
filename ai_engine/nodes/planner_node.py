@@ -386,11 +386,13 @@ def _build_cart_arguments(
 
     arguments: dict[str, Any] = {}
 
-    product_name = entities.get("product_name")
+    product_name = entities.get("product_name") or state.get("product_name")
     if product_name:
         arguments["product_name"] = product_name
 
     quantity = entities.get("quantity")
+    if quantity is None:
+        quantity = state.get("quantity")
     if quantity is not None:
         try:
             quantity = int(quantity)
@@ -436,6 +438,18 @@ def _normalize_plan(
         plan.get("action")
     )
 
+    if action is not None:
+        action_aliases = {
+            "add_cart_item": "add_to_cart",
+            "remove_cart_item": "remove_from_cart",
+            "update_cart_item": "update_cart_item",
+            "clear_cart": "clear_cart",
+            "show_cart": "show_cart",
+            "checkout_cart": "checkout_cart",
+            "search_product": "search_products",
+        }
+        action = action_aliases.get(action, action)
+
     if action is None:
 
         for field in (
@@ -450,6 +464,15 @@ def _normalize_plan(
             )
 
             if action is not None:
+                action = {
+                    "add_cart_item": "add_to_cart",
+                    "remove_cart_item": "remove_from_cart",
+                    "update_cart_item": "update_cart_item",
+                    "clear_cart": "clear_cart",
+                    "show_cart": "show_cart",
+                    "checkout_cart": "checkout_cart",
+                    "search_product": "search_products",
+                }.get(action, action)
                 break
 
     # -----------------------------------------------------
