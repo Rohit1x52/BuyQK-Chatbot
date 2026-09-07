@@ -436,6 +436,25 @@ def init_db() -> None:
         bind=engine,
     )
 
+    try:
+        from backend.database.sqlite import SessionLocal
+        from backend.models.product import Product
+
+        with SessionLocal() as db:
+            if db.query(Product).count() == 0:
+                print(
+                    "[DATABASE] Product catalog is empty; "
+                    "bootstrapping seed catalog..."
+                )
+                from backend.seed_products import seed_products
+                seed_products(auto_init=False)
+
+    except Exception as exc:
+        print(
+            "[DATABASE] Product catalog bootstrap failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     print(
         "[DATABASE] Database initialized successfully."
     )
