@@ -222,6 +222,15 @@ working with an existing cart.
 
 If ambiguous, choose the intent that best represents the
 user's primary goal.
+
+CONVERSATION CONTEXT:
+- If the user is answering a question from an active order,
+  classify the answer according to the active order context rather
+  than treating the short answer as a new unrelated request.
+- Short answers such as quantities, sizes, addresses, delivery
+  details, or payment choices may be continuations of an active
+  order. Use the supplied conversation context when available.
+- Never invent a product, quantity, address, order, or cart state.
 """
 
 
@@ -246,11 +255,115 @@ structured_llm = llm.with_structured_output(
 
 
 # =========================================================
+# Normalization / Context Helpers
+# =========================================================
+
+def _normalize_intent(value: object) -> str:
+    """Return a valid BuyQK intent without allowing invalid LLM output."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {
+            "product_search",
+            "order_create",
+            "cart",
+            "order_tracking",
+            "order_cancel",
+            "customer_support",
+            "general",
+        }:
+            return value
+    return "general"
+
+
+def _looks_like_order_continuation(state: GraphState) -> bool:
+    """Detect an already-active order conversation from graph state."""
+    if not isinstance(state, dict):
+        return False
+
+    intent = state.get("intent")
+    order_action = state.get("order_action")
+    missing_fields = state.get("missing_fields")
+    checkout_id = state.get("checkout_id")
+
+    if intent == "order_create" or order_action in {
+        "start_new_order",
+        "continue_order",
+    }:
+        return True
+
+    if checkout_id:
+        return True
+
+    return isinstance(missing_fields, (list, tuple)) and bool(missing_fields)
+
+
+def _has_explicit_new_intent(message: str) -> bool:
+    """Conservatively identify a message that starts a distinct request."""
+    text = message.casefold().strip()
+    if not text:
+        return False
+
+    # These are semantic operation indicators, not product names.
+    return bool(
+        re.search(
+            r"\b(?:find|search|show|compare|browse|track|tracking|cancel|refund|complaint)\b",
+            text,
+        )
+    )
+
+
+def _looks_like_cart_continuation(state: GraphState) -> bool:
+    """Detect an active cart operation awaiting the missing product reference."""
+    if not isinstance(state, dict):
+        return False
+
+    if state.get("intent") != "cart":
+        return False
+
+    entities = state.get("entities") or {}
+    if not isinstance(entities, dict):
+        return False
+
+    cart_action = entities.get("cart_action")
+    if cart_action in {"add_item", "remove_item", "update_quantity"}:
+        return True
+
+    missing_fields = state.get("missing_fields") or []
+    if isinstance(missing_fields, (list, tuple)) and (
+        "product_reference" in missing_fields or "cart_action" in missing_fields
+    ):
+        return True
+
+    return False
+
+
+def _classify_with_context(
+    message: str,
+    state: GraphState,
+) -> str | None:
+    """Return a context-derived continuation only when it is unambiguous."""
+    text = message.strip()
+    if not text or _has_explicit_new_intent(text):
+        return None
+
+    if _looks_like_cart_continuation(state):
+        return "cart"
+
+    if not _looks_like_order_continuation(state):
+        return None
+
+    # The active order context establishes the user's transaction goal.
+    # Entity/Planner remain responsible for interpreting the actual value.
+    return "order_create"
+
+
+# =========================================================
 # Classify Intent
 # =========================================================
 
 def classify_intent(
     message: str,
+    state: GraphState | None = None,
 ) -> str:
     """
     Classify a user message using the LLM.
@@ -292,7 +405,19 @@ def classify_intent(
         if re.search(r"\b(track|tracking|status)\b", text) and re.search(r"\border\b", text):
             return "order_tracking"
 
-        return result.intent
+        normalized_intent = _normalize_intent(
+            getattr(result, "intent", None)
+        )
+
+        if state is not None:
+            contextual_intent = _classify_with_context(
+                message,
+                state,
+            )
+            if contextual_intent is not None:
+                return contextual_intent
+
+        return normalized_intent
 
     except Exception as exc:
 
@@ -311,6 +436,14 @@ def classify_intent(
             f"[INTENT ERROR] "
             f"{type(exc).__name__}: {exc}"
         )
+
+        if state is not None:
+            contextual_intent = _classify_with_context(
+                message,
+                state,
+            )
+            if contextual_intent is not None:
+                return contextual_intent
 
         text = message.lower().strip()
 
@@ -488,7 +621,8 @@ def intent_node(
     )
 
     intent = classify_intent(
-        message
+        message,
+        state,
     )
 
     return {

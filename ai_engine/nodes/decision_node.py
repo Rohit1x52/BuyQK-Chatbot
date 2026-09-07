@@ -101,6 +101,13 @@ SUPPORTED_TOOLS = {
     "create_support_ticket",
     "list_saved_addresses",
     "list_payment_methods",
+    # Phase 3 cart capabilities.
+    "add_to_cart",
+    "remove_from_cart",
+    "update_cart_item",
+    "clear_cart",
+    "show_cart",
+    "checkout_cart",
 }
 
 
@@ -194,6 +201,78 @@ def _get_entities(
     return dict(
         entities
     )
+
+
+def _get_order_items(
+    state: GraphState,
+) -> list[dict[str, Any]]:
+    """Return normalized order items from the authoritative state."""
+    items = state.get("order_items")
+    if isinstance(items, list):
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            quantity = item.get("quantity")
+            product_name = item.get("product_name")
+            product_id = item.get("product_id")
+            if quantity is None:
+                continue
+            try:
+                parsed_quantity = int(quantity)
+            except (TypeError, ValueError):
+                continue
+            if parsed_quantity <= 0:
+                continue
+            order_item: dict[str, Any] = {"quantity": parsed_quantity}
+            if product_id is not None:
+                order_item["product_id"] = product_id
+            elif _has_value(product_name):
+                order_item["product_name"] = str(product_name).strip()
+            else:
+                continue
+            normalized.append(order_item)
+        if normalized:
+            return normalized
+
+    entities = _get_entities(state)
+    raw_items = entities.get("items")
+    if isinstance(raw_items, list):
+        normalized = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            product_name = item.get("product_name")
+            quantity = item.get("quantity")
+            if quantity is None:
+                continue
+            try:
+                parsed_quantity = int(quantity)
+            except (TypeError, ValueError):
+                continue
+            if parsed_quantity <= 0:
+                continue
+            if not _has_value(product_name):
+                continue
+            normalized.append({
+                "product_name": str(product_name).strip(),
+                "quantity": parsed_quantity,
+            })
+        if normalized:
+            return normalized
+
+    product_name = entities.get("product_name")
+    quantity = entities.get("quantity")
+
+    if _has_value(product_name):
+        try:
+            parsed_quantity = int(quantity)
+        except (TypeError, ValueError):
+            parsed_quantity = None
+        if parsed_quantity is not None and parsed_quantity > 0:
+            return [{"product_name": str(product_name).strip(), "quantity": parsed_quantity}]
+
+    return []
 
 
 # =========================================================
@@ -401,52 +480,44 @@ def _calculate_checkout_missing_fields(
     # Product
     # -----------------------------------------------------
 
-    product_name = entities.get(
-        "product_name"
-    )
-
-    product_id = (
-        state.get(
-            "product_id"
-        )
-        or entities.get(
-            "product_id"
-        )
-    )
-
-    #
-    # Product name is the user-facing semantic value.
-    #
-    # Product ID is the authoritative backend identity.
-    #
-    if not _has_value(
-        product_name
-    ):
-
-        missing.append(
+    order_items = _get_order_items(state)
+    
+    if not order_items:
+        product_name = entities.get(
             "product_name"
         )
-
-    # -----------------------------------------------------
-    # Quantity
-    # -----------------------------------------------------
-
-    quantity = (
-        state.get(
-            "quantity"
+    
+        product_id = (
+            state.get(
+                "product_id"
+            )
+            or entities.get(
+                "product_id"
+            )
         )
-        or entities.get(
-            "quantity"
+    
+        if not _has_value(
+            product_name
+        ):
+            missing.append(
+                "product_name"
+            )
+            
+        quantity = (
+            state.get(
+                "quantity"
+            )
+            or entities.get(
+                "quantity"
+            )
         )
-    )
-
-    if not _quantity_is_valid(
-        quantity
-    ):
-
-        missing.append(
-            "quantity"
-        )
+    
+        if not _quantity_is_valid(
+            quantity
+        ):
+            missing.append(
+                "quantity"
+            )
 
     # -----------------------------------------------------
     # Address
@@ -923,6 +994,62 @@ def decision_node(state: GraphState) -> GraphState:
     tool = _normalize_tool(policy.get("tool") or policy.get("tool_name"))
     reason = policy.get("reason")
 
+    # ---------------------------------------------------------
+    # Checkout address discovery
+    #
+    # START_CHECKOUT / MODIFY_CHECKOUT is a workflow action. When
+    # checkout reaches the address step, load the user's saved
+    # addresses first. The frontend can then present BOTH:
+    #
+    #   1. saved addresses
+    #   2. Add new address
+    #
+    # list_saved_addresses is read-only and authoritative for this UI.
+    # ---------------------------------------------------------
+    if action in {"START_CHECKOUT", "MODIFY_CHECKOUT"}:
+        checkout_missing = _calculate_checkout_missing_fields(state)
+
+        address_action = str(
+            _get_entities(state).get("address_action") or ""
+        ).strip().lower()
+
+        if (
+            "address_selection" in checkout_missing
+            and address_action != "add"
+        ):
+            return _decision_result(
+                route=ROUTE_TOOL,
+                allowed=True,
+                action="LIST_SAVED_ADDRESSES",
+                tool="list_saved_addresses",
+                reason="load_saved_addresses_for_checkout",
+            )
+
+    # ---------------------------------------------------------
+    # Checkout payment discovery
+    #
+    # CREATE_ORDER must never be routed directly to the Tool node
+    # when a payment method has not yet been selected.  The payment
+    # method list is backend-authoritative and read-only.
+    #
+    # This check intentionally happens before the generic Policy
+    # rejection branch so a structurally incomplete checkout can
+    # continue through the payment-selection workflow.
+    # ---------------------------------------------------------
+    if action == "CREATE_ORDER" and not _has_value(
+        _get_payment_method(
+            state,
+            _get_entities(state),
+        )
+    ):
+        return _decision_result(
+            route=ROUTE_TOOL,
+            allowed=True,
+            action="LIST_PAYMENT_METHODS",
+            tool="list_payment_methods",
+            reason="load_payment_methods_for_checkout",
+        )
+
     # Conversational actions are never tool-routed, even if a malformed
     # policy payload contains a tool name.
     if action in {
@@ -968,6 +1095,7 @@ def decision_node(state: GraphState) -> GraphState:
         "REQUEST_SUPPORT": "create_support_ticket",
         "LIST_PAYMENT_METHODS": "list_payment_methods",
         "LIST_SAVED_ADDRESSES": "list_saved_addresses",
+        "ADD_NEW_ADDRESS": "add_new_address",
         "ADD_TO_CART": "add_to_cart",
         "REMOVE_FROM_CART": "remove_from_cart",
         "UPDATE_CART_ITEM": "update_cart_item",
@@ -977,7 +1105,12 @@ def decision_node(state: GraphState) -> GraphState:
     }.get(action)
 
     if canonical is not None:
-        if tool is None:
+        # CREATE_ORDER is always routed to the canonical backend
+        # capability.  The decision node never substitutes another
+        # tool for an authorized order-creation action.
+        if action == "CREATE_ORDER":
+            tool = "create_order"
+        elif tool is None:
             tool = canonical
         elif tool != canonical:
             return _decision_result(
@@ -1002,6 +1135,18 @@ def decision_node(state: GraphState) -> GraphState:
             action=action,
             tool=None,
             reason=reason,
+        )
+
+    # Never route an unsupported capability to the Tool node.
+    # Policy remains authoritative for authorization; this is only a
+    # structural routing guard against malformed/unknown tool names.
+    if tool not in SUPPORTED_TOOLS:
+        return _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=False,
+            action=action,
+            tool=None,
+            reason="unsupported_tool",
         )
 
     return _decision_result(

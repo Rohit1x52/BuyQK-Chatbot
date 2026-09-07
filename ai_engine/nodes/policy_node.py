@@ -92,6 +92,7 @@ SUPPORTED_TOOLS = {
     # Address
     # -----------------------------------------------------
     "list_saved_addresses",
+    "add_new_address",
 }
 
 
@@ -599,39 +600,115 @@ def _checkout_has_required_state(
     state: GraphState,
 ) -> tuple[bool, list[str]]:
     """
-    Validate that the current GraphState contains the
-    transaction fields required before CREATE_ORDER.
+    Validate the final structural requirements before CREATE_ORDER.
 
-    This does NOT validate business facts such as:
+    Required state:
+
+        checkout_id
+        cart checkout readiness
+        product/order items
+        quantity
+        address
+        payment
+
+    This is intentionally a structural/state validation only.
+
+    It does NOT validate business facts such as:
 
         product exists
         stock is sufficient
         address belongs to user
         payment is currently available
+        prices, taxes, delivery charges, discounts, or totals
 
-    Those are backend responsibilities.
+    Those remain backend responsibilities.
     """
 
     missing: list[str] = []
 
-    if not (
-        _has_value(
-            state.get("product_id")
-        )
-        or _has_value(
-            state.get("product_name")
-        )
-    ):
-        missing.append(
-            "product_name"
-        )
+    # -----------------------------------------------------
+    # Checkout ID
+    # -----------------------------------------------------
 
     if not _has_value(
-        state.get("quantity")
+        state.get("checkout_id")
     ):
         missing.append(
-            "quantity"
+            "checkout_id"
         )
+
+    # -----------------------------------------------------
+    # Cart checkout readiness
+    # -----------------------------------------------------
+
+    if not bool(
+        state.get(
+            "cart_checkout_ready",
+            False,
+        )
+    ):
+        missing.append(
+            "cart_checkout_ready"
+        )
+
+    # -----------------------------------------------------
+    # Product / order items
+    # -----------------------------------------------------
+    #
+    # CREATE_ORDER must be based on an actual checkout/cart
+    # snapshot. A stale product_name/product_id alone is not
+    # sufficient to prove that order items are present.
+    # -----------------------------------------------------
+
+    cart_items = _get_cart_items(
+        state
+    )
+
+    if not cart_items:
+        missing.append(
+            "order_items"
+        )
+
+    # -----------------------------------------------------
+    # Quantity
+    # -----------------------------------------------------
+    #
+    # Validate quantities structurally from the current cart
+    # snapshot. Each order item must have a positive integer
+    # quantity. No stock/business validation is performed here.
+    # -----------------------------------------------------
+
+    if cart_items:
+        invalid_quantity = False
+
+        for item in cart_items:
+            if not isinstance(
+                item,
+                dict,
+            ):
+                invalid_quantity = True
+                break
+
+            quantity = item.get(
+                "quantity"
+            )
+
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, int)
+                or quantity <= 0
+            ):
+                invalid_quantity = True
+                break
+
+        if invalid_quantity:
+            missing.append(
+                "quantity"
+            )
+
+    # -----------------------------------------------------
+    # Address
+    # -----------------------------------------------------
 
     address_id = state.get(
         "address_id"
@@ -652,6 +729,10 @@ def _checkout_has_required_state(
         missing.append(
             "address_id"
         )
+
+    # -----------------------------------------------------
+    # Payment
+    # -----------------------------------------------------
 
     payment_method = state.get(
         "selected_payment_method"
@@ -945,6 +1026,81 @@ def _validate_cart_action(
 
 
 # =========================================================
+# Entity Access
+# =========================================================
+
+
+def _get_entities(
+    state: GraphState,
+) -> dict[str, Any]:
+    """Return accumulated entities safely for Policy validation."""
+
+    entities = state.get("entities", {})
+    return dict(entities) if isinstance(entities, dict) else {}
+
+
+# =========================================================
+# Validate ADD_NEW_ADDRESS
+# =========================================================
+
+def _validate_add_new_address(
+    state: GraphState,
+    action: str,
+    tool: str | None,
+) -> GraphState:
+    """Validate required user-supplied fields for address creation."""
+
+    if tool != "add_new_address":
+        return _failure(
+            "add_new_address_requires_add_new_address_tool",
+            action=action,
+            tool=tool,
+            retryable=False,
+        )
+
+    arguments = _get_planned_arguments(state)
+    required = (
+        "address_label",
+        "address_text",
+        "address_city",
+        "address_state",
+        "address_postal_code",
+    )
+
+    missing = [
+        field
+        for field in required
+        if not _has_value(arguments.get(field))
+        and not _has_value(state.get(field))
+        and not _has_value(_get_entities(state).get(field))
+    ]
+
+    if missing:
+        result = {
+            "allowed": False,
+            "action": action,
+            "tool": tool,
+            "reason": "new_address_incomplete",
+            "missing_fields": missing,
+            "retryable": True,
+        }
+        return {
+            "policy_result": result,
+            "policy_error": result,
+            "policy_decision": "deny",
+            "policy_allowed": False,
+            "policy_reason": "new_address_incomplete",
+            "tool_name": None,
+            "missing_fields": missing,
+            "planner_action": action,
+            "planner_tool": tool,
+            "planner_status": "rejected",
+        }
+
+    return _success(action, tool)
+
+
+# =========================================================
 # Validate CREATE_ORDER
 # =========================================================
 
@@ -1050,33 +1206,24 @@ def _validate_track_order(
     responsibility.
     """
 
-    order_id = state.get(
-        "order_id"
-    )
+    order_id = state.get("order_id")
+    order_reference = state.get("order_reference")
+    order_reference_type = state.get("order_reference_type")
 
-    planned_arguments = _get_planned_arguments(
-        state
-    )
+    planned_arguments = _get_planned_arguments(state)
+    planned_order_id = planned_arguments.get("order_id") if isinstance(planned_arguments, dict) else None
+    planned_order_reference = planned_arguments.get("order_reference") if isinstance(planned_arguments, dict) else None
+    planned_reference_type = planned_arguments.get("order_reference_type") if isinstance(planned_arguments, dict) else None
 
-    planned_order_id = None
-
-    if isinstance(
-        planned_arguments,
-        dict,
-    ):
-        planned_order_id = (
-            planned_arguments.get(
-                "order_id"
-            )
-        )
+    valid_reference_type = {"specific", "latest", "previous"}
 
     if not (
-        _has_value(
-            order_id
-        )
-        or _has_value(
-            planned_order_id
-        )
+        _has_value(order_id)
+        or _has_value(planned_order_id)
+        or _has_value(order_reference)
+        or _has_value(planned_order_reference)
+        or order_reference_type in valid_reference_type
+        or planned_reference_type in valid_reference_type
     ):
         return _failure(
             "missing_order_reference",
@@ -1100,53 +1247,59 @@ def _validate_cancel_order(
     action: str,
     tool: str | None,
 ) -> GraphState:
-    """
-    Validate that a cancellation request contains an order
-    reference.
+    """Validate cancellation workflow state, not business eligibility."""
+    order_id = state.get("order_id")
+    order_reference = state.get("order_reference")
+    order_reference_type = state.get("order_reference_type")
 
-    Whether cancellation is actually allowed is determined
-    by the backend/order service.
-    """
+    planned_arguments = _get_planned_arguments(state)
+    planned_order_id = planned_arguments.get("order_id") if isinstance(planned_arguments, dict) else None
+    planned_order_reference = planned_arguments.get("order_reference") if isinstance(planned_arguments, dict) else None
+    planned_reference_type = planned_arguments.get("order_reference_type") if isinstance(planned_arguments, dict) else None
 
-    order_id = state.get(
-        "order_id"
+    valid_reference_types = {"specific", "latest", "previous"}
+    has_reference = (
+        _has_value(order_id)
+        or _has_value(planned_order_id)
+        or _has_value(order_reference)
+        or _has_value(planned_order_reference)
+        or order_reference_type in valid_reference_types
+        or planned_reference_type in valid_reference_types
     )
 
-    planned_arguments = _get_planned_arguments(
-        state
+    if not has_reference:
+        return _failure("missing_order_reference", action=action, tool=tool, retryable=True)
+
+    # Initial cancellation calls are allowed to reach Tool so the backend can
+    # perform the eligibility preflight. Once that preflight succeeds, a
+    # subsequent cancellation execution requires the user's reason.
+    eligibility = state.get("cancellation_eligibility")
+    resolved_reference = (
+        order_id
+        or planned_order_id
+        or order_reference
+        or planned_order_reference
+    )
+    eligibility_matches_reference = (
+        isinstance(eligibility, dict)
+        and (
+            resolved_reference is None
+            or str(eligibility.get("order_id")) == str(resolved_reference)
+        )
     )
 
-    planned_order_id = None
+    if eligibility_matches_reference and isinstance(eligibility, dict) and eligibility.get("eligible") is True:
+        reason = (
+            state.get("cancellation_reason")
+            or (planned_arguments.get("cancellation_reason") if isinstance(planned_arguments, dict) else None)
+        )
+        if not _has_value(reason):
+            return _failure("missing_cancellation_reason", action=action, tool=tool, retryable=True)
 
-    if isinstance(
-        planned_arguments,
-        dict,
-    ):
-        planned_order_id = (
-            planned_arguments.get(
-                "order_id"
-            )
-        )
+    if eligibility_matches_reference and isinstance(eligibility, dict) and eligibility.get("eligible") is False:
+        return _failure("cancellation_not_eligible", action=action, tool=tool, retryable=False)
 
-    if not (
-        _has_value(
-            order_id
-        )
-        or _has_value(
-            planned_order_id
-        )
-    ):
-        return _failure(
-            "missing_order_reference",
-            action=action,
-            tool=tool,
-            retryable=True,
-        )
-
-    return _success(
-        action,
-        tool,
-    )
+    return _success(action, tool)
 
 
 # =========================================================
@@ -1456,6 +1609,17 @@ def policy_node(
     if action in CART_ACTIONS:
 
         return _validate_cart_action(
+            state,
+            action,
+            tool,
+        )
+
+    # =====================================================
+    # ADD_NEW_ADDRESS
+    # =====================================================
+
+    if action == "ADD_NEW_ADDRESS":
+        return _validate_add_new_address(
             state,
             action,
             tool,

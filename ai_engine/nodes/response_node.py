@@ -1323,9 +1323,33 @@ def _generate_checkout_response(
     metadata: dict[str, Any],
 ) -> str:
     """Generate wording for the graph-selected missing field."""
+
+    # Once the address/payment selection tool has returned, its result is
+    # authoritative for this checkout step. Do not reuse a stale follow-up
+    # question from the previous turn.
+    tool_result = _get_tool_result(state)
+
+    if (
+        next_missing == "address_selection"
+        and isinstance(tool_result, dict)
+        and tool_result.get("type") == "address_selection"
+        and tool_result.get("success") is not False
+    ):
+        return _tool_fallback(tool_result)
+
+    if (
+        next_missing == "payment_method"
+        and isinstance(tool_result, dict)
+        and tool_result.get("type") == "payment_selection"
+        and tool_result.get("success") is not False
+    ):
+        return _tool_fallback(tool_result)
+
     existing = state.get("follow_up_question")
     if isinstance(existing, str) and existing.strip():
-        return existing.strip()
+        safe_existing = _sanitize_user_response(existing)
+        if safe_existing:
+            return safe_existing
 
     context = {
         "current_message": state.get("message", ""),
@@ -1715,10 +1739,15 @@ For product search:
 - use only returned products
 
 For tracking:
-- use only returned order status
+- use only order_id/status/payment_status and other fields explicitly returned by the backend
+- never invent ETA, courier, location, tracking URL, delivery date, or other tracking details
 
 For cancellation:
 - use only returned cancellation result
+- never confirm cancellation unless success is true and type is order_cancelled
+- when type is cancellation_eligibility and needs_reason is true, ask only for the cancellation reason
+- report refund eligibility/status only when explicitly returned by the backend
+- never invent a refund amount, refund ETA, refund method, or refund promise
 
 For support:
 - use only returned ticket information
@@ -2274,10 +2303,39 @@ def _tool_fallback(
         return "The item has been removed from your cart."
 
     # -----------------------------------------------------
+    # Order tracking
+    # -----------------------------------------------------
+    if (
+        success is True
+        and result_type == "order_tracking"
+    ):
+        order_id = tool_result.get("order_id")
+        status = tool_result.get("status")
+        payment_status = tool_result.get("payment_status")
+
+        parts = []
+        if order_id is not None:
+            parts.append(f"Order {order_id}")
+        if status is not None:
+            parts.append(f"status: {status}")
+        if payment_status is not None:
+            parts.append(f"payment status: {payment_status}")
+
+        if parts:
+            return " — ".join(parts) + "."
+        return "I retrieved the order status."
+
+    # -----------------------------------------------------
     # Order
     # -----------------------------------------------------
 
-    if result_type == "order_success":
+    # Confirmation is strictly gated by the backend ToolResult contract.
+    # A result with success=False, missing success, or another result type
+    # can never reach the order-confirmation wording below.
+    if (
+        tool_result.get("success") is True
+        and result_type == "order_success"
+    ):
 
         order_id = tool_result.get(
             "order_id"
@@ -2291,30 +2349,62 @@ def _tool_fallback(
             "payment_method"
         )
 
+        bill = tool_result.get(
+            "bill"
+        )
+
+        purchase_summary = tool_result.get(
+            "purchase_summary"
+        )
+
         parts = [
             "Your order has been placed."
         ]
 
         if order_id is not None:
-
             parts.append(
                 f"Order ID: #{order_id}."
             )
 
         if status is not None:
-
             parts.append(
                 f"Status: {status}."
             )
 
         if payment_method is not None:
-
             parts.append(
                 f"Payment: {payment_method}."
             )
 
-        if order_id is not None:
+        # Billing values are copied only from the backend result.
+        # Nothing is calculated, inferred, or replaced here.
+        billing_source = (
+            bill
+            if isinstance(bill, dict)
+            else (
+                purchase_summary
+                if isinstance(purchase_summary, dict)
+                else None
+            )
+        )
 
+        if billing_source is not None:
+            for label, key in (
+                ("Items", "items"),
+                ("Subtotal", "subtotal"),
+                ("Delivery charge", "delivery_charge"),
+                ("Discount", "discount"),
+                ("Tax", "tax"),
+                ("Total", "total"),
+                ("Currency", "currency"),
+            ):
+                value = billing_source.get(key)
+                if value is not None:
+                    parts.append(
+                        f"{label}: {value}."
+                    )
+
+        if order_id is not None:
             parts.append(
                 "Would you like me to track your order?"
             )
@@ -2360,25 +2450,42 @@ def _tool_fallback(
         )
 
     # -----------------------------------------------------
+    # Cancellation eligibility
+    # -----------------------------------------------------
+
+    if (
+        success is True
+        and result_type == "cancellation_eligibility"
+        and tool_result.get("needs_reason") is True
+    ):
+        return "Cancellation ka reason bata dijiye."
+
+    # -----------------------------------------------------
     # Cancellation
     # -----------------------------------------------------
 
-    if result_type == "order_cancelled":
-
-        order_id = tool_result.get(
-            "order_id"
-        )
+    if (
+        success is True
+        and result_type == "order_cancelled"
+    ):
+        order_id = tool_result.get("order_id")
+        parts: list[str] = []
 
         if order_id is not None:
+            parts.append(f"Order #{order_id} has been cancelled.")
+        else:
+            parts.append("Your order has been cancelled.")
 
-            return (
-                f"Order #{order_id} "
-                "has been cancelled."
-            )
+        refund = tool_result.get("refund_eligibility")
+        if isinstance(refund, dict):
+            refund_status = refund.get("status")
+            payment_status = refund.get("payment_status")
+            if refund_status is not None:
+                parts.append(f"Refund status: {refund_status}.")
+            elif payment_status is not None:
+                parts.append(f"Payment status: {payment_status}.")
 
-        return (
-            "The order has been cancelled."
-        )
+        return " ".join(parts)
 
     # -----------------------------------------------------
     # Support
@@ -2656,10 +2763,10 @@ def _tool_metadata(
             tool_result,
         )
 
-    if result_type == "tracking":
+    if result_type == "order_tracking":
 
         return {
-            "type": "tracking",
+            "type": "order_tracking",
             "order_id": tool_result.get(
                 "order_id"
             ),
@@ -2674,16 +2781,21 @@ def _tool_metadata(
             ),
         }
 
-    if result_type == "order_cancelled":
+    if result_type == "cancellation_eligibility":
+        return {
+            "type": "cancellation_eligibility",
+            "order_id": tool_result.get("order_id"),
+            "eligible": tool_result.get("eligible"),
+            "needs_reason": tool_result.get("needs_reason"),
+        }
 
+    if result_type == "order_cancelled":
         return {
             "type": "order_cancelled",
-            "order_id": tool_result.get(
-                "order_id"
-            ),
-            "status": tool_result.get(
-                "status"
-            ),
+            "order_id": tool_result.get("order_id"),
+            "status": tool_result.get("status"),
+            "cancellation_reason": tool_result.get("cancellation_reason"),
+            "refund_eligibility": tool_result.get("refund_eligibility"),
         }
 
     if result_type == "support_ticket":
@@ -2937,37 +3049,105 @@ def response_node(
         "current_missing_field"
     )
 
+    # A selection-tool result has priority over a stale follow-up question.
+    # The tool has supplied the interactive checkout options, so render those
+    # options instead of returning only the previous text prompt.
+    interactive_tool_result = (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is not False
+        and tool_result.get("type") in {
+            "address_selection",
+            "payment_selection",
+        }
+    )
+
+    # ---------------------------------------------------------
+    # Never expose raw / malformed LLM follow-up output.
+    #
+    # Followup Node may receive model output containing:
+    #     <think>
+    #     <think>...</think>
+    #     <analysis>...</analysis>
+    #
+    # Response Node is the final customer-facing boundary, so
+    # sanitize the follow-up question again here.
+    # ---------------------------------------------------------
+
+    # A follow-up question is untrusted model output. Never allow a
+    # reasoning marker (including an unmatched <think>) to become the
+    # customer-facing response. If such a marker is present, discard the
+    # entire model follow-up and use the deterministic context fallback.
+    raw_follow_up = (
+        follow_up_question
+        if isinstance(follow_up_question, str)
+        else ""
+    )
+    has_hidden_reasoning = bool(
+        re.search(
+            r"<\s*(?:think|analysis)\b",
+            raw_follow_up,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    safe_follow_up_question = (
+        ""
+        if has_hidden_reasoning
+        else _sanitize_user_response(raw_follow_up)
+    )
+
     if (
         awaiting_user_input
-        and isinstance(
-            follow_up_question,
-            str,
-        )
-        and follow_up_question.strip()
+        and not interactive_tool_result
     ):
-        question = follow_up_question.strip()
+        # Use the Followup Node's question when it is valid.
+        if safe_follow_up_question:
+            question = safe_follow_up_question
 
-        metadata.update(
-            {
-                "type": "follow_up",
-                "question": question,
-                "field": current_missing_field,
+        # If the Followup Node returned unusable model output,
+        # generate a deterministic, context-aware question.
+        #
+        # This uses the graph-provided missing field and the
+        # already-extracted product entity. No product is hardcoded.
+        else:
+            question = _localized_context_fallback(
+                presentation_state,
+                current_missing_field or next_missing,
+            )
+
+        question = _sanitize_user_response(question)
+
+        if question:
+            metadata.update(
+                {
+                    "type": "follow_up",
+                    "question": question,
+                    "field": (
+                        current_missing_field
+                        or next_missing
+                    ),
+                    "missing_fields": missing_fields,
+                    "awaiting_user_input": True,
+                }
+            )
+
+            return {
+                "response": question,
+                "response_language": response_language,
+                "tool_result": tool_result_object,
+                "metadata": metadata,
                 "missing_fields": missing_fields,
+                "next_missing": (
+                    current_missing_field
+                    or next_missing
+                ),
+                "current_missing_field": (
+                    current_missing_field
+                    or next_missing
+                ),
+                "follow_up_question": question,
                 "awaiting_user_input": True,
             }
-        )
-
-        return {
-            "response": question,
-            "response_language": response_language,
-            "tool_result": tool_result_object,
-            "metadata": metadata,
-            "missing_fields": missing_fields,
-            "next_missing": current_missing_field,
-            "current_missing_field": current_missing_field,
-            "follow_up_question": question,
-            "awaiting_user_input": True,
-        }
 
     # ---------------------------------------------------------
     # Preserve graph-controlled checkout state.
@@ -3194,7 +3374,7 @@ def response_node(
     if (
         isinstance(tool_result, dict)
         and tool_result.get("success") is True
-        and tool_result.get("type") == "tracking"
+        and tool_result.get("type") == "order_tracking"
     ):
         response = _generate_tool_response(presentation_state)
 
@@ -3221,6 +3401,59 @@ def response_node(
             "order_id": tool_result.get("order_id"),
             "awaiting_order_tracking_confirmation": False,
         }
+
+    # ---------------------------------------------------------
+    # Cancellation
+    # ---------------------------------------------------------
+    if isinstance(tool_result, dict):
+        if (
+            tool_result.get("success") is True
+            and tool_result.get("type") == "cancellation_eligibility"
+            and tool_result.get("needs_reason") is True
+        ):
+            cancellation_metadata = _tool_metadata(
+                presentation_state,
+                missing_fields,
+            )
+            cancellation_metadata["missing_fields"] = ["cancellation_reason"]
+            cancellation_metadata["next_missing"] = "cancellation_reason"
+            return {
+                "response": "Cancellation ka reason bata dijiye.",
+                "response_language": response_language,
+                "tool_result": tool_result_object,
+                "metadata": cancellation_metadata,
+                "missing_fields": ["cancellation_reason"],
+                "next_missing": "cancellation_reason",
+                "current_missing_field": "cancellation_reason",
+                "awaiting_user_input": True,
+                "awaiting_cancellation_reason": True,
+                "order_id": tool_result.get("order_id"),
+            }
+
+        if (
+            tool_result.get("success") is True
+            and tool_result.get("type") == "order_cancelled"
+        ):
+            cancellation_metadata = _tool_metadata(
+                presentation_state,
+                missing_fields,
+            )
+            response = _sanitize_user_response(
+                _tool_fallback(tool_result)
+            )
+            return {
+                "response": response,
+                "response_language": response_language,
+                "tool_result": tool_result_object,
+                "metadata": cancellation_metadata,
+                "missing_fields": [],
+                "next_missing": None,
+                "order_id": tool_result.get("order_id"),
+                "cancellation_reason": tool_result.get("cancellation_reason"),
+                "cancellation_eligibility": tool_result.get("cancellation_eligibility"),
+                "refund_eligibility": tool_result.get("refund_eligibility"),
+                "awaiting_cancellation_reason": False,
+            }
 
     # ---------------------------------------------------------
     # 7. Product search
@@ -3300,6 +3533,26 @@ def response_node(
     policy_error = state.get("policy_error")
     if isinstance(policy_error, dict) and policy_error.get("allowed") is False:
         reason = str(policy_error.get("reason") or "").strip()
+
+        if reason == "missing_cancellation_reason":
+            return {
+                "response": "Cancellation ka reason bata dijiye.",
+                "response_language": response_language,
+                "tool_result": tool_result_object,
+                "metadata": {
+                    **metadata,
+                    "type": "follow_up",
+                    "field": "cancellation_reason",
+                    "missing_fields": ["cancellation_reason"],
+                    "next_missing": "cancellation_reason",
+                },
+                "missing_fields": ["cancellation_reason"],
+                "next_missing": "cancellation_reason",
+                "current_missing_field": "cancellation_reason",
+                "awaiting_user_input": True,
+                "awaiting_cancellation_reason": True,
+                "order_id": state.get("order_id"),
+            }
         try:
             response = _sanitize_user_response(
                 _generate_llm_response({
@@ -3456,6 +3709,10 @@ def response_node(
 
     if not response:
         response = _general_fallback(message)
+
+    # Final customer-facing boundary: no hidden reasoning marker may leave
+    # the Response Node, regardless of which generation path produced it.
+    response = _sanitize_user_response(response)
 
     metadata = _clean_checkout_metadata(
         metadata,

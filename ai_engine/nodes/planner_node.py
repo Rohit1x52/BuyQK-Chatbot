@@ -95,6 +95,9 @@ PLANNER_ACTIONS: set[str] = {
     "clear_cart",
     "show_cart",
     "checkout_cart",
+
+    # Phase 7A address capability.
+    "add_new_address",
 }
 
 
@@ -581,6 +584,11 @@ def _build_planner_prompt(
         "conversation_history",
         [],
     )
+    if isinstance(conversation_history, list):
+        # The planner needs recent conversational context, not the entire
+        # transcript. Keeping a bounded window prevents provider TPM
+        # failures while retaining follow-up context.
+        conversation_history = conversation_history[-6:]
 
     entities = state.get(
         "entities",
@@ -599,7 +607,11 @@ def _build_planner_prompt(
     cart_state = {
         "cart_id": state.get("cart_id"),
         "cart_status": state.get("cart_status"),
-        "cart_items": state.get("cart_items", []),
+        "cart_items": (
+            state.get("cart_items", [])[-20:]
+            if isinstance(state.get("cart_items", []), list)
+            else []
+        ),
         "cart_summary": state.get("cart_summary"),
         "cart_action": (
             entities.get("cart_action")
@@ -623,6 +635,15 @@ def _build_planner_prompt(
         "checkout_status": state.get(
             "checkout_status"
         ),
+        "address_id": state.get(
+            "address_id"
+        ) or state.get("selected_address_id"),
+        "delivery_preference": state.get(
+            "delivery_preference"
+        ),
+        "selected_payment_method": state.get(
+            "selected_payment_method"
+        ) or state.get("payment_method"),
         "order_created": state.get(
             "order_created"
         ),
@@ -632,6 +653,8 @@ def _build_planner_prompt(
         "bill": state.get(
             "bill"
         ),
+        "cancellation_eligibility": state.get("cancellation_eligibility"),
+        "cancellation_reason": state.get("cancellation_reason"),
     }
 
     # -----------------------------------------------------
@@ -702,6 +725,26 @@ You must NOT:
 
 The backend is authoritative for transactional facts.
 
+CHECKOUT CONTINUITY RULE:
+
+When an active checkout is present, preserve these already-understood
+checkout values in the execution plan when they are available:
+
+- checkout_id
+- address_id
+- delivery_preference
+- selected_payment_method
+
+These values are state/context values, not values to calculate or invent.
+Prefer backend-resolved/state values over anything newly invented by the
+planner model. The planner must not calculate delivery charges, choose
+delivery availability, or convert a delivery preference into a backend
+delivery option.
+
+For order creation, carry the available checkout values into arguments so
+downstream Policy/Decision/Tool layers receive the complete order context.
+If a value is absent, leave it absent; do not fabricate it.
+
 IMPORTANT CHECKOUT RULE:
 
 The supplied checkout state is authoritative.
@@ -724,6 +767,16 @@ use modify_checkout.
 
 If the user's reference cannot be resolved from the
 available context, use ask_clarification.
+
+CANCELLATION PLANNING RULE:
+
+For order cancellation:
+- specific order IDs/references come only from entity/state
+- latest/previous order references must be passed through for backend resolution
+- do not decide cancellation eligibility
+- do not invent a cancellation reason
+- if the user has supplied a cancellation_reason, preserve it exactly
+- the Tool Node/backend owns eligibility and cancellation execution
 
 Available capabilities:
 
@@ -749,6 +802,14 @@ Phase 3 cart capabilities:
 - clear_cart
 - show_cart
 - checkout_cart
+
+Phase 7A address capability:
+
+- add_new_address
+
+When the user explicitly asks to add a new delivery address, use
+add_new_address only when address_action is "add". Pass only address
+fields already present in the supplied state. Never invent address data.
 
 CART PLANNING RULE:
 
@@ -910,6 +971,57 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
 
     if intent == "order_create":
         args = {}
+
+        # Phase 7A: explicitly requested new-address flow.
+        # This is conversational intent only; persistence happens in Tool.
+        if str(entities.get("address_action") or "").strip().lower() == "add":
+            for key in (
+                "address_label",
+                "address_text",
+                "address_line_2",
+                "address_city",
+                "address_state",
+                "address_postal_code",
+            ):
+                value = entities.get(key)
+                if value is not None and str(value).strip():
+                    args[key] = value
+
+            required_address_fields = (
+                "address_label",
+                "address_text",
+                "address_city",
+                "address_state",
+                "address_postal_code",
+            )
+            address_missing = [
+                field
+                for field in required_address_fields
+                if not args.get(field)
+            ]
+
+            if address_missing:
+                return {
+                    "action": "ask_clarification",
+                    "tool_name": "ask_clarification",
+                    "arguments": args,
+                    "missing_fields": address_missing,
+                    "confidence": 0.0,
+                    "reason": (
+                        "A new delivery address was requested, but required "
+                        "address information is missing."
+                    ),
+                }
+
+            return {
+                "action": "add_new_address",
+                "tool_name": "add_new_address",
+                "arguments": args,
+                "missing_fields": [],
+                "confidence": 0.0,
+                "reason": "Deterministic new-address checkout flow.",
+            }
+
         for key in (
             "product_name",
             "quantity",
@@ -918,6 +1030,30 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         ):
             value = entities.get(key)
             if value is not None:
+                args[key] = value
+
+        # Preserve already-resolved checkout context. These values are
+        # carried forward only; the planner does not calculate or invent
+        # transactional facts.
+        checkout_values = {
+            "checkout_id": state.get("checkout_id"),
+            "address_id": (
+                state.get("address_id")
+                or state.get("selected_address_id")
+            ),
+            "delivery_preference": state.get(
+                "delivery_preference"
+            ),
+            "selected_payment_method": (
+                state.get("selected_payment_method")
+                or state.get("payment_method")
+            ),
+        }
+
+        for key, value in checkout_values.items():
+            if value is not None and (
+                not isinstance(value, str) or value.strip()
+            ):
                 args[key] = value
 
         if missing:
@@ -945,6 +1081,71 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
+    if intent == "order_cancel":
+        arguments: dict[str, Any] = {}
+        for key in (
+            "order_id",
+            "order_reference",
+            "order_reference_type",
+            "cancellation_reason",
+        ):
+            value = entities.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                arguments[key] = value
+
+        if not (
+            arguments.get("order_id")
+            or arguments.get("order_reference")
+            or arguments.get("order_reference_type") in {"latest", "previous"}
+        ):
+            return {
+                "action": "ask_clarification",
+                "tool_name": "ask_clarification",
+                "arguments": {},
+                "missing_fields": ["order_id"],
+                "confidence": 0.0,
+                "reason": "Cancellation requires an order reference.",
+            }
+
+        return {
+            "action": "cancel_order",
+            "tool_name": "cancel_order",
+            "arguments": arguments,
+            "missing_fields": [],
+            "confidence": 0.0,
+            "reason": "Deterministic cancellation plan used because the planner model was unavailable.",
+        }
+
+    if intent == "order_tracking":
+        arguments: dict[str, Any] = {}
+        for key in ("order_id", "order_reference", "order_reference_type"):
+            value = entities.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                arguments[key] = value
+
+        if not (
+            arguments.get("order_id")
+            or arguments.get("order_reference")
+            or arguments.get("order_reference_type") in {"latest", "previous"}
+        ):
+            return {
+                "action": "ask_clarification",
+                "tool_name": "ask_clarification",
+                "arguments": {},
+                "missing_fields": ["order_id"],
+                "confidence": 0.0,
+                "reason": "Tracking requires an order reference.",
+            }
+
+        return {
+            "action": "track_order",
+            "tool_name": "track_order",
+            "arguments": arguments,
+            "missing_fields": [],
+            "confidence": 0.0,
+            "reason": "Deterministic tracking plan used because the planner model was unavailable.",
+        }
+
     mapping = {
         "product_search": "search_products",
         "order_tracking": "track_order",
@@ -952,15 +1153,160 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         "customer_support": "request_support",
     }
     action = mapping.get(intent, "answer")
+
+    # Build arguments from already-understood entity state when the
+    # planner LLM is unavailable. This prevents a provider failure from
+    # dropping the current product and accidentally falling back to stale
+    # or empty arguments. No product is invented here.
+    arguments: dict[str, Any] = {}
+    if intent == "product_search":
+        product_name = entities.get("product_name")
+        if isinstance(product_name, str) and product_name.strip():
+            arguments["product_name"] = product_name.strip()
+
+    if intent in {"order_tracking", "order_cancel"}:
+        order_id = entities.get("order_id")
+        if order_id is not None:
+            try:
+                normalized_order_id = int(order_id)
+                if normalized_order_id > 0:
+                    arguments["order_id"] = normalized_order_id
+            except (TypeError, ValueError):
+                pass
+
+        if intent in {"order_tracking", "order_cancel"}:
+            for key in ("order_reference", "order_reference_type"):
+                value = entities.get(key)
+                if value is not None and (not isinstance(value, str) or value.strip()):
+                    arguments[key] = value
+
+        if intent == "order_cancel":
+            value = entities.get("cancellation_reason")
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                arguments["cancellation_reason"] = value
+
     return {
         "action": action,
         "tool_name": action if action != "answer" else None,
-        "arguments": {},
+        "arguments": arguments,
         "missing_fields": missing,
         "confidence": 0.0,
         "reason": "Deterministic planner fallback used because the planner model was unavailable.",
     }
 
+
+def _preserve_checkout_arguments(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Preserve already-resolved checkout context in the planner arguments.
+
+    The planner may carry authoritative state forward, but it must not
+    calculate, invent, or mutate transactional values.
+    """
+    action = _normalize_action(plan.get("action"))
+    if action not in {
+        "start_checkout",
+        "modify_checkout",
+        "add_to_checkout",
+        "create_order",
+    }:
+        return plan
+
+    arguments = plan.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    merged_arguments = dict(arguments)
+
+    authoritative_values = {
+        "checkout_id": state.get("checkout_id"),
+        "address_id": (
+            state.get("address_id")
+            or state.get("selected_address_id")
+        ),
+        "delivery_preference": state.get(
+            "delivery_preference"
+        ),
+        "selected_payment_method": (
+            state.get("selected_payment_method")
+            or state.get("payment_method")
+        ),
+    }
+
+    for key, value in authoritative_values.items():
+        if value is not None and (
+            not isinstance(value, str) or value.strip()
+        ):
+            merged_arguments[key] = value
+
+    plan["arguments"] = merged_arguments
+    return plan
+
+
+def _preserve_tracking_arguments(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry already-understood tracking references into the tool plan."""
+    action = _normalize_action(plan.get("action"))
+    if action != "track_order":
+        return plan
+
+    arguments = plan.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    merged = dict(arguments)
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    for key in ("order_id", "order_reference", "order_reference_type"):
+        value = entities.get(key)
+        if value is None:
+            value = state.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            merged[key] = value
+
+    plan["arguments"] = merged
+    return plan
+
+
+
+def _preserve_cancellation_arguments(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry order reference and user-provided reason into cancellation."""
+    action = _normalize_action(plan.get("action"))
+    if action != "cancel_order":
+        return plan
+
+    arguments = plan.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    merged = dict(arguments)
+
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    for key in (
+        "order_id",
+        "order_reference",
+        "order_reference_type",
+        "cancellation_reason",
+    ):
+        value = entities.get(key)
+        if value is None:
+            value = state.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            merged[key] = value
+
+    plan["arguments"] = merged
+    return plan
 
 def planner_node(
     state: dict[str, Any],
@@ -1118,6 +1464,29 @@ def planner_node(
         )
 
     # -----------------------------------------------------
+    # Preserve checkout context in the execution plan
+    # -----------------------------------------------------
+    #
+    # These values are already understood/state-backed. Carry them
+    # forward for checkout/order capabilities without calculating,
+    # inventing, or mutating transactional facts.
+    # -----------------------------------------------------
+
+    plan = _preserve_checkout_arguments(
+        state,
+        plan,
+    )
+
+    plan = _preserve_tracking_arguments(
+        state,
+        plan,
+    )
+    plan = _preserve_cancellation_arguments(
+        state,
+        plan,
+    )
+
+    # -----------------------------------------------------
     # Preserve backend transaction state
     # -----------------------------------------------------
     #
@@ -1202,6 +1571,21 @@ def planner_node(
     print(
         f"checkout_status = "
         f"{state.get('checkout_status')!r}"
+    )
+
+    print(
+        f"address_id      = "
+        f"{state.get('address_id') or state.get('selected_address_id')!r}"
+    )
+
+    print(
+        f"delivery_pref   = "
+        f"{state.get('delivery_preference')!r}"
+    )
+
+    print(
+        f"payment_method  = "
+        f"{state.get('selected_payment_method') or state.get('payment_method')!r}"
     )
 
     print(

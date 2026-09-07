@@ -47,6 +47,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -64,7 +65,10 @@ from backend.services.product_service import (
 from backend.services.order_service import (
     create_order,
     get_order,
+    get_user_orders,
     cancel_order,
+    check_cancellation_eligibility,
+    get_refund_eligibility,
     build_order_bill,
     get_available_payment_methods,
 )
@@ -75,6 +79,7 @@ from backend.services.support_service import (
 
 from backend.services.address_service import (
     get_user_addresses,
+    create_address,
 )
 
 from backend.services.cart_service import (
@@ -939,12 +944,12 @@ def _get_payment_method(
     """
 
     payment_method = state.get(
-        "payment_method"
+        "selected_payment_method"
     )
 
     if payment_method is None:
         payment_method = state.get(
-            "selected_payment_method"
+            "payment_method"
         )
 
     if payment_method is None:
@@ -960,6 +965,81 @@ def _get_payment_method(
     ).strip().casefold()
 
     return normalized or None
+
+
+def _validate_payment_method(
+    payment_method: str,
+) -> tuple[bool, str | None]:
+    """
+    Validate the selected payment method against the backend-authoritative
+    payment-method catalog.
+
+    The Tool Node never maintains its own payment allowlist or aliases.
+    The backend remains the source of truth.
+    """
+
+    if not _has_value(payment_method):
+        return (
+            False,
+            "Please select a payment method before placing the order.",
+        )
+
+    try:
+        methods = get_available_payment_methods()
+    except Exception as exc:
+        print(
+            "[PAYMENT VALIDATION ERROR]",
+            type(exc).__name__,
+            str(exc),
+        )
+        return (
+            False,
+            "Payment methods are currently unavailable.",
+        )
+
+    if methods is None:
+        return (
+            False,
+            "Payment methods are currently unavailable.",
+        )
+
+    if isinstance(methods, dict):
+        raw_methods = (
+            methods.get("methods")
+            if isinstance(methods.get("methods"), list)
+            else [methods]
+        )
+    elif isinstance(methods, (list, tuple, set)):
+        raw_methods = list(methods)
+    else:
+        raw_methods = [methods]
+
+    requested = str(payment_method).strip().casefold()
+
+    for method in raw_methods:
+        if isinstance(method, dict):
+            candidates = [
+                method.get("id"),
+                method.get("code"),
+                method.get("name"),
+                method.get("method"),
+                method.get("value"),
+                method.get("payment_method"),
+            ]
+        else:
+            candidates = [method]
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            if str(candidate).strip().casefold() == requested:
+                return True, None
+
+    return (
+        False,
+        "The selected payment method is not available.",
+    )
 
 
 # =========================================================
@@ -1985,7 +2065,9 @@ def _tool_node_impl(
                     "success": False,
                     "type": "product_search",
                     "error": "Product name is required.",
-                }
+                },
+                "product_search_results": [],
+                "selected_product": None,
             }
 
         try:
@@ -2027,6 +2109,10 @@ def _tool_node_impl(
 
                 "entities": updated_entities,
 
+                # Preserve the complete backend-derived candidate set in
+                # GraphState for later product selection.
+                "product_search_results": serialized_products,
+
                 "selected_product": (
                     serialized_products[0]
                     if len(serialized_products) == 1
@@ -2047,8 +2133,112 @@ def _tool_node_impl(
                     "success": False,
                     "type": "product_search",
                     "error": str(exc),
+                },
+                "product_search_results": [],
+                "selected_product": None,
+            }
+
+# =====================================================
+    # ADD NEW ADDRESS
+    # =====================================================
+
+    if tool_name == "add_new_address":
+
+        if user_id is None:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "address_creation",
+                    "error": "User ID is required to create an address.",
                 }
             }
+
+        try:
+            normalized_user_id = int(user_id)
+            if normalized_user_id <= 0:
+                raise ValueError("Invalid user ID.")
+        except (TypeError, ValueError) as exc:
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "address_creation",
+                    "error": str(exc),
+                }
+            }
+
+        def _address_value(key: str) -> Any:
+            value = state.get(key)
+            if value is not None and str(value).strip():
+                return value
+            value = updated_entities.get(key)
+            if value is not None and str(value).strip():
+                return value
+            planner_args = state.get("planner_args")
+            if isinstance(planner_args, dict):
+                value = planner_args.get(key)
+                if value is not None and str(value).strip():
+                    return value
+            return None
+
+        label = _address_value("address_label")
+        address_text = _address_value("address_text")
+        address_line_2 = _address_value("address_line_2")
+        city = _address_value("address_city")
+        address_state = _address_value("address_state")
+        postal_code = _address_value("address_postal_code")
+
+        try:
+            new_address = create_address(
+                db=db,
+                user_id=normalized_user_id,
+                label=str(label).strip() if label is not None else "",
+                address=str(address_text).strip() if address_text is not None else "",
+                city=str(city).strip() if city is not None else None,
+                state=str(address_state).strip() if address_state is not None else None,
+                postal_code=str(postal_code).strip() if postal_code is not None else None,
+                address_line_2=(
+                    str(address_line_2).strip()
+                    if address_line_2 is not None and str(address_line_2).strip()
+                    else None
+                ),
+            )
+        except Exception as exc:
+            print(
+                "[TOOL add_new_address ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "address_creation",
+                    "error": str(exc),
+                }
+            }
+
+        serialized = _serialize_address(new_address)
+        new_address_id = serialized.get("id")
+
+        return {
+            "tool_name": "add_new_address",
+            "tool_result": {
+                "success": True,
+                "type": "address_selection",
+                "action": "add_new_address",
+                "address": serialized,
+                "selected_address_id": new_address_id,
+                "allow_new": True,
+                "next_step": "payment_selection",
+            },
+            "address_id": new_address_id,
+            "selected_address_id": new_address_id,
+            "checkout_status": state.get("checkout_status") or "collecting",
+            "entities": {
+                **updated_entities,
+                "address_id": new_address_id,
+                "address_action": "select",
+            },
+        }
 
     # =====================================================
     # LIST SAVED ADDRESSES
@@ -2359,18 +2549,35 @@ def _tool_node_impl(
         # Address and payment selection remain part of the
         # existing checkout flow and are validated by the
         # authoritative order path before order creation.
+        # Phase 7A: successful cart validation initializes the checkout
+        # transaction state exactly once for this conversation.
+        initialized_checkout_id = (
+            str(checkout_id).strip()
+            if checkout_id is not None and str(checkout_id).strip()
+            else str(uuid.uuid4())
+        )
+        initialized_checkout_status = (
+            state.get("checkout_status")
+            or "collecting"
+        )
+
         return {
+            "tool_name": "checkout_cart",
             "tool_result": {
                 "success": True,
                 "type": "cart_checkout",
                 "action": "checkout_cart",
                 "checkout_ready": True,
+                "checkout_id": initialized_checkout_id,
+                "checkout_status": initialized_checkout_status,
                 "cart": cart,
                 "cart_id": cart.get("cart_id"),
                 "items": items,
                 "summary": cart.get("summary"),
                 "next_step": "address_selection",
             },
+            "checkout_id": initialized_checkout_id,
+            "checkout_status": initialized_checkout_status,
             **_cart_state_from_result(
                 cart,
                 checkout_ready=True,
@@ -2541,6 +2748,34 @@ def _tool_node_impl(
                     ),
                 },
                 "entities": updated_entities,
+            }
+
+        # =================================================
+        # BACKEND PAYMENT VALIDATION
+        # =================================================
+        #
+        # The selected method must exist in the backend-authoritative
+        # payment catalog before create_order() is called.
+        # The Tool Node does not maintain its own payment allowlist.
+        # =================================================
+
+        payment_valid, payment_error = _validate_payment_method(
+            payment_method
+        )
+
+        if not payment_valid:
+
+            return {
+                "tool_result": {
+                    "success": False,
+                    "type": "payment_selection",
+                    "error": (
+                        payment_error
+                        or "The selected payment method is not available."
+                    ),
+                },
+                "entities": updated_entities,
+                "selected_payment_method": payment_method,
             }
 
         # =================================================
@@ -3154,6 +3389,8 @@ def _tool_node_impl(
 
             "entities": updated_entities,
             "checkout_id": checkout_id,
+            "selected_payment_method": payment_method,
+            "payment_method": payment_method,
             "checkout_status": "completed",
             "checkout_completed": True,
             "order_created": True,
@@ -3181,83 +3418,129 @@ def _tool_node_impl(
 
     if tool_name == "track_order":
 
-        order_id = updated_entities.get(
-            "order_id"
-        )
+        order_id = updated_entities.get("order_id")
+        order_reference = updated_entities.get("order_reference")
+        order_reference_type = updated_entities.get("order_reference_type")
 
         if not order_id:
+            order_id = state.get("order_id")
+        if not order_reference:
+            order_reference = state.get("order_reference")
+        if not order_reference_type:
+            order_reference_type = state.get("order_reference_type")
 
-            order_id = state.get(
-                "order_id"
-            )
+        planned_arguments = state.get("planned_arguments")
+        if not isinstance(planned_arguments, dict):
+            planned_arguments = state.get("planner_args")
+        if not isinstance(planned_arguments, dict):
+            planned_arguments = {}
 
         if not order_id:
+            order_id = planned_arguments.get("order_id")
+        if not order_reference:
+            order_reference = planned_arguments.get("order_reference")
+        if not order_reference_type:
+            order_reference_type = planned_arguments.get("order_reference_type")
 
+        # Latest/previous are resolved only by the backend service.
+        # The AI never selects an order from conversation history.
+        if not order_id and order_reference_type in {"latest", "previous"}:
+            try:
+                recent_orders = get_user_orders(
+                    db=db,
+                    user_id=int(user_id),
+                    limit=2,
+                )
+            except Exception as exc:
+                print("[TRACK ORDER RESOLUTION ERROR]", type(exc).__name__, str(exc))
+                return {
+                    "tool_name": "track_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_tracking",
+                        "error": "I could not retrieve your orders right now.",
+                    },
+                    "awaiting_order_tracking_order_id": False,
+                }
+
+            index = 0 if order_reference_type == "latest" else 1
+            if len(recent_orders) <= index:
+                return {
+                    "tool_name": "track_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_tracking",
+                        "error": "No matching order was found.",
+                    },
+                    "awaiting_order_tracking_order_id": False,
+                }
+
+            order_id = getattr(recent_orders[index], "id", None)
+
+        if not order_id and order_reference:
+            try:
+                order_id = int(str(order_reference).strip())
+            except (TypeError, ValueError):
+                return {
+                    "tool_name": "track_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_tracking",
+                        "error": "The supplied order reference is not a supported order ID.",
+                    },
+                    "awaiting_order_tracking_order_id": False,
+                }
+
+        if not order_id:
             return {
                 "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
                     "error": "Order ID is required.",
-                }
+                },
+                "awaiting_order_tracking_order_id": True,
             }
 
         try:
-
-            order_id = int(
-                order_id
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
+            order_id = int(order_id)
+        except (TypeError, ValueError):
             return {
                 "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
                     "error": "Invalid order ID.",
-                }
+                },
+                "awaiting_order_tracking_order_id": False,
             }
 
         try:
-
             order = get_order(
                 db=db,
                 order_id=order_id,
             )
-
         except Exception as exc:
-
-            print(
-                "[TRACK ORDER ERROR]",
-                type(exc).__name__,
-                str(exc),
-            )
-
+            print("[TRACK ORDER ERROR]", type(exc).__name__, str(exc))
             return {
                 "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
                     "error": str(exc),
-                }
+                },
+                "awaiting_order_tracking_order_id": False,
             }
 
         if order is None:
-
             return {
                 "tool_name": "track_order",
                 "tool_result": {
                     "success": False,
                     "type": "order_tracking",
-                    "error": (
-                        f"Order {order_id} "
-                        "does not exist."
-                    ),
-                }
+                    "error": f"Order {order_id} does not exist.",
+                },
+                "awaiting_order_tracking_order_id": False,
             }
 
         # =================================================
@@ -3313,7 +3596,7 @@ def _tool_node_impl(
 
             "tool_result": {
                 "success": True,
-                "type": "tracking",
+                "type": "order_tracking",
                 "order_id": getattr(
                     order,
                     "id",
@@ -3393,24 +3676,186 @@ def _tool_node_impl(
     if tool_name == "cancel_order":
 
         if user_id is None:
-
             return {
                 "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
+                    "type": "order_cancellation",
                     "error": "User ID is required.",
-                }
+                },
             }
 
-        order_id = updated_entities.get(
-            "order_id"
+        # -------------------------------------------------
+        # Resolve order reference
+        # -------------------------------------------------
+
+        order_id = updated_entities.get("order_id")
+        order_reference = updated_entities.get("order_reference")
+        order_reference_type = updated_entities.get(
+            "order_reference_type"
         )
 
         if not order_id:
+            order_id = state.get("order_id")
 
-            order_id = state.get(
+        if not order_reference:
+            order_reference = state.get("order_reference")
+
+        if not order_reference_type:
+            order_reference_type = state.get(
+                "order_reference_type"
+            )
+
+        planned_arguments = state.get(
+            "planned_arguments"
+        )
+
+        if not isinstance(
+            planned_arguments,
+            dict,
+        ):
+            planned_arguments = state.get(
+                "planner_args"
+            )
+
+        if not isinstance(
+            planned_arguments,
+            dict,
+        ):
+            planned_arguments = {}
+
+        if not order_id:
+            order_id = planned_arguments.get(
                 "order_id"
             )
+
+        if not order_reference:
+            order_reference = planned_arguments.get(
+                "order_reference"
+            )
+
+        if not order_reference_type:
+            order_reference_type = planned_arguments.get(
+                "order_reference_type"
+            )
+
+        cancellation_reason = (
+            updated_entities.get(
+                "cancellation_reason"
+            )
+            or state.get(
+                "cancellation_reason"
+            )
+            or planned_arguments.get(
+                "cancellation_reason"
+            )
+        )
+
+        # -------------------------------------------------
+        # Latest / previous order
+        #
+        # Resolve ONLY through backend.
+        # -------------------------------------------------
+
+        if (
+            not order_id
+            and order_reference_type
+            in {
+                "latest",
+                "previous",
+            }
+        ):
+
+            try:
+
+                recent_orders = get_user_orders(
+                    db=db,
+                    user_id=int(user_id),
+                    limit=2,
+                )
+
+            except Exception as exc:
+
+                print(
+                    "[CANCEL ORDER RESOLUTION ERROR]",
+                    type(exc).__name__,
+                    str(exc),
+                )
+
+                return {
+                    "tool_name": "cancel_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_cancellation",
+                        "error": (
+                            "I could not retrieve your "
+                            "orders right now."
+                        ),
+                    },
+                }
+
+            index = (
+                0
+                if order_reference_type == "latest"
+                else 1
+            )
+
+            if len(recent_orders) <= index:
+
+                return {
+                    "tool_name": "cancel_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_cancellation",
+                        "error": (
+                            "No matching order was found."
+                        ),
+                    },
+                }
+
+            order_id = getattr(
+                recent_orders[index],
+                "id",
+                None,
+            )
+
+        # -------------------------------------------------
+        # Explicit non-numeric reference
+        # -------------------------------------------------
+
+        if (
+            not order_id
+            and order_reference
+        ):
+
+            try:
+
+                order_id = int(
+                    str(
+                        order_reference
+                    ).strip()
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                return {
+                    "tool_name": "cancel_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "order_cancellation",
+                        "error": (
+                            "The supplied order reference "
+                            "is not a supported order ID."
+                        ),
+                    },
+                }
+
+        # -------------------------------------------------
+        # Missing order ID
+        # -------------------------------------------------
 
         if not order_id:
 
@@ -3418,8 +3863,9 @@ def _tool_node_impl(
                 "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
+                    "type": "order_cancellation",
                     "error": "Order ID is required.",
-                }
+                },
             }
 
         try:
@@ -3437,20 +3883,223 @@ def _tool_node_impl(
                 "tool_name": "cancel_order",
                 "tool_result": {
                     "success": False,
+                    "type": "order_cancellation",
                     "error": "Invalid order ID.",
-                }
+                },
             }
+
+        if order_id <= 0:
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": "Invalid order ID.",
+                },
+            }
+
+        # -------------------------------------------------
+        # Backend cancellation eligibility
+        # -------------------------------------------------
+        #
+        # This is intentionally executed before asking for
+        # a cancellation reason and before cancel_order().
+        #
+        # The AI cannot authorize cancellation.
+        # -------------------------------------------------
+
+        try:
+
+            eligibility = check_cancellation_eligibility(
+                db=db,
+                order_id=order_id,
+                user_id=int(user_id),
+            )
+
+        except ValueError as exc:
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": str(exc),
+                },
+                "cancellation_eligibility": {
+                    "eligible": False,
+                    "order_id": order_id,
+                },
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        except Exception as exc:
+
+            print(
+                "[CANCEL ELIGIBILITY ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": (
+                        "I could not verify cancellation "
+                        "eligibility right now."
+                    ),
+                },
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        if not isinstance(
+            eligibility,
+            dict,
+        ):
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": (
+                        "The backend returned an invalid "
+                        "cancellation eligibility result."
+                    ),
+                },
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        # -------------------------------------------------
+        # Backend says NOT eligible
+        # -------------------------------------------------
+        #
+        # Never call cancel_order().
+        # -------------------------------------------------
+
+        if not bool(
+            eligibility.get("eligible")
+        ):
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": (
+                        "This order is not eligible "
+                        "for cancellation."
+                    ),
+                    "eligibility": eligibility,
+                },
+                "cancellation_eligibility": eligibility,
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        # -------------------------------------------------
+        # Eligible, but reason missing
+        # -------------------------------------------------
+
+        if (
+            not cancellation_reason
+            or not str(
+                cancellation_reason
+            ).strip()
+        ):
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": True,
+                    "type": "cancellation_eligibility",
+                    "order_id": order_id,
+                    "eligible": True,
+                    "needs_reason": True,
+                },
+                "cancellation_eligibility": eligibility,
+                "awaiting_cancellation_reason": True,
+                "order_id": order_id,
+            }
+
+        cancellation_reason = str(
+            cancellation_reason
+        ).strip()
+
+        # -------------------------------------------------
+        # Execute backend cancellation
+        # -------------------------------------------------
 
         try:
 
             order = cancel_order(
                 db=db,
                 order_id=order_id,
-                user_id=int(
-                    user_id
-                ),
+                user_id=int(user_id),
             )
 
+        except ValueError as exc:
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": str(exc),
+                },
+                "cancellation_eligibility": eligibility,
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        except Exception as exc:
+
+            print(
+                "[CANCEL ORDER ERROR]",
+                type(exc).__name__,
+                str(exc),
+            )
+
+            return {
+                "tool_name": "cancel_order",
+                "tool_result": {
+                    "success": False,
+                    "type": "order_cancellation",
+                    "error": (
+                        "I could not complete the "
+                        "cancellation right now."
+                    ),
+                },
+                "cancellation_eligibility": eligibility,
+                "awaiting_cancellation_reason": False,
+                "order_id": order_id,
+            }
+
+        # -------------------------------------------------
+        # Refund eligibility/status
+        # -------------------------------------------------
+        #
+        # Refund information comes ONLY from the backend.
+        # Never calculate, promise, or invent refund details.
+        # -------------------------------------------------
+
+        try:
+
+            refund = get_refund_eligibility(
+                db=db,
+                order_id=order_id,
+                user_id=int(user_id),
+            )
+
+        except ValueError as exc:
+
+            # Cancellation succeeded, but refund lookup failed.
+            # Do NOT invent refund information.
             return {
                 "tool_name": "cancel_order",
                 "tool_result": {
@@ -3466,40 +4115,86 @@ def _tool_node_impl(
                         "status",
                         None,
                     ),
+                    "cancellation_reason": cancellation_reason,
+                    "cancellation_eligibility": eligibility,
+                    "refund_eligibility": None,
+                    "refund_error": str(exc),
                 },
-
                 "entities": updated_entities,
-
                 "order_id": order_id,
-            }
-
-        except ValueError as exc:
-
-            return {
-                "tool_name": "cancel_order",
-                "tool_result": {
-                    "success": False,
-                    "type": "order_cancelled",
-                    "error": str(exc),
-                }
+                "cancellation_reason": cancellation_reason,
+                "cancellation_eligibility": eligibility,
+                "refund_eligibility": None,
+                "awaiting_cancellation_reason": False,
             }
 
         except Exception as exc:
 
             print(
-                "[CANCEL ORDER ERROR]",
+                "[REFUND ELIGIBILITY ERROR]",
                 type(exc).__name__,
                 str(exc),
             )
 
+            # Cancellation succeeded, but refund lookup failed.
+            # Do NOT claim a refund status.
             return {
                 "tool_name": "cancel_order",
                 "tool_result": {
-                    "success": False,
+                    "success": True,
                     "type": "order_cancelled",
-                    "error": str(exc),
-                }
+                    "order_id": getattr(
+                        order,
+                        "id",
+                        order_id,
+                    ),
+                    "status": getattr(
+                        order,
+                        "status",
+                        None,
+                    ),
+                    "cancellation_reason": cancellation_reason,
+                    "cancellation_eligibility": eligibility,
+                    "refund_eligibility": None,
+                    "refund_error": (
+                        "Refund eligibility could not "
+                        "be verified."
+                    ),
+                },
+                "entities": updated_entities,
+                "order_id": order_id,
+                "cancellation_reason": cancellation_reason,
+                "cancellation_eligibility": eligibility,
+                "refund_eligibility": None,
+                "awaiting_cancellation_reason": False,
             }
+
+        return {
+            "tool_name": "cancel_order",
+            "tool_result": {
+                "success": True,
+                "type": "order_cancelled",
+                "order_id": getattr(
+                    order,
+                    "id",
+                    order_id,
+                ),
+                "status": getattr(
+                    order,
+                    "status",
+                    None,
+                ),
+                "cancellation_reason": cancellation_reason,
+                "cancellation_eligibility": eligibility,
+                "refund_eligibility": refund,
+            },
+            "entities": updated_entities,
+            "order_id": order_id,
+            "cancellation_reason": cancellation_reason,
+            "cancellation_eligibility": eligibility,
+            "refund_eligibility": refund,
+            "awaiting_cancellation_reason": False,
+        }
 
     # =====================================================
     # CREATE SUPPORT TICKET
@@ -3809,6 +4504,30 @@ def tool_node(
     )
 
     result["tool_result"] = normalized
+
+    # ---------------------------------------------------------
+    # Phase 7B: transactional failure guard
+    # ---------------------------------------------------------
+    #
+    # A failed create_order ToolResult must never leave stale
+    # success flags from an earlier turn/retry in GraphState.
+    # Only the successful create_order branch above is allowed
+    # to set order_created / checkout_completed to True.
+    # ---------------------------------------------------------
+
+    if (
+        str(tool_name or "").strip().lower() == "create_order"
+        and normalized is not None
+        and not normalized.success
+    ):
+        result["order_created"] = False
+        result["checkout_completed"] = False
+        result["order_creation_attempted"] = True
+
+        # Do not mark the checkout completed after any failed
+        # transactional attempt.
+        if not result.get("checkout_status"):
+            result["checkout_status"] = "collecting"
 
     if tool_name:
         result["tool_name"] = tool_name
