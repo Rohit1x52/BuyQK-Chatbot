@@ -4,7 +4,9 @@
 #
 # Phase 3 Architecture
 #
-# Workflow:
+# =========================================================
+#
+# WORKFLOW
 #
 # START
 #   ↓
@@ -14,51 +16,50 @@
 #   ↓
 # entity
 #   ↓
-# planner
-#   ↓
-# policy
-#   ↓
-# decision
-#   ├──────────────────────┐
-#   │                      │
-#   │ tool_name            │ no tool
-#   ↓                      ↓
-# tool                  response
-#   ↓                      ↓
-# response               END
-#   ↓
-#  END
+# followup
+#   ├───────────────┐
+#   │               │
+#   │ awaiting      │ ready
+#   │ user input    │
+#   ↓               ↓
+# response        planner
+#                   ↓
+#                 policy
+#                   ↓
+#                 decision
+#                /        \
+#             tool       response
+#              ↓
+#           response
+#              ↓
+#             END
 #
+# =========================================================
 #
-# Phase 3 cart operations use the SAME graph pipeline:
+# IMPORTANT
 #
-# User
-#   ↓
-# Entity
-#   ↓
-# Planner
-#   ↓
-# Policy
-#   ↓
-# Decision
-#   ↓
-# Tool
-#   ↓
-# Cart Service
-#   ↓
-# Response
+# The Graph Builder owns ONLY orchestration/routing.
 #
-# The graph does NOT contain business logic for:
+# It does NOT:
 #
-#   - adding cart items
-#   - removing cart items
-#   - changing quantities
-#   - calculating totals
-#   - validating stock
-#   - creating orders
+#   - resolve products
+#   - validate stock
+#   - calculate prices
+#   - calculate taxes
+#   - calculate discounts
+#   - calculate delivery charges
+#   - modify cart state
+#   - create orders
+#   - modify backend state
 #
-# Those responsibilities remain in the appropriate service/tool
-# layers.
+# Those responsibilities remain inside:
+#
+#   Entity Node
+#   Planner Node
+#   Policy Node
+#   Decision Node
+#   Tool Node
+#   Backend Services
 #
 # =========================================================
 
@@ -74,6 +75,11 @@ from langgraph.graph import (
 )
 
 from ai_engine.graph.state import GraphState
+
+
+# =========================================================
+# Nodes
+# =========================================================
 
 from ai_engine.nodes.context_node import (
     context_node,
@@ -113,6 +119,431 @@ from ai_engine.nodes.response_node import (
 
 
 # =========================================================
+# Constants
+# =========================================================
+
+ROUTE_TOOL = "tool"
+ROUTE_RESPONSE = "response"
+ROUTE_PLANNER = "planner"
+
+
+# =========================================================
+# Conversational / Tool-less Actions
+# =========================================================
+#
+# These actions must NEVER reach Tool Node.
+#
+# They are presentation/workflow actions.
+#
+# =========================================================
+
+TOOLLESS_ACTIONS = frozenset(
+    {
+        "ANSWER",
+        "ASK_CLARIFICATION",
+        "CONFIRM",
+        "END_CONVERSATION",
+        "START_CHECKOUT",
+        "MODIFY_CHECKOUT",
+    }
+)
+
+
+# =========================================================
+# Checkout Required Fields
+# =========================================================
+
+CHECKOUT_REQUIRED_FIELDS = (
+    "product_name",
+    "quantity",
+    "address_selection",
+    "payment_method",
+)
+
+
+# =========================================================
+# Helper: Normalize String
+# =========================================================
+
+
+def _normalize_string(
+    value: Any,
+) -> str | None:
+    """
+    Safely normalize a possible string value.
+    """
+
+    if not isinstance(
+        value,
+        str,
+    ):
+        return None
+
+    value = value.strip()
+
+    return value or None
+
+
+# =========================================================
+# Helper: Normalize Missing Fields
+# =========================================================
+
+
+def _get_missing_fields(
+    state: GraphState,
+) -> list[str]:
+    """
+    Read missing_fields from GraphState.
+
+    Always returns a clean list of strings.
+
+    This function does NOT calculate missing fields.
+    It only reads the value produced by the upstream
+    workflow nodes.
+    """
+
+    value = state.get(
+        "missing_fields"
+    )
+
+    if not isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        return []
+
+    result: list[str] = []
+
+    for field in value:
+        normalized = _normalize_string(
+            field
+        )
+
+        if normalized:
+            result.append(
+                normalized
+            )
+
+    return result
+
+
+# =========================================================
+# Helper: Read Intent
+# =========================================================
+
+
+def _get_intent(
+    state: GraphState,
+) -> str | None:
+    """
+    Read normalized intent from state.
+    """
+
+    return _normalize_string(
+        state.get("intent")
+    )
+
+
+# =========================================================
+# Helper: Read Action
+# =========================================================
+
+
+def _get_action(
+    state: GraphState,
+) -> str | None:
+    """
+    Read the action selected by Decision/Policy.
+    """
+
+    candidates = (
+        state.get("action"),
+        state.get("decision_action"),
+    )
+
+    for value in candidates:
+        normalized = _normalize_string(
+            value
+        )
+
+        if normalized:
+            return normalized.upper()
+
+    decision = state.get(
+        "decision"
+    )
+
+    if isinstance(
+        decision,
+        dict,
+    ):
+        normalized = _normalize_string(
+            decision.get("action")
+        )
+
+        if normalized:
+            return normalized.upper()
+
+    policy_result = state.get(
+        "policy_result"
+    )
+
+    if isinstance(
+        policy_result,
+        dict,
+    ):
+        normalized = _normalize_string(
+            policy_result.get("action")
+        )
+
+        if normalized:
+            return normalized.upper()
+
+    return None
+
+
+# =========================================================
+# Helper: Read Tool
+# =========================================================
+
+
+def _get_tool_name(
+    state: GraphState,
+) -> str | None:
+    """
+    Read the canonical tool name from state.
+
+    This does not execute anything.
+    """
+
+    tool_name = _normalize_string(
+        state.get("tool_name")
+    )
+
+    if tool_name:
+        return tool_name.lower()
+
+    decision = state.get(
+        "decision"
+    )
+
+    if isinstance(
+        decision,
+        dict,
+    ):
+        tool_name = _normalize_string(
+            decision.get("tool")
+            or decision.get("tool_name")
+        )
+
+        if tool_name:
+            return tool_name.lower()
+
+    policy_result = state.get(
+        "policy_result"
+    )
+
+    if isinstance(
+        policy_result,
+        dict,
+    ):
+        tool_name = _normalize_string(
+            policy_result.get("tool")
+            or policy_result.get("tool_name")
+        )
+
+        if tool_name:
+            return tool_name.lower()
+
+    return None
+
+
+# =========================================================
+# Helper: Awaiting User Input
+# =========================================================
+
+
+def _is_awaiting_user_input(
+    state: GraphState,
+) -> bool:
+    """
+    Return True when Followup Node explicitly says
+    that the workflow is waiting for another user message.
+    """
+
+    return bool(
+        state.get(
+            "awaiting_user_input"
+        )
+    )
+
+
+# =========================================================
+# Helper: Checkout Incomplete
+# =========================================================
+
+
+def _checkout_has_blocking_missing_field(
+    state: GraphState,
+) -> bool:
+    """
+    Determine whether checkout is missing a prerequisite
+    that must be supplied before backend checkout tools can
+    execute.
+
+    Product and quantity are hard prerequisites.
+
+    Address/payment are interactive checkout steps and can
+    legitimately trigger their corresponding selection tools.
+    """
+
+    intent = _get_intent(
+        state
+    )
+
+    action = _get_action(
+        state
+    )
+
+    missing_fields = _get_missing_fields(
+        state
+    )
+
+    # -----------------------------------------------------
+    # Only apply this guard to order checkout flows.
+    # -----------------------------------------------------
+
+    checkout_intent = intent in {
+        "order_create",
+        "checkout",
+        "checkout_cart",
+        "cart_checkout",
+    }
+
+    checkout_action = action in {
+        "START_CHECKOUT",
+        "MODIFY_CHECKOUT",
+        "CREATE_ORDER",
+    }
+
+    if not (
+        checkout_intent
+        or checkout_action
+    ):
+        return False
+
+    # -----------------------------------------------------
+    # Product and quantity are hard prerequisites.
+    #
+    # We must NEVER load addresses/payment methods or
+    # execute create_order while either is missing.
+    # -----------------------------------------------------
+
+    blocking_fields = {
+        "product_name",
+        "quantity",
+    }
+
+    return bool(
+        blocking_fields.intersection(
+            missing_fields
+        )
+    )
+
+
+# =========================================================
+# Helper: Tool Allowed By Graph
+# =========================================================
+
+
+def _tool_is_safe_to_execute(
+    state: GraphState,
+) -> bool:
+    """
+    Structural safety guard before Tool Node execution.
+
+    The Policy/Decision nodes remain authoritative for business
+    authorization.
+
+    This function only prevents obviously invalid graph routing.
+
+    In particular:
+
+        START_CHECKOUT
+            +
+        missing product/quantity
+            =
+        NEVER execute a backend tool.
+    """
+
+    action = _get_action(
+        state
+    )
+
+    tool_name = _get_tool_name(
+        state
+    )
+
+    # -----------------------------------------------------
+    # No tool = no tool execution.
+    # -----------------------------------------------------
+
+    if not tool_name:
+        return False
+
+    # -----------------------------------------------------
+    # Conversational actions are never tool-routed.
+    # -----------------------------------------------------
+
+    if action in TOOLLESS_ACTIONS:
+        return False
+
+    # -----------------------------------------------------
+    # Checkout prerequisite guard.
+    # -----------------------------------------------------
+
+    if _checkout_has_blocking_missing_field(
+        state
+    ):
+        return False
+
+    return True
+
+
+# =========================================================
+# Followup Routing
+# =========================================================
+
+
+def _route_after_followup(
+    state: GraphState,
+) -> str:
+    """
+    Route after Followup Node.
+
+    Followup Node owns the question/clarification decision.
+
+    If it says the system is waiting for user input,
+    Response Node must present that question.
+
+    Otherwise continue to Planner.
+    """
+
+    if _is_awaiting_user_input(
+        state
+    ):
+        print(
+            "[GRAPH ROUTE]"
+            " followup -> response"
+            " (awaiting user input)"
+        )
+
+        return ROUTE_RESPONSE
+
+    return ROUTE_PLANNER
+
+
+# =========================================================
 # Decision Routing
 # =========================================================
 
@@ -121,39 +552,103 @@ def _route_after_decision(
     state: GraphState,
 ) -> str:
     """
-    Route the workflow after decision_node.
+    Route after Decision Node.
 
-    The decision node converts the approved planner/policy
-    state into executable routing information.
+    Decision Node is responsible for producing the authoritative
+    decision contract.
 
-    The graph itself does not determine which capability
-    should execute.
+    The graph performs structural safety checks before allowing
+    Tool Node execution.
 
-    It only checks whether decision_node produced a valid
-    tool_name.
+    Possible routes:
 
-    Returns:
-        "tool":
-            A backend capability should execute.
-
-        "response":
-            No backend capability is required.
+        tool
+        response
     """
 
-    decision_route = state.get("decision_route")
+    action = _get_action(
+        state
+    )
 
-    if isinstance(decision_route, str):
-        route = decision_route.strip().lower()
-        if route in {"tool", "response"}:
-            return route
+    tool_name = _get_tool_name(
+        state
+    )
 
-    # Compatibility with decision implementations that expose only
-    # tool_name. The graph still performs structural routing only.
-    tool_name = state.get("tool_name")
-    if isinstance(tool_name, str) and tool_name.strip():
-        return "tool"
+    decision_route = _normalize_string(
+        state.get("decision_route")
+    )
 
-    return "response"
+    # -----------------------------------------------------
+    # 1. Conversational actions ALWAYS go to Response.
+    # -----------------------------------------------------
+
+    if action in TOOLLESS_ACTIONS:
+        print(
+            "[GRAPH ROUTE]"
+            f" action={action}"
+            " -> response"
+            " (tool-less action)"
+        )
+
+        return ROUTE_RESPONSE
+
+    # -----------------------------------------------------
+    # 2. Explicit decision route.
+    #
+    # Only honor "tool" if structural safety passes.
+    # -----------------------------------------------------
+
+    if decision_route:
+        normalized_route = (
+            decision_route.lower()
+        )
+
+        if normalized_route == ROUTE_TOOL:
+
+            if _tool_is_safe_to_execute(
+                state
+            ):
+                return ROUTE_TOOL
+
+            print(
+                "[GRAPH ROUTE]"
+                " decision requested tool"
+                " but safety guard rejected it"
+                " -> response"
+            )
+
+            return ROUTE_RESPONSE
+
+        if normalized_route == ROUTE_RESPONSE:
+            return ROUTE_RESPONSE
+
+    # -----------------------------------------------------
+    # 3. Compatibility fallback.
+    #
+    # Some older Decision Nodes only populate tool_name.
+    # -----------------------------------------------------
+
+    if tool_name:
+
+        if _tool_is_safe_to_execute(
+            state
+        ):
+            return ROUTE_TOOL
+
+        print(
+            "[GRAPH ROUTE]"
+            f" tool={tool_name}"
+            " rejected by safety guard"
+            " -> response"
+        )
+
+        return ROUTE_RESPONSE
+
+    # -----------------------------------------------------
+    # 4. No executable tool.
+    # -----------------------------------------------------
+
+    return ROUTE_RESPONSE
 
 
 # =========================================================
@@ -167,25 +662,41 @@ def _create_tool_wrapper(
     """
     Create the Tool Node wrapper.
 
-    Runtime database sessions should come from GraphState.
+    Runtime DB sessions are preferred from GraphState.
 
-    default_db exists for backwards compatibility with callers
-    that construct the graph using build_graph(db).
-
-    Phase 3 cart operations continue to use the same Tool Node.
-    The Tool Node delegates actual cart mutations to
-    backend/services/cart_service.py.
+    default_db remains supported for backwards compatibility.
     """
 
     def _tool_wrapper(
         state: GraphState,
-    ):
+    ) -> GraphState:
+
         db = state.get(
             "db"
         )
 
         if db is None:
             db = default_db
+
+        # -------------------------------------------------
+        # Defensive guard.
+        #
+        # This is the final protection before backend execution.
+        # -------------------------------------------------
+
+        if not _tool_is_safe_to_execute(
+            state
+        ):
+            print(
+                "[TOOL WRAPPER]"
+                " Tool execution blocked by graph safety guard."
+            )
+
+            return {
+                "tool_name": None,
+                "tool_result": None,
+                "decision_route": ROUTE_RESPONSE,
+            }
 
         return tool_node(
             state,
@@ -206,40 +717,29 @@ def build_graph(
     """
     Build and compile the BuyQK LangGraph workflow.
 
-    Supports:
-        Phase 2:
-            - checkout
-            - order creation
-            - tracking
-            - cancellation
-            - address
-            - payment
-            - product search
-            - conversation actions
+    Phase 2:
+        - checkout
+        - order creation
+        - tracking
+        - cancellation
+        - addresses
+        - payment
+        - product search
+        - conversation actions
 
-        Phase 3:
-            - add_to_cart
-            - remove_from_cart
-            - update_cart_item
-            - clear_cart
-            - show_cart
-            - checkout_cart
+    Phase 3:
+        - add_to_cart
+        - remove_from_cart
+        - update_cart_item
+        - clear_cart
+        - show_cart
+        - checkout_cart
 
-    Parameters
-    ----------
-    db:
-        Optional compatibility database session.
-
-        Runtime requests should preferably provide the database
-        session through GraphState.
-
-    Returns
-    -------
-    Compiled LangGraph application.
+    The graph itself contains only orchestration/routing logic.
     """
 
     # =====================================================
-    # Create State Graph
+    # State Graph
     # =====================================================
 
     graph = StateGraph(
@@ -248,24 +748,6 @@ def build_graph(
 
     # =====================================================
     # Register Nodes
-    # =====================================================
-    #
-    # Phase 3 does NOT require separate cart graph nodes.
-    #
-    # Cart behavior travels through:
-    #
-    #     Entity
-    #       ↓
-    #     Planner
-    #       ↓
-    #     Policy
-    #       ↓
-    #     Decision
-    #       ↓
-    #     Tool
-    #
-    # This prevents duplicated routing logic.
-    #
     # =====================================================
 
     graph.add_node(
@@ -343,25 +825,7 @@ def build_graph(
     )
 
     # =====================================================
-    # Entity → Planner
-    # =====================================================
-    #
-    # Entity Node may now produce Phase 3 information such as:
-    #
-    #     intent = "cart"
-    #
-    #     cart_action = "add_item"
-    #
-    #     product_name = "Maggi"
-    #
-    #     quantity = 2
-    #
-    # or:
-    #
-    #     cart_action = "clear_cart"
-    #
-    # The graph does not interpret these values.
-    #
+    # Entity → Followup
     # =====================================================
 
     graph.add_edge(
@@ -369,28 +833,53 @@ def build_graph(
         "followup",
     )
 
-    graph.add_edge(
+    # =====================================================
+    # Followup → Response OR Planner
+    # =====================================================
+    #
+    # IMPORTANT FIX:
+    #
+    # If Followup Node determines that user input is required,
+    # Planner MUST NOT run.
+    #
+    # Example:
+    #
+    # User:
+    #     "Mujhe Amul Full Cream Milk chahiye"
+    #
+    # Entity:
+    #     missing_fields = ["product_name"]
+    #
+    # Followup:
+    #     awaiting_user_input = True
+    #
+    # Route:
+    #
+    #     Followup
+    #        ↓
+    #     Response
+    #
+    # NOT:
+    #
+    #     Followup
+    #        ↓
+    #     Planner
+    #        ↓
+    #     list_saved_addresses
+    #
+    # =====================================================
+
+    graph.add_conditional_edges(
         "followup",
-        "planner",
+        _route_after_followup,
+        {
+            ROUTE_RESPONSE: "response",
+            ROUTE_PLANNER: "planner",
+        },
     )
 
     # =====================================================
     # Planner → Policy
-    # =====================================================
-    #
-    # Planner proposes a capability.
-    #
-    # Examples:
-    #
-    #     add_to_cart
-    #     remove_from_cart
-    #     update_cart_item
-    #     clear_cart
-    #     show_cart
-    #     checkout_cart
-    #
-    # The planner does NOT execute them.
-    #
     # =====================================================
 
     graph.add_edge(
@@ -401,14 +890,6 @@ def build_graph(
     # =====================================================
     # Policy → Decision
     # =====================================================
-    #
-    # Policy determines whether the proposed capability is
-    # allowed.
-    #
-    # Decision then converts the approved state into the
-    # executable routing state.
-    #
-    # =====================================================
 
     graph.add_edge(
         "policy",
@@ -418,27 +899,13 @@ def build_graph(
     # =====================================================
     # Decision → Tool OR Response
     # =====================================================
-    #
-    # The graph only performs structural routing.
-    #
-    # If decision_node produces:
-    #
-    #     tool_name = "add_to_cart"
-    #
-    # the graph routes to Tool Node.
-    #
-    # If decision_node produces no tool_name:
-    #
-    #     Response Node
-    #
-    # =====================================================
 
     graph.add_conditional_edges(
         "decision",
         _route_after_decision,
         {
-            "tool": "tool",
-            "response": "response",
+            ROUTE_TOOL: "tool",
+            ROUTE_RESPONSE: "response",
         },
     )
 
@@ -446,35 +913,12 @@ def build_graph(
     # Tool → Response
     # =====================================================
     #
-    # Tool Node executes the approved capability.
+    # CRITICAL:
     #
-    # Phase 3 examples:
+    # Every tool execution must pass through Response.
     #
-    #     add_to_cart
-    #          ↓
-    #     cart_service.add_item()
-    #
-    #     remove_from_cart
-    #          ↓
-    #     cart_service.remove_item()
-    #
-    #     update_cart_item
-    #          ↓
-    #     cart_service.update_quantity()
-    #
-    #     clear_cart
-    #          ↓
-    #     cart_service.clear_cart()
-    #
-    #     show_cart
-    #          ↓
-    #     cart_service.get_cart()
-    #
-    #     checkout_cart
-    #          ↓
-    #     cart validation / checkout preparation
-    #
-    # Tool results remain authoritative.
+    # This guarantees that the graph cannot finish after
+    # Tool Node without producing a user-facing response.
     #
     # =====================================================
 
@@ -505,12 +949,9 @@ def build_graph(
 #
 # The default graph does not own a database session.
 #
-# Runtime callers should inject the SQLAlchemy session into
-# GraphState:
+# Runtime callers should inject:
 #
 #     state["db"] = db
-#
-# This preserves request-level database ownership.
 #
 # =========================================================
 

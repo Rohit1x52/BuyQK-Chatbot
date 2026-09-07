@@ -103,6 +103,7 @@ PERSISTED_STATE_FIELDS = (
     "product_name",
     "quantity",
     "selected_product",
+    "product_search_results",
 
     # -----------------------------------------------------
     # Address
@@ -110,6 +111,18 @@ PERSISTED_STATE_FIELDS = (
 
     "address_id",
     "selected_address_id",
+    "address_action",
+    "address_label",
+    "address_line_2",
+    "address_city",
+    "address_state",
+    "address_postal_code",
+
+    # -----------------------------------------------------
+    # Delivery
+    # -----------------------------------------------------
+
+    "delivery_preference",
 
     # -----------------------------------------------------
     # Payment
@@ -174,7 +187,19 @@ PERSISTED_STATE_FIELDS = (
     # Tracking
     # -----------------------------------------------------
 
+    "order_reference",
+    "order_reference_type",
+    "awaiting_order_tracking_order_id",
     "awaiting_order_tracking_confirmation",
+
+    # -----------------------------------------------------
+    # Cancellation
+    # -----------------------------------------------------
+
+    "cancellation_reason",
+    "cancellation_eligibility",
+    "refund_eligibility",
+    "awaiting_cancellation_reason",
 
     # -----------------------------------------------------
     # Phase 1 conversation/task memory
@@ -1025,59 +1050,36 @@ def _update_conversation_state(
     # Selected Product
     # =====================================================
     #
-    # Keep a convenient conversational product reference.
+    # Preserve only an explicitly resolved/selected product reference.
     #
-    # Never invent a product ID.
+    # IMPORTANT:
+    # product_name alone is NOT proof that a product was selected.
+    # In an ambiguous search, product_name may simply be the user's
+    # search query while product_search_results contains multiple
+    # candidates.
+    #
+    # Therefore the runner must never synthesize selected_product
+    # from product_id/product_name.
     #
     # =====================================================
 
-    product_id = updated.get(
-        "product_id"
+    selected_product = updated.get(
+        "selected_product"
     )
 
-    product_name = updated.get(
-        "product_name"
-    )
-
-    if (
-        product_id is not None
-        or (
-            isinstance(
-                product_name,
-                str,
-            )
-            and product_name.strip()
-        )
+    if isinstance(
+        selected_product,
+        dict,
     ):
-
-        selected_product: dict[str, Any] = {}
-
-        if product_id is not None:
-
-            try:
-                selected_product[
-                    "product_id"
-                ] = deepcopy(product_id)
-            except Exception:
-                selected_product[
-                    "product_id"
-                ] = product_id
-
-        if (
-            isinstance(
-                product_name,
-                str,
-            )
-            and product_name.strip()
-        ):
-
-            selected_product[
-                "product_name"
-            ] = product_name.strip()
-
         updated[
             "selected_product"
-        ] = selected_product
+        ] = deepcopy(
+            selected_product
+        )
+    elif selected_product is None:
+        updated[
+            "selected_product"
+        ] = None
 
     # =====================================================
     # Keep Missing Fields Canonical

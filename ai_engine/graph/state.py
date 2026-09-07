@@ -165,6 +165,17 @@ class GraphState(TypedDict, total=False):
     selected_product: dict[str, Any] | None
 
     # =========================================================
+    # PRODUCT SEARCH / SELECTION - PHASE 6B
+    # =========================================================
+
+    # Normalized product candidates returned by product search.
+    #
+    # These are backend-derived candidates used for conversational
+    # product selection. They are not authoritative until a product
+    # is resolved/validated by the backend.
+    product_search_results: list[dict[str, Any]]
+
+    # =========================================================
     # AI UNDERSTANDING
     # =========================================================
 
@@ -469,11 +480,42 @@ class GraphState(TypedDict, total=False):
     quantity: int | None
 
     # =========================================================
+    # GROCERY ORDER DETAILS - PHASE 6A
+    # =========================================================
+
+    # Optional product size requested by the user.
+    # This is conversational input; backend/product resolution
+    # remains authoritative.
+    size: str | None
+
+    # Optional product variant requested by the user.
+    # This is conversational input; it does not identify a
+    # backend product by itself.
+    variant: str | None
+
+    # User's requested delivery preference.
+    # Actual delivery availability/time is backend-authoritative.
+    delivery_preference: str | None
+
+    # =========================================================
     # SELECTED ADDRESS
     # =========================================================
 
     # Authoritative address ID used by checkout.
     address_id: int | None
+
+    # =========================================================
+    # NEW ADDRESS INPUT - PHASE 7A
+    # =========================================================
+
+    # User-provided fields used only when creating a new address.
+    # Backend address identity is created by the address service.
+    address_action: str | None
+    address_label: str | None
+    address_line_2: str | None
+    address_city: str | None
+    address_state: str | None
+    address_postal_code: str | None
 
     # =========================================================
     # SELECTED PAYMENT
@@ -521,6 +563,18 @@ class GraphState(TypedDict, total=False):
 
     # Whether the AI is waiting for tracking confirmation.
     awaiting_order_tracking_confirmation: bool
+
+    # User-provided cancellation reason.
+    # This is conversational input only; the backend does not infer it.
+    cancellation_reason: str | None
+
+    # Cancellation workflow state.
+    cancellation_eligibility: dict[str, Any] | None
+    refund_eligibility: dict[str, Any] | None
+
+    # True while the graph is waiting for the cancellation reason
+    # after backend eligibility has been confirmed.
+    awaiting_cancellation_reason: bool
 
     # =========================================================
     # TRANSACTION ERROR
