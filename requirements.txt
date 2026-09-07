@@ -1,0 +1,13 @@
+sqlalchemy
+redis
+pydantic
+email-validator
+faiss-cpu
+numpy
+python-dotenv
+uvicorn
+fastapi
+langgraph
+langchain-groq
+zustand
+pytest
