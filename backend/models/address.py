@@ -1,21 +1,3 @@
-"""
-The Address model is responsible for storing delivery/service addresses
-belonging to a BuyQK user.
-
-It will:
-- Store the user's address.
-- Link the address to users.id.
-- Store city/state/pincode information.
-- Store latitude/longitude for location-based services.
-- Mark one address as the user's default address.
-- Provide the address that can later be used by:
-    - Grocery delivery
-    - Food delivery
-    - Medicine delivery
-    - Electronics delivery
-    - Service booking
-"""
-
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String
@@ -130,11 +112,8 @@ class Address(Base):
         back_populates="addresses",
     )
 
-    # IMPORTANT:
-    #
-    # Orders are historical records.
-    # Deleting an address must NOT delete orders.
-    #
+    # Orders are historical records. Deleting an address must not
+    # delete historical orders.
     orders = relationship(
         "Order",
         back_populates="address",
