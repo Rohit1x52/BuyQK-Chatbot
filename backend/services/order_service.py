@@ -1617,6 +1617,83 @@ def get_order_bill(
 
 
 # =========================================================
+# Cancellation Eligibility
+# =========================================================
+
+
+def check_cancellation_eligibility(
+    db: Session,
+    order_id: int,
+    user_id: int,
+) -> dict[str, Any]:
+    """Return backend-authoritative cancellation eligibility without mutation."""
+    user_id = _normalize_user_id(user_id)
+
+    try:
+        normalized_order_id = int(order_id)
+    except (TypeError, ValueError):
+        return {"eligible": False, "order_id": order_id, "reason_code": "invalid_order_id"}
+
+    if normalized_order_id <= 0:
+        return {"eligible": False, "order_id": normalized_order_id, "reason_code": "invalid_order_id"}
+
+    order = get_order(db=db, order_id=normalized_order_id)
+    if order is None:
+        return {"eligible": False, "order_id": normalized_order_id, "reason_code": "order_not_found"}
+
+    if order.user_id != user_id:
+        return {"eligible": False, "order_id": normalized_order_id, "reason_code": "unauthorized"}
+
+    if order.status == "cancelled":
+        return {"eligible": False, "order_id": normalized_order_id, "reason_code": "already_cancelled", "status": order.status}
+
+    if order.status in {"delivered", "completed"}:
+        return {"eligible": False, "order_id": normalized_order_id, "reason_code": "not_cancellable_status", "status": order.status}
+
+    return {"eligible": True, "order_id": normalized_order_id, "status": order.status}
+
+
+# =========================================================
+# Refund Eligibility
+# =========================================================
+
+
+def get_refund_eligibility(
+    db: Session,
+    order_id: int,
+    user_id: int,
+) -> dict[str, Any]:
+    """Return backend-derived refund eligibility/status for an order."""
+    user_id = _normalize_user_id(user_id)
+    order = get_order(db=db, order_id=order_id)
+
+    if order is None:
+        return {"eligible": False, "order_id": order_id, "reason_code": "order_not_found"}
+
+    if order.user_id != user_id:
+        return {"eligible": False, "order_id": order_id, "reason_code": "unauthorized"}
+
+    payment = db.query(Payment).filter(Payment.order_id == order.id).first()
+    payment_status = getattr(payment, "payment_status", None) if payment is not None else None
+
+    return {
+        "eligible": payment_status in {"success", "refunded"},
+        "order_id": order.id,
+        "payment_status": payment_status,
+        "status": (
+            "refunded" if payment_status == "refunded"
+            else "eligible" if payment_status == "success"
+            else "not_eligible"
+        ),
+        "reason_code": (
+            "already_refunded" if payment_status == "refunded"
+            else "payment_success" if payment_status == "success"
+            else "payment_not_successful"
+        ),
+    }
+
+
+# =========================================================
 # Cancel Order
 # =========================================================
 
