@@ -1320,13 +1320,12 @@ def _get_or_create_test_parents(db: Any):
 # Seed
 # ============================================================
 
-def seed_products() -> None:
+def seed_products(*, auto_init: bool = True) -> None:
 
-    print("[DB] Initializing BuyQK database schema...")
-
-    init_db()
-
-    print("[DB] Database schema ready.")
+    if auto_init:
+        print("[DB] Initializing BuyQK database schema...")
+        init_db()
+        print("[DB] Database schema ready.")
 
     db_generator = get_db()
     db = next(db_generator)
