@@ -8,6 +8,9 @@ their tables with Base.metadata before database initialization
 or migrations create the schema.
 """
 
+from backend.models.restaurant import Restaurant
+from backend.models.menu import Menu, MenuItem
+
 # =========================================================
 # User and Address
 # =========================================================
