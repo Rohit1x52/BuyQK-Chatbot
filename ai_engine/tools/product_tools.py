@@ -87,7 +87,7 @@ def _serialize_product(
     No business logic is performed here.
     """
 
-    return {
+    serialized = {
         "id": product.id,
         "merchant_id": product.merchant_id,
         "category_id": product.category_id,
@@ -105,6 +105,16 @@ def _serialize_product(
             product.updated_at
         ),
     }
+
+    for field in (
+        "model_number",
+        "specifications",
+        "prescription_required",
+    ):
+        if hasattr(product, field):
+            serialized[field] = getattr(product, field)
+
+    return serialized
 
 
 # =========================================================
@@ -189,12 +199,25 @@ def search_products_tool(
     db: Session,
     query: str,
     limit: int = 10,
+    brand: str | None = None,
+    category_id: int | None = None,
+    merchant_id: int | None = None,
+    model_number: str | None = None,
+    prescription_required: bool | None = None,
 ) -> ToolResult:
     """
     Search available products.
 
     Backend search semantics are delegated entirely to
     product_service.search_products().
+
+    Optional structured filters:
+
+        brand
+        category_id
+        merchant_id
+        model_number
+        prescription_required
     """
 
     tool = SEARCH_PRODUCTS_TOOL
@@ -251,15 +274,113 @@ def search_products_tool(
     limit = min(limit, 100)
 
     # -----------------------------------------------------
+    # Optional filter validation
+    # -----------------------------------------------------
+
+    if brand is not None:
+        if not isinstance(brand, str):
+            return _validation_error(
+                tool,
+                "Product brand filter must be text.",
+                field="brand",
+            )
+
+        brand = brand.strip() or None
+
+    if category_id is not None:
+        if isinstance(category_id, bool):
+            return _validation_error(
+                tool,
+                "Category ID must be a positive integer.",
+                field="category_id",
+            )
+
+        if not isinstance(category_id, int):
+            try:
+                category_id = int(category_id)
+            except (TypeError, ValueError):
+                return _validation_error(
+                    tool,
+                    "Category ID must be a positive integer.",
+                    field="category_id",
+                )
+
+        if category_id <= 0:
+            return _validation_error(
+                tool,
+                "Category ID must be a positive integer.",
+                field="category_id",
+            )
+
+    if merchant_id is not None:
+        if isinstance(merchant_id, bool):
+            return _validation_error(
+                tool,
+                "Merchant ID must be a positive integer.",
+                field="merchant_id",
+            )
+
+        if not isinstance(merchant_id, int):
+            try:
+                merchant_id = int(merchant_id)
+            except (TypeError, ValueError):
+                return _validation_error(
+                    tool,
+                    "Merchant ID must be a positive integer.",
+                    field="merchant_id",
+                )
+
+        if merchant_id <= 0:
+            return _validation_error(
+                tool,
+                "Merchant ID must be a positive integer.",
+                field="merchant_id",
+            )
+
+    if model_number is not None:
+        if not isinstance(model_number, str):
+            return _validation_error(
+                tool,
+                "Model number filter must be text.",
+                field="model_number",
+            )
+
+        model_number = model_number.strip() or None
+
+    if prescription_required is not None:
+        if not isinstance(
+            prescription_required,
+            bool,
+        ):
+            return _validation_error(
+                tool,
+                "Prescription requirement filter must be boolean.",
+                field="prescription_required",
+            )
+
+    # -----------------------------------------------------
     # Backend operation
     # -----------------------------------------------------
 
     try:
-        products = search_products(
-            db=db,
-            query=query,
-            limit=limit,
-        )
+        search_arguments = {
+            "db": db,
+            "query": query,
+            "limit": limit,
+        }
+        optional_filters = {
+            "brand": brand,
+            "category_id": category_id,
+            "merchant_id": merchant_id,
+            "model_number": model_number,
+            "prescription_required": prescription_required,
+        }
+        search_arguments.update({
+            key: value
+            for key, value in optional_filters.items()
+            if value is not None
+        })
+        products = search_products(**search_arguments)
     except Exception:
         return _backend_error(
             tool,

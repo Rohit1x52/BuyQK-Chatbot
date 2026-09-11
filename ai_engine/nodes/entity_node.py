@@ -135,6 +135,46 @@ class EntityOutput(BaseModel):
         description="Order reference kind: specific, latest, or previous.",
     )
 
+    # -----------------------------------------------------
+    # Commerce Vertical - Phase 10
+    # -----------------------------------------------------
+
+    commerce_vertical: Optional[str] = Field(
+        default=None,
+        description=(
+            "Semantic commerce vertical understood from the current request, "
+            "such as grocery, food, medicine, electronics, or another supported "
+            "vertical. Do not infer from product names alone when the context is ambiguous."
+        ),
+    )
+
+    # -----------------------------------------------------
+    # Customer Support - Phase 9
+    # -----------------------------------------------------
+
+    support_issue_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Support issue category: wrong_product, payment_failure, "
+            "delivery_delay, refund_status, human_escalation, or general_support."
+        ),
+    )
+
+    support_description: Optional[str] = Field(
+        default=None,
+        description="Explicit description of the customer's support issue.",
+    )
+
+    support_transaction_id: Optional[str] = Field(
+        default=None,
+        description="Payment transaction/reference ID explicitly supplied by the user.",
+    )
+
+    support_evidence_url: Optional[str] = Field(
+        default=None,
+        description="Evidence/image URL explicitly supplied by the user.",
+    )
+
     cancellation_reason: Optional[str] = Field(
         default=None,
         description="Natural-language reason explicitly supplied by the user for cancelling an order. Never invent.",
@@ -254,6 +294,31 @@ class LLMEntityOutput(BaseModel):
         description="Order reference kind when explicit: specific, latest, or previous.",
     )
 
+    commerce_vertical: Optional[str] = Field(
+        default=None,
+        description=(
+            "Semantic commerce vertical for the current request. Preserve the "
+            "user's meaning; do not invent or infer a vertical when ambiguous."
+        ),
+    )
+
+    support_issue_type: Optional[str] = Field(
+        default=None,
+        description="Support issue category explicitly understood from the current message.",
+    )
+    support_description: Optional[str] = Field(
+        default=None,
+        description="Explicit customer support issue description.",
+    )
+    support_transaction_id: Optional[str] = Field(
+        default=None,
+        description="Explicit payment transaction/reference ID.",
+    )
+    support_evidence_url: Optional[str] = Field(
+        default=None,
+        description="Explicit evidence/image URL.",
+    )
+
     cancellation_reason: Optional[str] = Field(
         default=None,
         description="Natural-language cancellation reason explicitly supplied by the user, or null. Never invent.",
@@ -347,6 +412,28 @@ class _LLMProviderEntityOutput(BaseModel):
         default=None,
         description="Order reference kind: specific, latest, or previous, or null.",
     )
+
+    commerce_vertical: Optional[str] = Field(
+        default=None,
+        description="Semantic commerce vertical understood from the user's request, or null.",
+    )
+
+    support_issue_type: Optional[str] = Field(
+        default=None,
+        description="Support issue category, or null.",
+    )
+    support_description: Optional[str] = Field(
+        default=None,
+        description="Explicit support issue description, or null.",
+    )
+    support_transaction_id: Optional[str] = Field(
+        default=None,
+        description="Explicit payment transaction/reference ID, or null.",
+    )
+    support_evidence_url: Optional[str] = Field(
+        default=None,
+        description="Explicit evidence/image URL, or null.",
+    )
     cancellation_reason: Optional[str] = Field(
         default=None,
         description="Explicit natural-language cancellation reason, or null. Never invent.",
@@ -435,6 +522,15 @@ class IntentDecision(BaseModel):
         )
     )
 
+    commerce_vertical: Optional[str] = Field(
+        default=None,
+        description=(
+            "Semantic commerce vertical for the current turn. Determine this "
+            "from the user's meaning and conversation context. Return null when "
+            "the vertical is ambiguous or not relevant."
+        ),
+    )
+
     # NOTE: kept as a plain Optional[str] rather than a strict Literal
     # enum for the same reason as LLMEntityOutput.cart_action above --
     # a strict-enum schema can be rejected server-side if the model
@@ -489,6 +585,11 @@ Supported fields:
 - order_id
 - order_reference
 - order_reference_type
+- commerce_vertical
+- support_issue_type
+- support_description
+- support_transaction_id
+- support_evidence_url
 - cancellation_reason
 - address_id
 - address_text
@@ -521,6 +622,71 @@ For order cancellation:
 - extract cancellation_reason only when the user explicitly provides one
 - never invent a cancellation reason
 - cancellation eligibility is determined only by the backend
+
+
+=========================================================
+COMMERCE VERTICAL
+=========================================================
+
+Determine the commerce vertical from the user's CURRENT request and the
+conversation context. This is semantic understanding, not keyword matching.
+
+Examples of vertical meaning include:
+- grocery: household grocery / daily-needs shopping
+- food: prepared food, meals, restaurant or menu ordering
+- medicine: medicines or pharmacy-related ordering
+- electronics: electronic devices, accessories, specifications, search or comparison
+
+These examples describe the domain concept only. Do not classify from a product
+name alone when the conversation does not establish the domain. If the request
+is ambiguous, return null and let the next conversational turn clarify it.
+
+For a new food or medicine purchase, keep the existing order_create intent and
+represent the domain through commerce_vertical. Do not invent a new transactional
+intent merely because the vertical changed.
+
+For electronics search or comparison, keep product_search as the intent and
+represent the domain through commerce_vertical. The user's comparison/search
+goal remains part of the semantic request; do not invent a backend tool.
+
+Never fabricate catalog IDs, restaurant IDs, pharmacy IDs, prescription status,
+product specifications, prices, stock, or availability. Those values belong to
+backend/catalog services.
+
+
+=========================================================
+CUSTOMER SUPPORT
+=========================================================
+
+When the current intent is customer_support, preserve only information
+explicitly supplied or clearly established for the same support request.
+
+support_issue_type must be one of:
+- wrong_product
+- payment_failure
+- delivery_delay
+- refund_status
+- human_escalation
+- general_support
+
+Examples:
+"I received the wrong product" -> support_issue_type = "wrong_product"
+"Payment failed" -> support_issue_type = "payment_failure"
+"My order is late" -> support_issue_type = "delivery_delay"
+"Where is my refund?" -> support_issue_type = "refund_status"
+"Connect me to support" -> support_issue_type = "human_escalation"
+
+Extract support_transaction_id only when the user explicitly provides a
+transaction/reference ID. Never invent one.
+
+Extract support_evidence_url only when an evidence/image URL is explicitly
+present in the message or already supplied by the application. Do not
+invent or infer an upload.
+
+support_description should preserve the user's issue description when
+available. Never invent a complaint.
+
+Do not classify ordinary checkout continuation messages as support.
 
 
 =========================================================
@@ -1203,6 +1369,16 @@ def detect_order_id(
         # such as "order 11 Maggi" are not misclassified.
         match = re.search(
             r"\border\s+(\d+)\s+(?:status|tracking|track|location|progress|update|delivery)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+
+    if not match:
+        # A location question with an explicit order number is also an
+        # unambiguous tracking reference, without treating purchase
+        # quantities as order IDs.
+        match = re.search(
+            r"\bwhere\s+is\s+(?:my\s+)?order\s*[#:]?\s*(\d+)\b",
             message,
             flags=re.IGNORECASE,
         )
@@ -2059,6 +2235,18 @@ Supported intents:
   Conversation that does not request one of the transactional
   actions above.
 
+COMMERCE VERTICAL UNDERSTANDING:
+
+Also determine the semantic commerce_vertical for the CURRENT message when
+relevant. The vertical is contextual domain understanding, not a keyword rule.
+It may describe grocery, food, medicine, electronics, or another supported
+commerce domain. Return null when the domain is ambiguous or not relevant.
+
+Food ordering and medicine ordering normally use order_create. Electronics
+search/comparison normally uses product_search. Do not create a new intent just
+because the vertical changes. Never invent catalog, restaurant, pharmacy,
+prescription, product, price, stock, or availability facts.
+
 For order_action:
 
 - start_new_order:
@@ -2273,6 +2461,10 @@ PREVIOUS ENTITY STATE
 ---------------------
 {previous_entities}
 
+CURRENT COMMERCE VERTICAL
+--------------------------
+{state.get("commerce_vertical")}
+
 IMPORTANT:
 The previous intent and entity state are context only.
 Classify the current message independently.
@@ -2330,6 +2522,8 @@ def _is_new_order_request(
         return False
 
     patterns = (
+        r"^\s*i\s+(?:want|need)\s+(?!to\s+)(?:.+?)\s*$",
+        r"^\s*(?:give|get)\s+me\s+(?:.+?)\s*$",
         r"^\s*i\s+(?:want|need)\s+to\s+order\b",
         r"^\s*i(?:'d|\s+would)\s+like\s+to\s+order\b",
         r"^\s*i\s+(?:want|need)\s+to\s+(?:buy|get|purchase)\b",
@@ -2369,11 +2563,69 @@ def _is_explicit_support_request(
     message: str,
 ) -> bool:
     """
-    Deprecated compatibility helper.
+    Conservative deterministic fallback for customer-support intent.
 
-    Current-turn support intent is decided by the AI classifier.
+    The LLM remains the primary semantic classifier. This helper exists only
+    so support remains reachable when the intent provider is unavailable.
     """
-    return False
+    text = (message or "").strip().casefold()
+    if not text:
+        return False
+
+    patterns = (
+        r"\bwrong\s+(?:product|item)\b",
+        r"\b(?:payment|transaction)\s+(?:failed|failure|declined)\b",
+        r"\bpayment\s+fail(?:ed|ure)?\b",
+        r"\border\s+(?:is\s+)?late\b",
+        r"\bdelivery\s+(?:is\s+)?(?:late|delayed|delay)\b",
+        r"\brefund\s+(?:status|late|pending|when|where)\b",
+        r"\bwhere\s+is\s+my\s+refund\b",
+        r"\bconnect\s+me\s+to\s+(?:a\s+)?support\b",
+        r"\bhuman\s+(?:support|agent|executive)\b",
+        r"\bsupport\s+(?:team|executive|agent)\b",
+        r"\bcomplaint\b",
+        r"\bhelp\s+with\s+(?:my\s+order|payment|refund|delivery)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _detect_support_issue_type(
+    message: str,
+) -> str | None:
+    """Classify common support requests for provider-free fallback routing."""
+    text = (message or "").strip().casefold()
+    if not text:
+        return None
+
+    patterns = (
+        ("wrong_product", (
+            r"\bwrong\s+(?:product|item)\b",
+            r"\b(?:received|got)\s+(?:the\s+)?wrong\b",
+        )),
+        ("payment_failure", (
+            r"\b(?:payment|transaction)\s+(?:failed|failure|declined)\b",
+            r"\bpayment\s+fail(?:ed|ure)?\b",
+        )),
+        ("delivery_delay", (
+            r"\border\s+(?:is\s+)?late\b",
+            r"\bdelivery\s+(?:is\s+)?(?:late|delayed|delay)\b",
+        )),
+        ("refund_status", (
+            r"\brefund\s+(?:status|late|pending|when|where)\b",
+            r"\bwhere\s+is\s+my\s+refund\b",
+        )),
+        ("human_escalation", (
+            r"\bconnect\s+me\s+to\s+(?:a\s+)?support\b",
+            r"\bhuman\s+(?:support|agent|executive)\b",
+            r"\bsupport\s+(?:team|executive|agent)\b",
+        )),
+    )
+
+    for issue_type, issue_patterns in patterns:
+        if any(re.search(pattern, text) for pattern in issue_patterns):
+            return issue_type
+
+    return "general_support" if _is_explicit_support_request(text) else None
 
 
 # =========================================================
@@ -2594,6 +2846,44 @@ def get_missing_fields(
             )
 
     # =====================================================
+    # Customer Support - Phase 9
+    # =====================================================
+
+    elif intent == "customer_support":
+        issue_type = (
+            getattr(entities, "support_issue_type", None)
+            or "general_support"
+        )
+
+        if issue_type == "wrong_product":
+            if entities.order_id is None:
+                missing.append("order_id")
+            elif not getattr(entities, "support_evidence_url", None):
+                missing.append("support_evidence")
+
+        elif issue_type == "payment_failure":
+            if (
+                entities.order_id is None
+                and not getattr(entities, "support_transaction_id", None)
+            ):
+                missing.append("payment_reference")
+
+        elif issue_type == "delivery_delay":
+            # Backend can use the user's latest order when no explicit order
+            # reference is supplied, matching the PDF's "latest delivery
+            # status" path.
+            pass
+
+        elif issue_type == "refund_status":
+            if entities.order_id is None:
+                missing.append("order_id")
+
+        elif issue_type in {"human_escalation", "general_support"}:
+            # The current user message itself is sufficient to create a
+            # support request. No unnecessary detail is collected.
+            pass
+
+    # =====================================================
     # Cancellation
     # =====================================================
 
@@ -2658,11 +2948,28 @@ def _safe_llm_entity_result(
         return LLMEntityOutput()
 
     return LLMEntityOutput(
+        commerce_vertical=_normalize_text(result.commerce_vertical),
         product_name=_normalize_text(result.product_name),
         quantity=result.quantity,
         order_id=result.order_id,
         order_reference=result.order_reference,
         order_reference_type=result.order_reference_type,
+        support_issue_type=_normalize_text(result.support_issue_type),
+        support_description=(
+            result.support_description.strip()
+            if result.support_description
+            else None
+        ),
+        support_transaction_id=(
+            result.support_transaction_id.strip()
+            if result.support_transaction_id
+            else None
+        ),
+        support_evidence_url=(
+            result.support_evidence_url.strip()
+            if result.support_evidence_url
+            else None
+        ),
         address_id=result.address_id,
         address_text=(result.address_text.strip() if result.address_text else None),
         address_action=(result.address_action.strip().lower() if result.address_action else None),
@@ -3065,11 +3372,57 @@ def entity_node(
         existing_entities
     )
 
+    # The current-turn intent classifier may already have identified the
+    # semantic commerce domain. Preserve it as contextual state; do not derive
+    # it with deterministic keyword rules.
+    decision_vertical = getattr(intent_decision, "commerce_vertical", None)
+    if isinstance(decision_vertical, str):
+        decision_vertical = decision_vertical.strip() or None
+    if decision_vertical:
+        entities["commerce_vertical"] = decision_vertical
+
     for key, value in extracted_entities.items():
 
         if value is not None:
 
             entities[key] = value
+
+    # =====================================================
+    # Phase 9 Support State Projection
+    # =====================================================
+
+    support_issue_type = entities.get("support_issue_type")
+    if isinstance(support_issue_type, str):
+        support_issue_type = support_issue_type.strip().lower()
+        allowed_support_types = {
+            "wrong_product",
+            "payment_failure",
+            "delivery_delay",
+            "refund_status",
+            "human_escalation",
+            "general_support",
+        }
+        if support_issue_type not in allowed_support_types:
+            entities.pop("support_issue_type", None)
+            support_issue_type = None
+        else:
+            entities["support_issue_type"] = support_issue_type
+
+    if entities.get("support_transaction_id") is not None:
+        entities["support_transaction_id"] = str(
+            entities["support_transaction_id"]
+        ).strip()
+
+    if entities.get("support_evidence_url") is not None:
+        entities["support_evidence_url"] = str(
+            entities["support_evidence_url"]
+        ).strip()
+
+    support_description = entities.get("support_description")
+    if not support_description and resolved_current_intent == "customer_support":
+        support_description = message.strip() or None
+        if support_description:
+            entities["support_description"] = support_description
 
     # =====================================================
     # IMPORTANT PRODUCT-ID RULE
@@ -3874,6 +4227,11 @@ def entity_node(
         ),
         order_reference=entities.get("order_reference"),
         order_reference_type=entities.get("order_reference_type"),
+        commerce_vertical=entities.get("commerce_vertical"),
+        support_issue_type=entities.get("support_issue_type"),
+        support_description=entities.get("support_description"),
+        support_transaction_id=entities.get("support_transaction_id"),
+        support_evidence_url=entities.get("support_evidence_url"),
         cancellation_reason=entities.get("cancellation_reason"),
         address_id=entities.get(
             "address_id"
@@ -3965,6 +4323,11 @@ def entity_node(
         "order_id": final_entities.get("order_id"),
         "order_reference": final_entities.get("order_reference"),
         "order_reference_type": final_entities.get("order_reference_type"),
+        "commerce_vertical": final_entities.get("commerce_vertical"),
+        "support_issue_type": final_entities.get("support_issue_type"),
+        "support_description": final_entities.get("support_description"),
+        "support_transaction_id": final_entities.get("support_transaction_id"),
+        "support_evidence_url": final_entities.get("support_evidence_url"),
         "cancellation_reason": final_entities.get("cancellation_reason"),
         "awaiting_order_tracking_order_id": bool(
             resolved_intent == "order_tracking"

@@ -44,6 +44,31 @@ SEARCH_PRODUCTS_INPUT_SCHEMA = {
             "description": "Maximum number of products to return.",
             "minimum": 1,
         },
+        "brand": {
+            "type": "string",
+            "description": "Optional product brand filter.",
+        },
+        "category_id": {
+            "type": "integer",
+            "description": "Optional product category ID filter.",
+            "minimum": 1,
+        },
+        "merchant_id": {
+            "type": "integer",
+            "description": "Optional merchant ID filter.",
+            "minimum": 1,
+        },
+        "model_number": {
+            "type": "string",
+            "description": "Optional product model number filter.",
+        },
+        "prescription_required": {
+            "type": "boolean",
+            "description": (
+                "Optional filter for whether a product "
+                "requires a prescription."
+            ),
+        },
     },
     "required": [
         "query",
@@ -112,7 +137,10 @@ GET_PRODUCT_CONTRACT = ToolContract(
 
 CHECK_PRODUCT_AVAILABILITY_CONTRACT = ToolContract(
     name="check_product_availability",
-    description="Check whether a product is available in the requested quantity.",
+    description=(
+        "Check whether a product is available "
+        "in the requested quantity."
+    ),
     category="product",
     handler=check_product_availability_tool,
     read_only=True,

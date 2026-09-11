@@ -1327,6 +1327,54 @@ def _validate_generic_tool(
 # Policy Node
 # =========================================================
 
+def _validate_request_support(
+    state: GraphState,
+    action: str,
+    tool: str | None,
+) -> GraphState:
+    """Validate the Phase 9 support capability before execution."""
+    if tool != "create_support_ticket":
+        return _failure(
+            "support_requires_create_support_ticket_tool",
+            action=action,
+            tool=tool,
+            retryable=False,
+        )
+
+    entities = _get_entities(state)
+    issue_type = (
+        state.get("support_issue_type")
+        or entities.get("support_issue_type")
+    )
+
+    allowed_issue_types = {
+        "wrong_product",
+        "payment_failure",
+        "delivery_delay",
+        "refund_status",
+        "human_escalation",
+        "general_support",
+    }
+
+    if issue_type not in allowed_issue_types:
+        return _failure(
+            "missing_support_issue_type",
+            action=action,
+            tool=tool,
+            retryable=True,
+        )
+
+    if not _has_value(state.get("user_id")):
+        return _failure(
+            "missing_user_id",
+            action=action,
+            tool=tool,
+            retryable=False,
+        )
+
+    return _success(action, tool)
+
+
 def policy_node(
     state: GraphState,
 ) -> GraphState:
@@ -1620,6 +1668,17 @@ def policy_node(
 
     if action == "ADD_NEW_ADDRESS":
         return _validate_add_new_address(
+            state,
+            action,
+            tool,
+        )
+
+    # =====================================================
+    # REQUEST_SUPPORT - PHASE 9
+    # =====================================================
+
+    if action == "REQUEST_SUPPORT":
+        return _validate_request_support(
             state,
             action,
             tool,

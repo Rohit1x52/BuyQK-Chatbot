@@ -74,7 +74,9 @@ from backend.services.order_service import (
 )
 
 from backend.services.support_service import (
+    SUPPORT_ISSUE_TYPES,
     create_ticket,
+    verify_support_request,
 )
 
 from backend.services.address_service import (
@@ -292,6 +294,18 @@ def _serialize_product(
             "brand": _product_value(
                 product,
                 "brand",
+            ),
+            "model_number": _product_value(
+                product,
+                "model_number",
+            ),
+            "specifications": _product_value(
+                product,
+                "specifications",
+            ),
+            "prescription_required": _product_value(
+                product,
+                "prescription_required",
             ),
             "price": _product_value(
                 product,
@@ -1925,6 +1939,47 @@ def _execute_cart_mutation(
         ),
         {},
     )
+
+
+def _support_value(
+    state: GraphState,
+    entities: dict[str, Any],
+    key: str,
+) -> Any:
+    """Read a support field from canonical state, entities, or planner args."""
+    value = state.get(key)
+    if value is not None and (
+        not isinstance(value, str) or value.strip()
+    ):
+        return value
+
+    value = entities.get(key)
+    if value is not None and (
+        not isinstance(value, str) or value.strip()
+    ):
+        return value
+
+    planner_args = state.get("planner_args")
+    if isinstance(planner_args, dict):
+        value = planner_args.get(key)
+        if value is not None and (
+            not isinstance(value, str) or value.strip()
+        ):
+            return value
+
+    return None
+
+
+def _support_ticket_subject(issue_type: str) -> str:
+    labels = {
+        "wrong_product": "wrong_product",
+        "payment_failure": "payment_failure",
+        "delivery_delay": "delivery_delay",
+        "refund_status": "refund_status",
+        "human_escalation": "human_escalation",
+        "general_support": "general_support",
+    }
+    return labels.get(issue_type, "general_support")
 
 
 # =========================================================
@@ -4197,95 +4252,214 @@ def _tool_node_impl(
         }
 
     # =====================================================
-    # CREATE SUPPORT TICKET
+    # CUSTOMER SUPPORT - PHASE 9
     # =====================================================
 
     if tool_name == "create_support_ticket":
 
         if user_id is None:
-
             return {
                 "tool_result": {
                     "success": False,
+                    "type": "support_verification",
                     "error": "User ID is required.",
+                    "error_code": "validation_error",
                 }
             }
 
-        order_id = updated_entities.get(
-            "order_id"
+        issue_type = _support_value(
+            state,
+            updated_entities,
+            "support_issue_type",
+        )
+        issue_type = (
+            str(issue_type).strip().lower()
+            if issue_type is not None
+            else None
         )
 
-        message = state.get(
-            "message",
-            "",
-        )
-
-        if not _has_value(
-            message
-        ):
-
+        if issue_type not in SUPPORT_ISSUE_TYPES:
             return {
                 "tool_result": {
                     "success": False,
-                    "error": (
-                        "Support message is required."
-                    ),
+                    "type": "support_verification",
+                    "error": "Support issue type is required.",
+                    "error_code": "validation_error",
                 }
             }
+
+        support_description = _support_value(
+            state,
+            updated_entities,
+            "support_description",
+        )
+        if not _has_value(support_description):
+            support_description = state.get("message", "")
+
+        order_id = _support_value(
+            state,
+            updated_entities,
+            "order_id",
+        )
+        transaction_id = _support_value(
+            state,
+            updated_entities,
+            "support_transaction_id",
+        )
+        evidence_url = _support_value(
+            state,
+            updated_entities,
+            "support_evidence_url",
+        )
 
         try:
-
-            ticket = create_ticket(
+            verification = verify_support_request(
                 db=db,
-                user_id=int(
-                    user_id
+                user_id=int(user_id),
+                issue_type=issue_type,
+                order_id=(
+                    int(order_id)
+                    if order_id is not None
+                    else None
                 ),
-                subject="BuyQK Customer Support",
-                description=str(
-                    message
+                transaction_id=(
+                    str(transaction_id).strip()
+                    if transaction_id is not None
+                    else None
                 ),
-                order_id=order_id,
+                evidence_url=(
+                    str(evidence_url).strip()
+                    if evidence_url is not None
+                    else None
+                ),
+                description=(
+                    str(support_description).strip()
+                    if support_description is not None
+                    else None
+                ),
             )
+
+            verification_payload = dict(verification)
+
+            # -------------------------------------------------
+            # Backend resolved the issue.
+            # -------------------------------------------------
+            if verification_payload.get("resolved") is True:
+                return {
+                    "tool_name": "create_support_ticket",
+                    "tool_result": verification_payload,
+                    "support_verification": verification_payload,
+                    "support_resolved": True,
+                    "support_status": "resolved",
+                    "support_escalation_required": False,
+                    "support_ticket_id": None,
+                    "support_ticket_reference": None,
+                }
+
+            # -------------------------------------------------
+            # Backend says human/support review is required.
+            # Create the ticket only after verification succeeds.
+            # -------------------------------------------------
+            if verification_payload.get("needs_ticket") is True:
+                ticket_order_id = verification_payload.get("order_id")
+
+                ticket = create_ticket(
+                    db=db,
+                    user_id=int(user_id),
+                    subject=_support_ticket_subject(issue_type),
+                    description=str(support_description).strip(),
+                    order_id=(
+                        int(ticket_order_id)
+                        if ticket_order_id is not None
+                        else None
+                    ),
+                    image_url=(
+                        str(evidence_url).strip()
+                        if evidence_url is not None
+                        else None
+                    ),
+                    issue_type=issue_type,
+                )
+
+                ticket_id = getattr(ticket, "id", None)
+                ticket_reference = (
+                    f"SUP{int(ticket_id):05d}"
+                    if ticket_id is not None
+                    else None
+                )
+
+                return {
+                    "tool_name": "create_support_ticket",
+                    "tool_result": {
+                        "success": True,
+                        "type": "support_ticket",
+                        "issue_type": issue_type,
+                        "ticket_id": ticket_id,
+                        "ticket_reference": ticket_reference,
+                        "status": getattr(
+                            ticket,
+                            "status",
+                            "open",
+                        ),
+                        "verification": verification_payload,
+                        "human_escalation": True,
+                    },
+                    "support_verification": verification_payload,
+                    "support_resolved": False,
+                    "support_status": getattr(
+                        ticket,
+                        "status",
+                        "open",
+                    ),
+                    "support_ticket_id": ticket_id,
+                    "support_ticket_reference": ticket_reference,
+                    "support_escalation_required": True,
+                }
 
             return {
                 "tool_result": {
-                    "success": True,
-                    "type": "support_ticket",
-                    "ticket_id": getattr(
-                        ticket,
-                        "id",
-                        None,
-                    ),
-                    "status": getattr(
-                        ticket,
-                        "status",
-                        None,
-                    ),
-                }
+                    "success": False,
+                    "type": "support_verification",
+                    "error": "Support verification did not return a valid outcome.",
+                    "error_code": "backend_error",
+                },
+                "support_resolved": False,
+                "support_escalation_required": False,
             }
 
         except ValueError as exc:
-
             return {
                 "tool_result": {
                     "success": False,
+                    "type": "support_verification",
                     "error": str(exc),
-                }
+                    "error_code": (
+                        "not_found"
+                        if "not found" in str(exc).lower()
+                        else "validation_error"
+                    ),
+                },
+                "support_resolved": False,
+                "support_escalation_required": False,
             }
 
         except Exception as exc:
-
             print(
-                "[SUPPORT TICKET ERROR]",
+                "[SUPPORT SERVICE ERROR]",
                 type(exc).__name__,
                 str(exc),
             )
-
             return {
                 "tool_result": {
                     "success": False,
-                    "error": str(exc),
-                }
+                    "type": "support_verification",
+                    "error": (
+                        "Support service is temporarily unavailable."
+                    ),
+                    "error_code": "backend_error",
+                },
+                "support_resolved": False,
+                "support_escalation_required": True,
             }
 
     # =====================================================

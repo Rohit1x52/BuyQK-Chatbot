@@ -39,6 +39,8 @@ import tempfile
 
 import pytest
 
+from ai_engine.tools.results import ToolResult
+
 
 # =========================================================
 # Project Path
@@ -408,26 +410,57 @@ def test_product_search(
     )
 
     # -----------------------------------------------------
-    # Tool result
+    # ToolResult
     # -----------------------------------------------------
 
     tool_result = result.get(
-        "tool_result"
+        "tool_result",
     )
 
     assert_true(
-        tool_result is not None,
-        "Tool result is missing.",
+        isinstance(
+            tool_result,
+            ToolResult,
+        ),
+        "Product tool did not return a ToolResult.",
     )
 
     assert_true(
-        tool_result.get("success") is True,
+        tool_result.success is True,
         f"Product search failed: {tool_result}",
     )
 
-    products = tool_result.get(
+    assert_equal(
+        tool_result.tool,
+        "search_products",
+        "Incorrect ToolResult tool name.",
+    )
+
+    # -----------------------------------------------------
+    # ToolResult data
+    # -----------------------------------------------------
+
+    data = tool_result.data
+
+    assert_true(
+        isinstance(
+            data,
+            dict,
+        ),
+        "Product ToolResult data must be a dictionary.",
+    )
+
+    products = data.get(
         "products",
         [],
+    )
+
+    assert_true(
+        isinstance(
+            products,
+            list,
+        ),
+        "Product search result must contain a products list.",
     )
 
     assert_true(
@@ -480,6 +513,7 @@ def test_product_search(
     print(
         f"✓ AI response: {response}"
     )
+
 
 
 # =========================================================

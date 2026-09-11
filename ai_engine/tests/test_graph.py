@@ -20,6 +20,7 @@
 #     pytest ai_engine/tests/test_graph.py -v
 
 
+import ai_engine.nodes.intent_node as intent_module
 from ai_engine.graph.state import GraphState
 
 from ai_engine.nodes.intent_node import (
@@ -155,6 +156,147 @@ def test_intent_classification():
         print(
             f"✓ '{message}' → {actual}"
         )
+
+
+def test_quantity_reply_keeps_order_context(monkeypatch):
+    class BrokenLLM:
+        def invoke(self, messages):
+            raise RuntimeError("simulated provider outage")
+
+    monkeypatch.setattr(
+        intent_module,
+        "structured_llm",
+        BrokenLLM(),
+    )
+
+    state: GraphState = {
+        "intent": "order_create",
+        "missing_fields": ["quantity"],
+        "checkout_id": "checkout-123",
+        "conversation_history": [
+            {"role": "assistant", "content": "How many packs of Amul Full Cream Milk would you like?"},
+            {"role": "user", "content": "I want Amul Full Cream Milk"},
+        ],
+    }
+
+    actual = intent_module.classify_intent("3 packets", state)
+
+    assert_equal(
+        actual,
+        "order_create",
+        "A quantity-only answer in an active order should remain an order continuation.",
+    )
+
+
+def test_decision_node_handles_checkout_without_order_items():
+    state: GraphState = {
+        "intent": "order_create",
+        "entities": {
+            "product_name": "Amul Milk",
+            "quantity": 2,
+        },
+        "order_items": [],
+        "missing_fields": ["address_selection"],
+        "policy_result": {
+            "allowed": True,
+            "action": "START_CHECKOUT",
+            "tool": "list_saved_addresses",
+            "reason": "load_saved_addresses_for_checkout",
+        },
+    }
+
+    result = decision_node(state)
+
+    assert_equal(
+        result["decision"]["route"],
+        "tool",
+        "Checkout routing should keep the workflow alive instead of crashing.",
+    )
+    assert_equal(
+        result["decision"]["tool"],
+        "list_saved_addresses",
+        "The address step should trigger the saved-address lookup.",
+    )
+
+
+def test_entity_node_extracts_multiple_order_items():
+    state: GraphState = {
+        "message": "I want to buy 2 Amul Milk and 5 Tata Salt",
+        "intent": "order_create",
+        "conversation_history": [],
+    }
+
+    result = entity_node(state)
+    entities = result.get("entities", {})
+
+    assert_equal(
+        entities.get("product_name"),
+        "Amul Milk",
+        "The first ordered product should remain the active product context for checkout prompts.",
+    )
+    assert_equal(
+        entities.get("quantity"),
+        2,
+        "The first item quantity should remain the checkout anchor while preserving the full item list.",
+    )
+    assert_equal(
+        entities.get("items"),
+        [
+            {"product_name": "Amul Milk", "quantity": 2},
+            {"product_name": "Tata Salt", "quantity": 5},
+        ],
+        "Single-message multi-item orders should be parsed into structured item tuples, not collapsed into one product name.",
+    )
+
+
+def test_cart_followup_product_name_stays_in_cart_intent():
+    state: GraphState = {
+        "intent": "cart",
+        "entities": {
+            "cart_action": "add_item",
+            "quantity": 4,
+        },
+        "missing_fields": ["product_reference"],
+        "conversation_history": [
+            {"role": "user", "content": "Cart me 4 Tata Salt add kro"},
+        ],
+    }
+
+    actual_intent = classify_intent("Tata Tea Gold", state)
+    assert_equal(
+        actual_intent,
+        "cart",
+        "A bare product reference after an active cart add should remain in the cart workflow, not get reclassified as a new order.",
+    )
+
+    result = entity_node({
+        "message": "Tata Tea Gold",
+        "intent": "cart",
+        "entities": {
+            "cart_action": "add_item",
+            "quantity": 4,
+        },
+        "missing_fields": ["product_reference"],
+        "conversation_history": [
+            {"role": "user", "content": "Cart me 4 Tata Salt add kro"},
+        ],
+    })
+
+    assert_equal(
+        result["intent"],
+        "cart",
+        "Active cart context must keep the follow-up product reference inside the cart task.",
+    )
+    assert_equal(
+        result["entities"]["product_name"],
+        "Tata Tea Gold",
+        "The user’s product reference should be normalized into the cart item without losing the pending add action.",
+    )
+    assert_equal(
+        result["entities"]["cart_action"],
+        "add_item",
+        "The cart operation should remain unchanged while the product reference is supplied.",
+    )
 
 
 # =========================================================

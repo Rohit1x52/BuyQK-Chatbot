@@ -402,8 +402,29 @@ def classify_intent(
         text = message.strip().casefold()
         if re.search(r"\b(cancel|cancellation)\b", text) and re.search(r"\border\b", text):
             return "order_cancel"
-        if re.search(r"\b(track|tracking|status)\b", text) and re.search(r"\border\b", text):
+        if (
+            re.search(r"\b(track|tracking|status)\b", text)
+            and re.search(r"\border\b", text)
+        ) or re.search(
+            r"\bwhere\s+is\s+(?:my\s+)?order\b",
+            text,
+        ):
             return "order_tracking"
+
+        if re.search(
+            r"\b(?:i\s+(?:want|need)|please\s+)?(?:buy|purchase|order|get)\b",
+            text,
+        ) and not _has_explicit_new_intent(text):
+            return "order_create"
+
+        if re.search(
+            r"^\s*i\s+(?:want|need)\s+(?!to\s+).+",
+            text,
+        ) or re.search(
+            r"^\s*(?:give|get)\s+me\s+.+",
+            text,
+        ):
+            return "order_create"
 
         normalized_intent = _normalize_intent(
             getattr(result, "intent", None)

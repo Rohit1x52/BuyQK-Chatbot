@@ -218,6 +218,29 @@ PERSISTED_STATE_FIELDS = (
     "next_missing",
 
     # -----------------------------------------------------
+    # Phase 10 Commerce Verticals
+    # -----------------------------------------------------
+
+    "commerce_vertical",
+
+    # Food
+    "restaurant_id",
+    "restaurant_name",
+    "menu_id",
+    "menu_items",
+
+    # Medicine
+    "pharmacy_id",
+    "pharmacy_name",
+    "prescription_required",
+    "prescription_status",
+
+    # Electronics
+    "product_specifications",
+    "product_variants",
+    "comparison_results",
+
+    # -----------------------------------------------------
     # AI understanding
     # -----------------------------------------------------
 
@@ -248,6 +271,21 @@ PERSISTED_STATE_FIELDS = (
     # -----------------------------------------------------
 
     "transaction_error",
+
+    # -----------------------------------------------------
+    # Phase 9 Customer Support
+    # -----------------------------------------------------
+
+    "support_issue_type",
+    "support_description",
+    "support_transaction_id",
+    "support_evidence_url",
+    "support_verification",
+    "support_resolved",
+    "support_ticket_id",
+    "support_ticket_reference",
+    "support_status",
+    "support_escalation_required",
 )
 
 
@@ -472,6 +510,7 @@ def _build_initial_state(
     selected_address_id: int | None,
     payment_method: str | None,
     checkout_id: str | None,
+    evidence_url: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the GraphState for the current request.
@@ -506,6 +545,14 @@ def _build_initial_state(
         ] = str(
             checkout_id
         ).strip()
+
+    # =====================================================
+    # Current Support Evidence
+    # =====================================================
+    # The API/frontend may provide an already-uploaded evidence URL.
+    # The runner only transports it; it never interprets or validates it.
+    if evidence_url is not None and str(evidence_url).strip():
+        state["support_evidence_url"] = str(evidence_url).strip()
 
     # =====================================================
     # Current User Input
@@ -690,6 +737,70 @@ def _build_initial_state(
     state.setdefault(
         "entities",
         {},
+    )
+
+    # =====================================================
+    # Phase 10 commerce-vertical defaults
+    # =====================================================
+
+    state.setdefault(
+        "commerce_vertical",
+        None,
+    )
+
+    state.setdefault(
+        "restaurant_id",
+        None,
+    )
+
+    state.setdefault(
+        "restaurant_name",
+        None,
+    )
+
+    state.setdefault(
+        "menu_id",
+        None,
+    )
+
+    state.setdefault(
+        "menu_items",
+        [],
+    )
+
+    state.setdefault(
+        "pharmacy_id",
+        None,
+    )
+
+    state.setdefault(
+        "pharmacy_name",
+        None,
+    )
+
+    state.setdefault(
+        "prescription_required",
+        None,
+    )
+
+    state.setdefault(
+        "prescription_status",
+        None,
+    )
+
+    state.setdefault(
+        "product_specifications",
+        None,
+    )
+
+    state.setdefault(
+        "product_variants",
+        [],
+    )
+
+    state.setdefault(
+        "comparison_results",
+        [],
     )
 
     state.setdefault(
@@ -976,7 +1087,17 @@ def _update_conversation_state(
     # Task Status
     # =====================================================
 
-    if (
+    support_completed = bool(
+        updated.get("support_resolved")
+        or updated.get("support_ticket_id") is not None
+    )
+
+    if support_completed:
+        updated[
+            "task_status"
+        ] = "completed"
+
+    elif (
         order_created
         or checkout_completed
     ):
@@ -1107,6 +1228,7 @@ def run_chat(
     selected_address_id: int | None = None,
     payment_method: str | None = None,
     checkout_id: str | None = None,
+    evidence_url: str | None = None,
 ) -> dict[str, Any]:
     """
     Execute the BuyQK AI graph.
@@ -1261,6 +1383,7 @@ def run_chat(
         selected_address_id=selected_address_id,
         payment_method=payment_method,
         checkout_id=checkout_id,
+        evidence_url=evidence_url,
     )
 
     # =====================================================

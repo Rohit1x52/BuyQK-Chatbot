@@ -599,6 +599,10 @@ def _build_planner_prompt(
         "intent"
     )
 
+    commerce_vertical = state.get(
+        "commerce_vertical"
+    )
+
     missing_fields = state.get(
         "missing_fields",
         [],
@@ -681,6 +685,7 @@ def _build_planner_prompt(
         "current_message": message,
         "conversation_history": conversation_history,
         "intent": intent,
+        "commerce_vertical": commerce_vertical,
         "entities": entities,
         "missing_fields": missing_fields,
         "checkout": checkout_state,
@@ -706,12 +711,16 @@ You may decide:
 - whether the user wants tracking
 - whether the user wants cancellation
 - whether the user wants support
+- support issue classification and required support details
 - whether clarification is required
 - whether the message is ordinary conversation
 - which backend capability is appropriate
 
 You must NOT:
 
+- invent or hardcode a commerce vertical
+- infer a vertical from a product name alone when the conversation is ambiguous
+- create a new intent or backend tool merely because the commerce vertical changed
 - calculate prices
 - calculate bills
 - invent stock
@@ -724,6 +733,20 @@ You must NOT:
 - claim an order was created without authoritative backend state
 
 The backend is authoritative for transactional facts.
+
+COMMERCE VERTICAL RULE:
+
+Use the semantic commerce_vertical already produced by the Entity/AI layer as
+context for planning. Do not replace it with keyword rules or hardcoded
+classification. If the vertical is absent or ambiguous, do not fabricate one.
+
+Food ordering and medicine ordering remain order_create workflows unless the
+user's meaning clearly indicates another intent. Electronics search and
+comparison remain product_search workflows. Use the existing capabilities; do
+not invent vertical-specific tools.
+
+The planner may carry commerce_vertical as plan metadata, but it must not add
+unsupported vertical-specific arguments to an existing backend tool.
 
 CHECKOUT CONTINUITY RULE:
 
@@ -810,6 +833,22 @@ Phase 7A address capability:
 When the user explicitly asks to add a new delivery address, use
 add_new_address only when address_action is "add". Pass only address
 fields already present in the supplied state. Never invent address data.
+
+CUSTOMER SUPPORT PLANNING RULE:
+When intent is "customer_support", use the canonical action
+"request_support". The Tool Node/backend decides whether the request is
+resolved immediately or requires ticket creation.
+
+Carry only already-understood support fields:
+- support_issue_type
+- support_description
+- order_id
+- support_transaction_id
+- support_evidence_url
+
+Do not invent IDs, evidence URLs, payment status, refund status, delivery
+status, resolution, compensation, or ticket IDs.
+
 
 CART PLANNING RULE:
 
@@ -1146,6 +1185,33 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
             "reason": "Deterministic tracking plan used because the planner model was unavailable.",
         }
 
+    if intent == "customer_support":
+        arguments = {}
+        for key in (
+            "support_issue_type",
+            "support_description",
+            "order_id",
+            "support_transaction_id",
+            "support_evidence_url",
+        ):
+            value = entities.get(key)
+            if value is not None and (
+                not isinstance(value, str) or value.strip()
+            ):
+                arguments[key] = value
+
+        return {
+            "action": "request_support",
+            "tool_name": "request_support",
+            "arguments": arguments,
+            "missing_fields": missing,
+            "confidence": 0.0,
+            "reason": (
+                "Deterministic support plan used because the planner "
+                "model was unavailable."
+            ),
+        }
+
     mapping = {
         "product_search": "search_products",
         "order_tracking": "track_order",
@@ -1308,6 +1374,65 @@ def _preserve_cancellation_arguments(
     plan["arguments"] = merged
     return plan
 
+def _preserve_support_arguments(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry already-understood Phase 9 support fields into the plan."""
+    action = _normalize_action(plan.get("action"))
+    if action != "request_support":
+        return plan
+
+    arguments = plan.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    merged = dict(arguments)
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    for key in (
+        "support_issue_type",
+        "support_description",
+        "order_id",
+        "support_transaction_id",
+        "support_evidence_url",
+    ):
+        value = entities.get(key)
+        if value is None:
+            value = state.get(key)
+        if value is not None and (
+            not isinstance(value, str) or value.strip()
+        ):
+            merged[key] = value
+
+    plan["arguments"] = merged
+    return plan
+
+
+def _attach_commerce_context(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry AI-understood commerce context as planner metadata only.
+
+    The vertical is intentionally kept out of backend tool arguments because
+    existing tools may not accept arbitrary fields. Backend/catalog services
+    remain responsible for resolving vertical-specific entities.
+    """
+    vertical = state.get("commerce_vertical")
+    if isinstance(vertical, str):
+        vertical = vertical.strip() or None
+
+    if vertical:
+        plan["commerce_vertical"] = vertical
+    else:
+        plan.pop("commerce_vertical", None)
+
+    return plan
+
+
 def planner_node(
     state: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1330,6 +1455,7 @@ def planner_node(
     # -----------------------------------------------------
     if str(state.get("intent") or "").strip().lower() == "order_create":
         plan = _deterministic_plan_fallback(state)
+        plan = _attach_commerce_context(state, plan)
         result = {
             "planner": plan,
             "planner_args": dict(plan.get("arguments", {})),
@@ -1379,6 +1505,8 @@ def planner_node(
             f" {type(exc).__name__}: {exc}"
         )
         plan = _deterministic_plan_fallback(state)
+
+    plan = _attach_commerce_context(state, plan)
 
     # -----------------------------------------------------
     # Phase 3 cart capability enforcement
@@ -1485,6 +1613,10 @@ def planner_node(
         state,
         plan,
     )
+    plan = _preserve_support_arguments(
+        state,
+        plan,
+    )
 
     # -----------------------------------------------------
     # Preserve backend transaction state
@@ -1546,6 +1678,11 @@ def planner_node(
     print(
         f"action          = "
         f"{plan.get('action')!r}"
+    )
+
+    print(
+        f"commerce_vertical = "
+        f"{plan.get('commerce_vertical')!r}"
     )
 
     print(

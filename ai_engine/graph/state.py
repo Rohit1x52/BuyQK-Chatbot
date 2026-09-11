@@ -176,6 +176,33 @@ class GraphState(TypedDict, total=False):
     product_search_results: list[dict[str, Any]]
 
     # =========================================================
+    # COMMERCE VERTICAL - PHASE 10
+    # =========================================================
+
+    # Current commerce vertical understood from the conversation.
+    # Examples: grocery, food, medicine, electronics.
+    # This is conversational routing context; backend remains
+    # authoritative for product/merchant identity and availability.
+    commerce_vertical: str | None
+
+    # Restaurant/merchant context used by food ordering.
+    restaurant_id: int | None
+    restaurant_name: str | None
+    menu_id: int | None
+    menu_items: list[dict[str, Any]]
+
+    # Pharmacy/prescription context used by medicine ordering.
+    pharmacy_id: int | None
+    pharmacy_name: str | None
+    prescription_required: bool | None
+    prescription_status: str | None
+
+    # Electronics product intelligence.
+    product_specifications: dict[str, Any] | None
+    product_variants: list[dict[str, Any]]
+    comparison_results: list[dict[str, Any]]
+
+    # =========================================================
     # AI UNDERSTANDING
     # =========================================================
 
@@ -582,6 +609,42 @@ class GraphState(TypedDict, total=False):
 
     # Structured backend transaction error.
     transaction_error: dict[str, Any] | None
+
+    # =========================================================
+    # CUSTOMER SUPPORT - PHASE 9
+    # =========================================================
+
+    # Current support issue category understood from the user.
+    # Examples: wrong_product, payment_failure, delivery_delay,
+    # refund_status, human_escalation, general_support.
+    support_issue_type: str | None
+
+    # Natural-language description of the support issue.
+    support_description: str | None
+
+    # Payment transaction/reference identifier when supplied.
+    support_transaction_id: str | None
+
+    # Evidence supplied by the user (normally an uploaded image/document URL).
+    support_evidence_url: str | None
+
+    # Backend-authoritative support verification result.
+    support_verification: dict[str, Any] | None
+
+    # Whether backend verification resolved the issue without escalation.
+    support_resolved: bool
+
+    # Ticket reference returned by the backend after ticket creation.
+    support_ticket_id: int | None
+
+    # Human-readable ticket reference, e.g. SUP10231.
+    support_ticket_reference: str | None
+
+    # Current support lifecycle status.
+    support_status: str | None
+
+    # Whether the support flow requires human escalation.
+    support_escalation_required: bool
 
     # =========================================================
     # BILLING

@@ -936,6 +936,26 @@ def _context_aware_missing_field_fallback(
     if next_missing == "payment_method":
         return "Please select a payment method."
 
+    # Phase 9 support follow-ups.
+    support_issue_type = _context_value(
+        state,
+        "support_issue_type",
+    )
+
+    if next_missing == "order_id":
+        if support_issue_type in {
+            "wrong_product",
+            "refund_status",
+        }:
+            return "Please share your Order ID."
+        return "Please share the Order ID."
+
+    if next_missing == "payment_reference":
+        return "Please share your Transaction ID or Order ID."
+
+    if next_missing == "support_evidence":
+        return "Please upload the product image as evidence."
+
     return _checkout_fallback(next_missing)
 
 
@@ -2072,6 +2092,18 @@ def _success_response_from_tool(
 
         return "Here is your current cart."
 
+    if result_type in {
+        "order_tracking",
+        "order_cancelled",
+    }:
+        return _tool_fallback(tool_result)
+
+    if result_type in {
+        "support_verification",
+        "support_ticket",
+    }:
+        return _tool_fallback(tool_result)
+
     # =====================================================
     # GENERIC SUCCESS
     # =====================================================
@@ -2208,6 +2240,66 @@ planning notes, JSON, markdown code fences, or implementation details.
         tool_result
     )
 
+
+    # -----------------------------------------------------
+    # Customer Support - Phase 9
+    # -----------------------------------------------------
+
+    if result_type == "support_verification":
+        issue_type = tool_result.get("issue_type")
+        verification = tool_result.get("verification")
+        if not isinstance(verification, dict):
+            verification = {}
+
+        if issue_type == "payment_failure":
+            payment_status = verification.get("payment_status")
+            if payment_status == "failed":
+                return (
+                    "Backend verification confirms that the payment failed. "
+                    "Please retry the payment or use another available payment method."
+                )
+
+        if issue_type == "delivery_delay":
+            order_id = tool_result.get("order_id")
+            order_status = verification.get("order_status")
+            if order_status:
+                if order_id is not None:
+                    return f"Order #{order_id} is currently {order_status}."
+                return f"Your latest order is currently {order_status}."
+
+        if issue_type == "refund_status":
+            refund_status = verification.get("refund_status")
+            order_id = tool_result.get("order_id")
+            if refund_status:
+                if order_id is not None:
+                    return (
+                        f"Refund status for order #{order_id}: "
+                        f"{refund_status}."
+                    )
+                return f"Refund status: {refund_status}."
+
+        if tool_result.get("reason") == "evidence_required":
+            return "Please upload the product image as evidence."
+
+        return "Your support request requires further review."
+
+    if result_type == "support_ticket":
+        ticket_reference = tool_result.get("ticket_reference")
+        ticket_id = tool_result.get("ticket_id")
+
+        if ticket_reference:
+            return (
+                "Your support request has been created. "
+                f"Ticket ID: {ticket_reference}."
+            )
+
+        if ticket_id is not None:
+            return (
+                "Your support request has been created. "
+                f"Ticket ID: #{ticket_id}."
+            )
+
+        return "Your support request has been created."
 
 # =========================================================
 # Tool Fallback
@@ -2488,7 +2580,53 @@ def _tool_fallback(
         return " ".join(parts)
 
     # -----------------------------------------------------
-    # Support
+    # Customer Support - Phase 9 verification
+    # -----------------------------------------------------
+
+    if result_type == "support_verification":
+        issue_type = tool_result.get("issue_type")
+        verification = tool_result.get("verification")
+        if not isinstance(verification, dict):
+            verification = {}
+
+        reason = tool_result.get("reason")
+
+        if issue_type == "payment_failure":
+            payment_status = verification.get("payment_status")
+            if payment_status == "failed":
+                return (
+                    "Backend verification confirms that the payment failed. "
+                    "Please retry the payment or use another available payment method."
+                )
+
+        if issue_type == "delivery_delay":
+            order_id = tool_result.get("order_id")
+            order_status = verification.get("order_status")
+            if order_status:
+                if order_id is not None:
+                    return (
+                        f"Order #{order_id} is currently {order_status}."
+                    )
+                return f"Your latest order is currently {order_status}."
+
+        if issue_type == "refund_status":
+            refund_status = verification.get("refund_status")
+            order_id = tool_result.get("order_id")
+            if refund_status:
+                if order_id is not None:
+                    return (
+                        f"Refund status for order #{order_id}: "
+                        f"{refund_status}."
+                    )
+                return f"Refund status: {refund_status}."
+
+        if reason == "evidence_required":
+            return "Please upload the product image as evidence."
+
+        return "Your support request requires further review."
+
+    # -----------------------------------------------------
+    # Support ticket
     # -----------------------------------------------------
 
     if result_type == "support_ticket":
@@ -2497,11 +2635,20 @@ def _tool_fallback(
             "ticket_id"
         )
 
-        if ticket_id is not None:
+        ticket_reference = tool_result.get(
+            "ticket_reference"
+        )
 
+        if ticket_reference:
             return (
-                "Your support request has been "
-                f"created. Ticket ID: #{ticket_id}."
+                "Your support request has been created. "
+                f"Ticket ID: {ticket_reference}."
+            )
+
+        if ticket_id is not None:
+            return (
+                "Your support request has been created. "
+                f"Ticket ID: #{ticket_id}."
             )
 
         return (
@@ -3303,6 +3450,46 @@ def response_node(
     if (
         isinstance(tool_result, dict)
         and tool_result.get("success") is False
+        and tool_result.get("type") == "support_verification"
+        and tool_result.get("error_code") == "not_found"
+    ):
+        return {
+            "response": "I couldn't find that order or transaction. Please verify the ID and try again.",
+            "response_language": response_language,
+            "tool_result": tool_result_object,
+            "metadata": {
+                **metadata,
+                "type": "support_error",
+                "error_code": "not_found",
+                "missing_fields": missing_fields,
+            },
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is False
+        and tool_result.get("type") == "support_verification"
+        and tool_result.get("error_code") == "backend_error"
+    ):
+        return {
+            "response": "Support service is temporarily unavailable. Please try again.",
+            "response_language": response_language,
+            "tool_result": tool_result_object,
+            "metadata": {
+                **metadata,
+                "type": "support_error",
+                "error_code": "backend_error",
+                "missing_fields": missing_fields,
+            },
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+        }
+
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is False
         and _extract_canonical_error_code(tool_result) is not None
     ):
         response = _canonical_error_response(tool_result)
@@ -3456,7 +3643,67 @@ def response_node(
             }
 
     # ---------------------------------------------------------
-    # 7. Product search
+    # 7. Customer Support
+    #
+    # Support verification/ticket responses are deterministic. Do not
+    # send these backend-authoritative outcomes back through the LLM
+    # before the customer sees them.
+    # ---------------------------------------------------------
+    if (
+        isinstance(tool_result, dict)
+        and tool_result.get("success") is True
+        and tool_result.get("type") in {
+            "support_verification",
+            "support_ticket",
+        }
+    ):
+        response = _success_response_from_tool(
+            tool_result,
+            tool_name,
+        )
+        response = _sanitize_user_response(
+            response
+        )
+
+        support_metadata = {
+            **metadata,
+            "type": tool_result.get("type"),
+            "issue_type": tool_result.get("issue_type"),
+            "support_resolved": bool(
+                tool_result.get("resolved", False)
+            ),
+            "ticket_id": tool_result.get("ticket_id"),
+            "ticket_reference": tool_result.get("ticket_reference"),
+            "ticket_status": tool_result.get("status"),
+            "human_escalation": bool(
+                tool_result.get("human_escalation", False)
+            ),
+            "verification": tool_result.get("verification"),
+            "missing_fields": [],
+        }
+
+        return {
+            "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
+            "metadata": support_metadata,
+            "missing_fields": [],
+            "next_missing": None,
+            "support_resolved": bool(
+                tool_result.get("resolved", False)
+            ),
+            "support_ticket_id": tool_result.get("ticket_id"),
+            "support_ticket_reference": tool_result.get(
+                "ticket_reference"
+            ),
+            "support_status": tool_result.get("status"),
+            "support_escalation_required": bool(
+                tool_result.get("human_escalation", False)
+            ),
+        }
+
+    # ---------------------------------------------------------
+    # 8. Product search
     #
     # Kept explicit because product results have dedicated UI
     # metadata.
