@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "description": "Rules for comparing electronics products.",
+  "comparison_principles": [
+    "Compare products using specifications returned by the backend.",
+    "Do not invent a specification that is missing from the backend result.",
+    "Do not infer an exact specification from a product name alone.",
+    "Use the same comparison dimensions across products whenever those dimensions are available.",
+    "Clearly identify unavailable specifications.",
+    "Price and availability must come from backend product data."
+  ],
+  "categories": {
+    "smartphone": {
+      "preferred_dimensions": [
+        "brand",
+        "model_number",
+        "display",
+        "processor",
+        "ram",
+        "storage",
+        "camera",
+        "battery",
+        "operating_system",
+        "connectivity"
+      ]
+    },
+    "laptop": {
+      "preferred_dimensions": [
+        "brand",
+        "model_number",
+        "processor",
+        "ram",
+        "storage",
+        "display",
+        "graphics",
+        "operating_system",
+        "battery"
+      ]
+    },
+    "television": {
+      "preferred_dimensions": [
+        "brand",
+        "model_number",
+        "display_size",
+        "resolution",
+        "panel_type",
+        "refresh_rate",
+        "operating_system",
+        "connectivity"
+      ]
+    },
+    "headphones": {
+      "preferred_dimensions": [
+        "brand",
+        "model_number",
+        "type",
+        "connectivity",
+        "noise_cancellation",
+        "battery",
+        "microphone"
+      ]
+    }
+  },
+  "missing_data_policy": {
+    "behavior": "mark_as_unavailable",
+    "message": "This specification is not available in the product data."
+  }
+}

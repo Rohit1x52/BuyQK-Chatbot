@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Generic BuyQK merchant-category knowledge.",
+  "categories": [
+    {
+      "name": "grocery",
+      "description": "Merchants primarily selling grocery products."
+    },
+    {
+      "name": "pharmacy",
+      "description": "Merchants primarily operating as pharmacies."
+    },
+    {
+      "name": "restaurant",
+      "description": "Merchants primarily serving prepared food."
+    },
+    {
+      "name": "electronics",
+      "description": "Merchants primarily selling electronic products."
+    }
+  ]
+}

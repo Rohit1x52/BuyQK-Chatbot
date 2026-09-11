@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "description": "Safety guardrails for medicine-related conversations.",
+  "principles": [
+    "Medicine information must be handled conservatively.",
+    "Do not diagnose a medical condition.",
+    "Do not recommend a prescription medicine solely from symptoms.",
+    "Do not invent dosage instructions.",
+    "Do not invent contraindications, interactions, or patient-specific advice.",
+    "Prescription requirements must come from authoritative product and backend data.",
+    "Prescription verification is a transaction/workflow concern and is not performed by this knowledge file.",
+    "When the user requests patient-specific medical advice, recommend consulting a qualified healthcare professional."
+  ],
+  "prescription_rules": {
+    "prescription_required_true": [
+      "The product requires prescription verification before purchase can proceed."
+    ],
+    "prescription_required_false": [
+      "The product is not marked as prescription-required in the product catalog."
+    ],
+    "unknown": [
+      "Do not assume whether a prescription is required when backend data is unavailable."
+    ]
+  },
+  "response_guardrails": {
+    "symptom_based_requests": "Provide general safety-oriented information and recommend professional medical advice rather than diagnosing or prescribing.",
+    "dosage_requests": "Do not invent a dosage. Refer to the product label or a qualified healthcare professional.",
+    "interaction_requests": "Do not invent interaction information. Recommend checking with a pharmacist or qualified healthcare professional.",
+    "prescription_requests": "Use backend prescription workflow when available. Do not claim that a prescription has been verified unless the backend confirms it."
+  }
+}
