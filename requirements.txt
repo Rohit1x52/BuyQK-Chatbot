@@ -4,6 +4,7 @@ pydantic
 email-validator
 faiss-cpu
 numpy
+sentence-transformers
 python-dotenv
 uvicorn
 fastapi
