@@ -9,7 +9,7 @@ from collections.abc import Generator
 
 from sqlalchemy.orm import Session
 
-from backend.database.sqlite import SessionLocal
+from backend.database import sqlite
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -20,7 +20,7 @@ def get_db() -> Generator[Session, None, None]:
     automatically closed when the request finishes.
     """
 
-    db = SessionLocal()
+    db = sqlite.SessionLocal()
 
     try:
         yield db

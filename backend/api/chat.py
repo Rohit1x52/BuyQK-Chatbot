@@ -151,8 +151,9 @@ def _request_value(
     Safely read an optional field from ChatRequest.
 
     This keeps the API compatible with older request schemas
-    while allowing newer transaction fields such as:
+    while allowing newer context and transaction fields such as:
 
+        commerce_vertical
         checkout_id
         selected_address_id
         payment_method
@@ -191,6 +192,31 @@ def _build_run_chat_kwargs(
         "user_id": request.user_id,
         "db": db,
     }
+
+    # =====================================================
+    # Frontend commerce context
+    # =====================================================
+    #
+    # If the frontend already knows the active commerce
+    # vertical, pass it through unchanged.
+    #
+    # The API does not infer whether a request is food,
+    # medicine, electronics, etc.
+    #
+    # The graph remains responsible for semantic
+    # interpretation and validation.
+    #
+    # =====================================================
+
+    commerce_vertical = _request_value(
+        request,
+        "commerce_vertical",
+    )
+
+    if commerce_vertical is not None:
+        kwargs[
+            "commerce_vertical"
+        ] = commerce_vertical
 
     # =====================================================
     # Frontend-authoritative address selection
@@ -259,6 +285,7 @@ def _run_graph(
 
     Newer runners can consume:
 
+        commerce_vertical
         checkout_id
         selected_address_id
         payment_method
@@ -272,6 +299,7 @@ def _run_graph(
         parameters = inspect.signature(
             run_chat
         ).parameters
+
     except (
         TypeError,
         ValueError,
@@ -402,6 +430,7 @@ def _extract_metadata(
         tracking
         errors
         transaction state
+        commerce context
 
     The API does not calculate or modify these values.
     """

@@ -33,6 +33,33 @@ class ChatRequest(BaseModel):
     )
 
     # --------------------------------------------------------
+    # Commerce Vertical
+    # --------------------------------------------------------
+    #
+    # Optional frontend context.
+    #
+    # The frontend may provide a known commerce vertical,
+    # but the API does not infer or validate the business
+    # meaning of this value.
+    #
+    # Examples:
+    #
+    #     grocery
+    #     food
+    #     medicine
+    #     electronics
+    #
+    # The graph remains responsible for semantic understanding.
+    #
+    # --------------------------------------------------------
+
+    commerce_vertical: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+    )
+
+    # --------------------------------------------------------
     # Active checkout
     # --------------------------------------------------------
     #

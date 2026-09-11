@@ -8,13 +8,18 @@ Store brand information.
 Store product description.
 Store an image URL.
 Track whether the product is currently available.
+Store an optional model number for products such as electronics.
+Store flexible product specifications.
+Store whether a product requires a prescription.
 Allow the AI/tool layer to search products later.
 Provide product information when creating order_items.
 """
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     Float,
@@ -31,15 +36,27 @@ from backend.database.base import Base
 class Product(Base):
     """
     Represents a product available on the BuyQK platform.
+
+    The Product model is intentionally generic so that the same
+    product infrastructure can support multiple commerce verticals
+    such as grocery, pharmacy, electronics, and future categories.
     """
 
     __tablename__ = "products"
+
+    # =========================================================
+    # Primary Key
+    # =========================================================
 
     # Unique identifier for the product
     id: Mapped[int] = mapped_column(
         primary_key=True,
         autoincrement=True
     )
+
+    # =========================================================
+    # Merchant
+    # =========================================================
 
     # Merchant that sells this product
     merchant_id: Mapped[int] = mapped_column(
@@ -48,12 +65,20 @@ class Product(Base):
         index=True
     )
 
+    # =========================================================
+    # Category
+    # =========================================================
+
     # Category to which this product belongs
     category_id: Mapped[int] = mapped_column(
         ForeignKey("categories.id", ondelete="RESTRICT"),
         nullable=False,
         index=True
     )
+
+    # =========================================================
+    # Basic Product Information
+    # =========================================================
 
     # Product name
     name: Mapped[str] = mapped_column(
@@ -75,6 +100,58 @@ class Product(Base):
         index=True
     )
 
+    # =========================================================
+    # Electronics / Product Identification
+    # =========================================================
+
+    # Optional model number.
+    #
+    # Useful for electronics and other products where a
+    # manufacturer model number is an important identifier.
+    model_number: Mapped[str | None] = mapped_column(
+        String(150),
+        nullable=True,
+        index=True
+    )
+
+    # Flexible product-specific specifications.
+    #
+    # Examples:
+    #
+    # Electronics:
+    # {
+    #     "ram": "8GB",
+    #     "storage": "256GB",
+    #     "display": "6.5 inch"
+    # }
+    #
+    # Other product categories can use their own specification
+    # keys without requiring a new database column for each one.
+    specifications: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True
+    )
+
+    # =========================================================
+    # Medicine / Pharmacy
+    # =========================================================
+
+    # Indicates whether the product requires a prescription.
+    #
+    # This is catalog metadata about the product.
+    # Actual prescription verification/status belongs to the
+    # transaction/user workflow and should not be stored here.
+    prescription_required: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        index=True
+    )
+
+    # =========================================================
+    # Pricing and Inventory
+    # =========================================================
+
     # Product price
     price: Mapped[float] = mapped_column(
         Float,
@@ -88,11 +165,19 @@ class Product(Base):
         nullable=False
     )
 
+    # =========================================================
+    # Media
+    # =========================================================
+
     # URL of product image
     image_url: Mapped[str | None] = mapped_column(
         String(500),
         nullable=True
     )
+
+    # =========================================================
+    # Availability
+    # =========================================================
 
     # Whether the product is currently available
     is_available: Mapped[bool] = mapped_column(
@@ -101,6 +186,10 @@ class Product(Base):
         nullable=False,
         index=True
     )
+
+    # =========================================================
+    # Timestamps
+    # =========================================================
 
     # Product creation timestamp
     created_at: Mapped[datetime] = mapped_column(
@@ -116,6 +205,10 @@ class Product(Base):
         onupdate=datetime.utcnow,
         nullable=False
     )
+
+    # =========================================================
+    # Relationships
+    # =========================================================
 
     # Relationship with Merchant
     merchant = relationship(
@@ -135,7 +228,7 @@ class Product(Base):
         back_populates="product"
     )
 
-    ## relationship with cart items
+    # Relationship with CartItem
     cart_items = relationship(
         "CartItem",
         back_populates="product",

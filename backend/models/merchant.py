@@ -96,6 +96,13 @@ class Merchant(Base):
         back_populates="merchant"
     )
 
+    restaurant = relationship(
+        "Restaurant",
+        back_populates="merchant",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
     def __init__(self, *args, **kwargs):
         # Backwards-compatibility: allow calling Merchant(name=...)
         # from tests or older code by mapping `name` to

@@ -393,6 +393,200 @@ def _migrate_orders_table(
         )
 
 
+def _migrate_products_table(
+    connection,
+) -> None:
+    """
+    Perform lightweight migrations required by the current
+    Product model.
+
+    New Product fields:
+
+        products.model_number
+        products.specifications
+        products.prescription_required
+
+    Existing product records remain valid:
+
+        model_number = NULL
+        specifications = NULL
+        prescription_required = 0
+
+    The migration is intentionally additive and does not
+    modify or rewrite existing product records.
+    """
+
+    # ---------------------------------------------------------
+    # Nothing to migrate if the products table does not exist.
+    #
+    # Base.metadata.create_all() will create the complete
+    # current products table later.
+    # ---------------------------------------------------------
+
+    if not _table_exists(
+        connection,
+        "products",
+    ):
+        return
+
+    # ---------------------------------------------------------
+    # Add model_number.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "products",
+        "model_number",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "products.model_number ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE products
+                ADD COLUMN model_number VARCHAR(150)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "products.model_number added."
+        )
+
+    # ---------------------------------------------------------
+    # Add specifications.
+    #
+    # SQLite stores SQLAlchemy JSON values using its
+    # JSON-compatible TEXT representation.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "products",
+        "specifications",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "products.specifications ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE products
+                ADD COLUMN specifications JSON
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "products.specifications added."
+        )
+
+    # ---------------------------------------------------------
+    # Add prescription_required.
+    #
+    # Existing products must remain valid, so the database
+    # column receives a default value of 0.
+    #
+    # 0 = prescription not required
+    # 1 = prescription required
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "products",
+        "prescription_required",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "products.prescription_required ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE products
+                ADD COLUMN prescription_required
+                BOOLEAN NOT NULL DEFAULT 0
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "products.prescription_required added."
+        )
+
+    # ---------------------------------------------------------
+    # Ensure indexes exist for the new indexed columns.
+    # ---------------------------------------------------------
+
+    index_result = connection.execute(
+        text(
+            'PRAGMA index_list("products")'
+        )
+    )
+
+    existing_indexes = {
+        row[1]
+        for row in index_result.fetchall()
+        if len(row) >= 2
+    }
+
+    # model_number index
+    if "ix_products_model_number" not in existing_indexes:
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_products_model_number ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_products_model_number
+                ON products(model_number)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_products_model_number created."
+        )
+
+    # prescription_required index
+    if (
+        "ix_products_prescription_required"
+        not in existing_indexes
+    ):
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_products_prescription_required ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_products_prescription_required
+                ON products(prescription_required)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_products_prescription_required created."
+        )
+
+
 # =========================================================
 # Database Initialization
 # =========================================================
@@ -428,6 +622,10 @@ def init_db() -> None:
             connection
         )
 
+        _migrate_products_table(
+            connection
+        )
+
     # ---------------------------------------------------------
     # Create missing tables
     # ---------------------------------------------------------
@@ -447,7 +645,10 @@ def init_db() -> None:
                     "bootstrapping seed catalog..."
                 )
                 from backend.seed_products import seed_products
-                seed_products(auto_init=False)
+
+                seed_products(
+                    auto_init=False
+                )
 
     except Exception as exc:
         print(

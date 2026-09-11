@@ -135,6 +135,64 @@ def create_test_database():
 # Seed Test Data
 # =========================================================
 
+def test_init_db_bootstraps_product_catalog_when_empty(
+    monkeypatch,
+):
+    """
+    The real DB should populate its catalog automatically when it is
+    empty, so the AI can resolve actual catalog items like
+    'Everest Turmeric Powder' without any hardcoded special cases.
+    """
+
+    temp_directory = tempfile.TemporaryDirectory()
+    database_path = Path(temp_directory.name) / "bootstrap_test.db"
+
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={
+            "check_same_thread": False,
+        },
+    )
+
+    SessionLocal = sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+    )
+
+    monkeypatch.setattr(
+        "backend.database.sqlite.engine",
+        engine,
+    )
+    monkeypatch.setattr(
+        "backend.database.sqlite.SessionLocal",
+        SessionLocal,
+    )
+    monkeypatch.setattr(
+        "backend.database.init_db.engine",
+        engine,
+    )
+
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    from backend.database import init_db as init_db_module
+
+    init_db_module.init_db()
+
+    with SessionLocal() as db:
+        product_names = [
+            product.name for product in db.query(Product).all()
+        ]
+
+    assert "Amul Milk" in product_names
+    assert "Tata Tea Gold" in product_names
+    assert "Everest Turmeric Powder" in product_names
+
+    engine.dispose()
+    temp_directory.cleanup()
+
+
 def seed_test_data(db):
     """
     Insert minimal data required by the service tests.
