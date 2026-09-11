@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Generic BuyQK product-category knowledge.",
+  "categories": [
+    {
+      "name": "grocery",
+      "description": "Everyday food, beverages, household groceries, and consumables."
+    },
+    {
+      "name": "pharmacy",
+      "description": "Medicines, healthcare products, and pharmacy-related products."
+    },
+    {
+      "name": "electronics",
+      "description": "Consumer electronics, computers, phones, accessories, and related devices."
+    },
+    {
+      "name": "food",
+      "description": "Prepared food and restaurant-related products."
+    }
+  ]
+}
