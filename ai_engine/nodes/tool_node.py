@@ -83,6 +83,9 @@ from backend.services.address_service import (
     get_user_addresses,
     create_address,
 )
+from backend.services.service_service import search_services, get_service
+from backend.services.availability_service import get_available_slots, check_availability, get_available_professionals
+from backend.services.booking_service import create_booking, get_booking, cancel_booking
 
 from backend.services.cart_service import (
     add_item as cart_add_item,
@@ -4461,6 +4464,99 @@ def _tool_node_impl(
                 "support_resolved": False,
                 "support_escalation_required": True,
             }
+
+    # =====================================================
+    # SERVICE BOOKING
+    # =====================================================
+    if tool_name in {"search_services","check_availability","get_available_professionals","create_booking","get_booking","cancel_booking","process_booking_payment"}:
+        def booking_value(key: str):
+            value = state.get(key)
+            if value is None: value = updated_entities.get(key)
+            args = state.get("planner_args")
+            if value is None and isinstance(args, dict): value = args.get(key)
+            return value
+
+        service_id = booking_value("service_id")
+        service_name = booking_value("service_name")
+        booking_id = booking_value("booking_id")
+        professional_id = booking_value("professional_id")
+        if tool_name == "search_services":
+            try:
+                services = search_services(db=db, query=str(service_name).strip() if service_name else None)
+                payload = [{"id":x.id,"name":x.name,"description":x.description,"category":x.category,"base_price":x.base_price,"duration_minutes":x.duration_minutes} for x in services]
+                result = {"tool_name":tool_name,"tool_result":{"success":True,"type":"service_search","services":payload}}
+                if len(payload) == 1:
+                    result.update({"service_id": payload[0]["id"], "service_name": payload[0]["name"]})
+                    result["tool_result"].update({"service_id": payload[0]["id"], "service_name": payload[0]["name"]})
+                return result
+            except Exception as exc:
+                return {"tool_result":{"success":False,"type":"service_search","error":str(exc)}}
+        if tool_name == "process_booking_payment":
+            return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_payment","error":"Booking payment processing is not available yet.","error_code":"backend_error"}}
+        if tool_name in {"get_booking","cancel_booking"}:
+            try:
+                booking = get_booking(db=db, booking_id=int(booking_id))
+                if booking is None or (user_id is not None and getattr(booking,"user_id",None) != int(user_id)):
+                    return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_not_found","error":"Booking was not found.","error_code":"not_found"}}
+                if tool_name == "get_booking":
+                    return {"tool_name":tool_name,"tool_result":{"success":True,"type":"booking","booking_id":booking.id,"service_id":booking.service_id,"professional_id":booking.professional_id,"address_id":booking.address_id,"date":str(booking.date),"start_time":str(booking.start_time),"end_time":str(booking.end_time),"booking_status":booking.status,"payment_status":booking.payment_status},"booking_id":booking.id,"booking_status":booking.status,"payment_status":booking.payment_status}
+                cancelled = cancel_booking(db=db, booking_id=int(booking_id), user_id=int(user_id))
+                return {"tool_name":tool_name,"tool_result":{"success":True,"type":"booking_cancelled","booking_id":cancelled.id,"status":cancelled.status},"booking_id":cancelled.id,"booking_status":cancelled.status}
+            except ValueError as exc:
+                return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":str(exc),"error_code":"validation_error"}}
+            except Exception as exc:
+                return {"tool_result":{"success":False,"type":"booking_error","error":str(exc)}}
+
+        from datetime import datetime, date, timedelta
+        def parse_date(v):
+            if isinstance(v,date): return v
+            text=str(v or "").strip()
+            if text.casefold()=="today": return date.today()
+            if text.casefold()=="tomorrow": return date.today()+timedelta(days=1)
+            for fmt in ("%Y-%m-%d","%d-%m-%Y","%d/%m/%Y","%m/%d/%Y"):
+                try: return datetime.strptime(text,fmt).date()
+                except ValueError: pass
+            return None
+        def parse_time(v):
+            if v is None: return None
+            if hasattr(v,"hour"): return v
+            for fmt in ("%I:%M %p","%I %p","%H:%M"):
+                try: return datetime.strptime(str(v).strip().upper(),fmt).time()
+                except ValueError: pass
+            return None
+
+        booking_date=parse_date(booking_value("booking_date")); start_time=parse_time(booking_value("booking_start_time")); end_time=parse_time(booking_value("booking_end_time"))
+        try:
+            if service_id is None and service_name:
+                matches=search_services(db=db,query=str(service_name).strip())
+                if len(matches)!=1:
+                    return {"tool_name":tool_name,"tool_result":{"success":False,"type":"service_selection","error":"The service could not be uniquely resolved.","error_code":"validation_error","services":[{"id":x.id,"name":x.name} for x in matches]}}
+                service_id=matches[0].id
+            service=get_service(db=db,service_id=int(service_id))
+            if service is None or not service.is_active:
+                return {"tool_name":tool_name,"tool_result":{"success":False,"type":"service_not_found","error":"The requested service is not available.","error_code":"not_found"}}
+            if booking_date is None or start_time is None:
+                return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":"A valid booking date and start time are required.","error_code":"validation_error"}}
+            if end_time is None: end_time=(datetime.combine(booking_date,start_time)+timedelta(minutes=service.duration_minutes)).time()
+            if tool_name=="check_availability":
+                available=check_availability(db=db,service_id=service.id,requested_date=booking_date,start_time=start_time,end_time=end_time,professional_id=int(professional_id) if professional_id is not None else None)
+                slots=get_available_slots(db=db,service_id=service.id,requested_date=booking_date,professional_id=int(professional_id) if professional_id is not None else None)
+                slot_payload=[{"start_time":str(x.start_time),"end_time":str(x.end_time)} for x in slots]
+                return {"tool_name":tool_name,"tool_result":{"success":True,"type":"availability","available":available,"service_id":service.id,"service_name":service.name,"date":str(booking_date),"start_time":str(start_time),"end_time":str(end_time),"slots":slot_payload},"service_id":service.id,"service_name":service.name,"booking_date":str(booking_date),"booking_start_time":str(start_time),"booking_end_time":str(end_time),"available_slots":slot_payload}
+            if tool_name=="get_available_professionals":
+                professionals=get_available_professionals(db=db,service_id=service.id,requested_date=booking_date,start_time=start_time,end_time=end_time)
+                payload=[{"id":x.id,"name":x.name,"specialization":x.specialization,"rating":x.rating} for x in professionals]
+                return {"tool_name":tool_name,"tool_result":{"success":True,"type":"available_professionals","professionals":payload,"service_id":service.id,"service_name":service.name,"date":str(booking_date),"start_time":str(start_time),"end_time":str(end_time)},"service_id":service.id,"service_name":service.name,"booking_date":str(booking_date),"booking_start_time":str(start_time),"booking_end_time":str(end_time),"available_professionals":payload}
+            if tool_name=="create_booking":
+                address_id=booking_value("address_id") or state.get("selected_address_id")
+                if user_id is None or professional_id is None or address_id is None:
+                    return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":"The booking information is incomplete.","error_code":"validation_error"}}
+                booking=create_booking(db=db,user_id=int(user_id),service_id=int(service.id),professional_id=int(professional_id),address_id=int(address_id),requested_date=booking_date,start_time=start_time,end_time=end_time,payment_method=booking_value("payment_method"))
+                return {"tool_name":tool_name,"tool_result":{"success":True,"type":"booking_success","booking_id":booking.id,"booking_status":booking.status,"payment_status":booking.payment_status,"service_id":booking.service_id,"professional_id":booking.professional_id,"date":str(booking.date),"start_time":str(booking.start_time),"end_time":str(booking.end_time)},"booking_id":booking.id,"booking_status":booking.status,"payment_status":booking.payment_status,"service_id":booking.service_id,"professional_id":booking.professional_id,"booking_date":str(booking.date),"booking_start_time":str(booking.start_time),"booking_end_time":str(booking.end_time)}
+        except ValueError as exc:
+            return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":str(exc),"error_code":"validation_error"}}
+        except Exception as exc:
+            return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":str(exc)}}
 
     # =====================================================
     # UNKNOWN TOOL

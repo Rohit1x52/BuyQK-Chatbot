@@ -22,6 +22,7 @@
 # - order_tracking
 # - order_cancel
 # - customer_support
+# - service_booking
 # - general
 
 
@@ -52,6 +53,7 @@ IntentType = Literal[
     "order_tracking",
     "order_cancel",
     "customer_support",
+    "service_booking",
     "general",
 ]
 
@@ -172,7 +174,16 @@ following intents:
    - "I want a refund"
    - "I have a complaint"
 
-7. general
+7. service_booking
+   User wants to book, schedule, arrange, or manage a bookable service.
+
+   This single intent covers finding a service, checking availability,
+   choosing a professional, creating a booking, viewing/cancelling a booking,
+   and booking payment.
+
+   Do not create separate intents for individual booking operations.
+
+8. general
    Greetings, casual conversation, or messages that do not
    match the other supported intents.
 
@@ -211,6 +222,7 @@ Classification Rules:
 - "Where is my order?" → order_tracking
 - "Cancel my order" → order_cancel
 - "My payment failed" → customer_support
+- A request to book or schedule a service → service_booking
 - "Hello" → general
 
 IMPORTANT:
@@ -284,6 +296,11 @@ def _looks_like_order_continuation(state: GraphState) -> bool:
     order_action = state.get("order_action")
     missing_fields = state.get("missing_fields")
     checkout_id = state.get("checkout_id")
+    booking_id = state.get("booking_id")
+    service_id = state.get("service_id")
+
+    if intent == "service_booking" or booking_id or service_id:
+        return True
 
     if intent == "order_create" or order_action in {
         "start_new_order",

@@ -98,6 +98,13 @@ PLANNER_ACTIONS: set[str] = {
 
     # Phase 7A address capability.
     "add_new_address",
+    "search_services",
+    "check_availability",
+    "get_available_professionals",
+    "create_booking",
+    "get_booking",
+    "cancel_booking",
+    "process_booking_payment",
 }
 
 
@@ -665,6 +672,21 @@ def _build_planner_prompt(
     # Frontend selection
     # -----------------------------------------------------
 
+    booking_state = {
+        "service_id": state.get("service_id"),
+        "service_name": state.get("service_name") or (entities.get("service_name") if isinstance(entities, dict) else None),
+        "booking_date": state.get("booking_date"),
+        "booking_start_time": state.get("booking_start_time"),
+        "booking_end_time": state.get("booking_end_time"),
+        "available_slots": state.get("available_slots", []),
+        "available_professionals": state.get("available_professionals", []),
+        "professional_id": state.get("professional_id"),
+        "professional_name": state.get("professional_name") or (entities.get("professional_name") if isinstance(entities, dict) else None),
+        "booking_id": state.get("booking_id"),
+        "booking_status": state.get("booking_status"),
+        "payment_status": state.get("payment_status"),
+    }
+
     frontend_state = {
         "selected_address_id": state.get(
             "selected_address_id"
@@ -691,6 +713,7 @@ def _build_planner_prompt(
         "checkout": checkout_state,
         "cart": cart_state,
         "frontend_selection": frontend_state,
+        "booking": booking_state,
     }
 
     return f"""
@@ -816,6 +839,25 @@ cancel_order
 request_support
 
 - request_support
+
+SERVICE BOOKING CAPABILITIES:
+
+- search_services
+- check_availability
+- get_available_professionals
+- create_booking
+- get_booking
+- cancel_booking
+- process_booking_payment
+
+SERVICE BOOKING RULES:
+- Use the single service_booking intent for the complete lifecycle.
+- Select the capability matching the current user goal and accumulated booking state.
+- check_availability and get_available_professionals require service + date + start time.
+- create_booking requires service + date/time + address + professional.
+- get_booking and cancel_booking require a backend-resolved booking ID.
+- process_booking_payment is only for an explicit booking-payment operation.
+- Never invent service_id, professional_id, booking_id, availability, booking status, or payment status.
 
 Phase 3 cart capabilities:
 
@@ -1003,6 +1045,27 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
                 "the planner model was unavailable."
             ),
         }
+
+    # =====================================================
+    # SERVICE BOOKING FALLBACK
+    # =====================================================
+    if intent == "service_booking":
+        args = {}
+        for key in ("service_id", "service_name", "booking_date", "booking_start_time", "booking_end_time", "professional_id", "professional_name", "booking_id", "address_id", "address_text", "payment_method"):
+            value = entities.get(key)
+            if value is None:
+                value = state.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                args[key] = value
+        if missing:
+            return {"action":"ask_clarification","tool_name":"ask_clarification","arguments":args,"missing_fields":missing,"confidence":0.0,"reason":"Service-booking fallback requires additional information."}
+        if not args.get("service_id"):
+            return {"action":"search_services","tool_name":"search_services","arguments":args,"missing_fields":[],"confidence":0.0,"reason":"Service search fallback."}
+        if not args.get("professional_id"):
+            return {"action":"check_availability","tool_name":"check_availability","arguments":args,"missing_fields":[],"confidence":0.0,"reason":"Availability fallback."}
+        if args.get("booking_id"):
+            return {"action":"get_booking","tool_name":"get_booking","arguments":args,"missing_fields":[],"confidence":0.0,"reason":"Booking lookup fallback."}
+        return {"action":"create_booking","tool_name":"create_booking","arguments":args,"missing_fields":[],"confidence":0.0,"reason":"Booking creation fallback."}
 
     # =====================================================
     # ORDER CREATE FALLBACK
@@ -1411,6 +1474,22 @@ def _preserve_support_arguments(
     return plan
 
 
+def _preserve_booking_arguments(state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    if _normalize_action(plan.get("action")) not in {"search_services","check_availability","get_available_professionals","create_booking","get_booking","cancel_booking","process_booking_payment"}:
+        return plan
+    arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}
+    merged = dict(arguments)
+    entities = state.get("entities", {}) if isinstance(state.get("entities", {}), dict) else {}
+    for key in ("service_id","service_name","booking_date","booking_start_time","booking_end_time","professional_id","professional_name","booking_id","address_id","address_text","payment_method"):
+        value = state.get(key)
+        if value is None:
+            value = entities.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            merged[key] = value
+    plan["arguments"] = merged
+    return plan
+
+
 def _attach_commerce_context(
     state: dict[str, Any],
     plan: dict[str, Any],
@@ -1453,6 +1532,17 @@ def planner_node(
     # -----------------------------------------------------
     # Deterministic checkout orchestration
     # -----------------------------------------------------
+    if str(state.get("intent") or "").strip().lower() == "service_booking":
+        try:
+            response = get_llm().invoke(_build_planner_prompt(state))
+            plan = _normalize_plan(_extract_json(_get_content(response)))
+        except Exception as exc:
+            print("[PLANNER BOOKING FALLBACK]", type(exc).__name__, str(exc))
+            plan = _deterministic_plan_fallback(state)
+        plan = _preserve_booking_arguments(state, plan)
+        plan = _attach_commerce_context(state, plan)
+        return {"planner":plan,"planner_args":dict(plan.get("arguments",{})),"missing_fields":list(plan.get("missing_fields",[]))}
+
     if str(state.get("intent") or "").strip().lower() == "order_create":
         plan = _deterministic_plan_fallback(state)
         plan = _attach_commerce_context(state, plan)
@@ -1614,6 +1704,10 @@ def planner_node(
         plan,
     )
     plan = _preserve_support_arguments(
+        state,
+        plan,
+    )
+    plan = _preserve_booking_arguments(
         state,
         plan,
     )

@@ -108,6 +108,13 @@ SUPPORTED_TOOLS = {
     "clear_cart",
     "show_cart",
     "checkout_cart",
+    "search_services",
+    "check_availability",
+    "get_available_professionals",
+    "create_booking",
+    "get_booking",
+    "cancel_booking",
+    "process_booking_payment",
 }
 
 
@@ -1102,6 +1109,13 @@ def decision_node(state: GraphState) -> GraphState:
         "CLEAR_CART": "clear_cart",
         "SHOW_CART": "show_cart",
         "CHECKOUT_CART": "checkout_cart",
+        "SEARCH_SERVICES": "search_services",
+        "CHECK_AVAILABILITY": "check_availability",
+        "GET_AVAILABLE_PROFESSIONALS": "get_available_professionals",
+        "CREATE_BOOKING": "create_booking",
+        "GET_BOOKING": "get_booking",
+        "CANCEL_BOOKING": "cancel_booking",
+        "PROCESS_BOOKING_PAYMENT": "process_booking_payment",
     }.get(action)
 
     if canonical is not None:

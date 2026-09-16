@@ -2105,6 +2105,27 @@ def _success_response_from_tool(
         return _tool_fallback(tool_result)
 
     # =====================================================
+    # SERVICE BOOKING
+    # =====================================================
+    if result_type == "service_search":
+        services=tool_result.get("services",[]); names=[str(x.get("name")).strip() for x in services if isinstance(x,dict) and x.get("name")] if isinstance(services,list) else []
+        return "I found these matching services: " + ", ".join(names) + "." if names else "I couldn't find matching services."
+    if result_type == "availability":
+        return "The requested service slot is available." if tool_result.get("available") is True else "The requested service slot is not available."
+    if result_type == "available_professionals":
+        professionals=tool_result.get("professionals",[]); names=[str(x.get("name")).strip() for x in professionals if isinstance(x,dict) and x.get("name")] if isinstance(professionals,list) else []
+        return "These professionals are available: " + ", ".join(names) + "." if names else "No professionals are available for that slot."
+    if result_type == "booking_success":
+        booking_id=tool_result.get("booking_id")
+        return f"Your booking #{booking_id} has been created." if booking_id is not None else "Your service booking has been created."
+    if result_type == "booking":
+        booking_id=tool_result.get("booking_id"); status=tool_result.get("booking_status")
+        return f"Booking #{booking_id} is currently {status}." if booking_id is not None and status else "Here are the details of your booking."
+    if result_type == "booking_cancelled":
+        booking_id=tool_result.get("booking_id")
+        return f"Booking #{booking_id} has been cancelled." if booking_id is not None else "Your booking has been cancelled."
+
+    # =====================================================
     # GENERIC SUCCESS
     # =====================================================
 
@@ -3003,6 +3024,24 @@ def _tool_metadata(
 
 
 
+    if result_type in {"service_search", "availability", "available_professionals", "booking", "booking_success", "booking_cancelled", "booking_payment"}:
+        return {
+            "type": result_type,
+            "service_id": tool_result.get("service_id"),
+            "service_name": tool_result.get("service_name"),
+            "booking_date": tool_result.get("date") or tool_result.get("booking_date"),
+            "booking_start_time": tool_result.get("start_time") or tool_result.get("booking_start_time"),
+            "booking_end_time": tool_result.get("end_time") or tool_result.get("booking_end_time"),
+            "professional_id": tool_result.get("professional_id"),
+            "booking_id": tool_result.get("booking_id"),
+            "booking_status": tool_result.get("booking_status") or tool_result.get("status"),
+            "payment_status": tool_result.get("payment_status"),
+            "slots": tool_result.get("slots"),
+            "professionals": tool_result.get("professionals"),
+            "services": tool_result.get("services"),
+            "missing_fields": missing_fields,
+        }
+
 # =========================================================
 # Cart Presentation Helpers
 # =========================================================
@@ -3305,6 +3344,40 @@ def response_node(
         metadata["next_missing"] = next_missing
     else:
         metadata.pop("next_missing", None)
+
+    # ---------------------------------------------------------
+    # Phase 11 service-booking results
+    # ---------------------------------------------------------
+    booking_result_types = {
+        "service_search", "availability", "available_professionals",
+        "booking", "booking_success", "booking_cancelled",
+    }
+    if isinstance(tool_result, dict) and tool_result.get("type") in booking_result_types:
+        response = (
+            _tool_fallback(tool_result)
+            if tool_result.get("success") is False
+            else _success_response_from_tool(tool_result, tool_name)
+        )
+        response = _sanitize_user_response(response)
+        return {
+            "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
+            "metadata": _tool_metadata(presentation_state, missing_fields),
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+            "service_id": tool_result.get("service_id") or state.get("service_id"),
+            "service_name": tool_result.get("service_name") or state.get("service_name"),
+            "booking_date": tool_result.get("date") or tool_result.get("booking_date") or state.get("booking_date"),
+            "booking_start_time": tool_result.get("start_time") or tool_result.get("booking_start_time") or state.get("booking_start_time"),
+            "booking_end_time": tool_result.get("end_time") or tool_result.get("booking_end_time") or state.get("booking_end_time"),
+            "professional_id": tool_result.get("professional_id") or state.get("professional_id"),
+            "booking_id": tool_result.get("booking_id") or state.get("booking_id"),
+            "booking_status": tool_result.get("booking_status") or tool_result.get("status") or state.get("booking_status"),
+            "payment_status": tool_result.get("payment_status") or state.get("payment_status"),
+            "available_slots": tool_result.get("slots") or state.get("available_slots", []),
+            "available_professionals": tool_result.get("professionals") or state.get("available_professionals", []),
+        }
 
     # ---------------------------------------------------------
     # 1. Successful order

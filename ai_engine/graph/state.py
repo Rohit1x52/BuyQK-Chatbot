@@ -203,6 +203,22 @@ class GraphState(TypedDict, total=False):
     comparison_results: list[dict[str, Any]]
 
     # =========================================================
+    # SERVICE BOOKING - PHASE 11
+    # =========================================================
+    service_id: int | None
+    service_name: str | None
+    booking_date: str | None
+    booking_start_time: str | None
+    booking_end_time: str | None
+    available_slots: list[dict[str, Any]]
+    available_professionals: list[dict[str, Any]]
+    professional_id: int | None
+    professional_name: str | None
+    booking_id: int | None
+    booking_status: str | None
+    payment_status: str | None
+
+    # =========================================================
     # AI UNDERSTANDING
     # =========================================================
 

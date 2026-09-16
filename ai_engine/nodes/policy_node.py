@@ -93,6 +93,13 @@ SUPPORTED_TOOLS = {
     # -----------------------------------------------------
     "list_saved_addresses",
     "add_new_address",
+    "search_services",
+    "check_availability",
+    "get_available_professionals",
+    "create_booking",
+    "get_booking",
+    "cancel_booking",
+    "process_booking_payment",
 }
 
 
@@ -1303,6 +1310,27 @@ def _validate_cancel_order(
 
 
 # =========================================================
+# Service Booking Structural Validation
+# =========================================================
+
+def _validate_booking_tool(state: GraphState, action: str, tool: str | None) -> GraphState:
+    expected = {"SEARCH_SERVICES":"search_services","CHECK_AVAILABILITY":"check_availability","GET_AVAILABLE_PROFESSIONALS":"get_available_professionals","CREATE_BOOKING":"create_booking","GET_BOOKING":"get_booking","CANCEL_BOOKING":"cancel_booking","PROCESS_BOOKING_PAYMENT":"process_booking_payment"}
+    if expected.get(action) != tool:
+        return _failure("booking_action_tool_mismatch", action=action, tool=tool, retryable=False)
+    if action in {"CHECK_AVAILABILITY","GET_AVAILABLE_PROFESSIONALS"}:
+        for keys in (("service_id","service_name"),("booking_date",),("booking_start_time",)):
+            if not any(_has_value(_get_argument(state,k)) for k in keys):
+                return _failure(f"missing_booking_{keys[0]}", action=action, tool=tool, retryable=True)
+    elif action == "CREATE_BOOKING":
+        for keys in (("service_id","service_name"),("booking_date",),("booking_start_time",),("address_id","address_selection","address_text"),("professional_id",)):
+            if not any(_has_value(_get_argument(state,k)) for k in keys):
+                return _failure(f"missing_booking_{keys[0]}", action=action, tool=tool, retryable=True)
+    elif action in {"GET_BOOKING","CANCEL_BOOKING"} and not _has_value(_get_argument(state,"booking_id")):
+        return _failure("missing_booking_id", action=action, tool=tool, retryable=True)
+    return _success(action, tool)
+
+
+# =========================================================
 # Validate Generic Tool
 # =========================================================
 
@@ -1743,6 +1771,12 @@ def policy_node(
             action,
             tool,
         )
+
+    # =====================================================
+    # SERVICE BOOKING
+    # =====================================================
+    if action in {"SEARCH_SERVICES","CHECK_AVAILABILITY","GET_AVAILABLE_PROFESSIONALS","CREATE_BOOKING","GET_BOOKING","CANCEL_BOOKING","PROCESS_BOOKING_PAYMENT"}:
+        return _validate_booking_tool(state, action, tool)
 
     # =====================================================
     # All Other Tool Actions

@@ -149,6 +149,18 @@ class EntityOutput(BaseModel):
     )
 
     # -----------------------------------------------------
+    # Service Booking - Phase 11
+    # -----------------------------------------------------
+    service_id: Optional[int] = Field(default=None, ge=1, description="Backend-authoritative service ID; never invent.")
+    service_name: Optional[str] = Field(default=None)
+    booking_date: Optional[str] = Field(default=None)
+    booking_start_time: Optional[str] = Field(default=None)
+    booking_end_time: Optional[str] = Field(default=None)
+    professional_id: Optional[int] = Field(default=None, ge=1, description="Backend-authoritative professional ID; never invent.")
+    professional_name: Optional[str] = Field(default=None)
+    booking_id: Optional[int] = Field(default=None, ge=1, description="Backend-authoritative booking ID; never invent.")
+
+    # -----------------------------------------------------
     # Customer Support - Phase 9
     # -----------------------------------------------------
 
@@ -377,6 +389,12 @@ class LLMEntityOutput(BaseModel):
         return data
 
 
+    service_name: Optional[str] = Field(default=None)
+    booking_date: Optional[str] = Field(default=None)
+    booking_start_time: Optional[str] = Field(default=None)
+    booking_end_time: Optional[str] = Field(default=None)
+    professional_name: Optional[str] = Field(default=None)
+
 class _LLMProviderEntityOutput(BaseModel):
     """Provider-facing entity schema.
 
@@ -488,6 +506,12 @@ class _LLMProviderEntityOutput(BaseModel):
 # Current-Turn Intent Decision
 # =========================================================
 
+    service_name: Optional[str] = Field(default=None)
+    booking_date: Optional[str] = Field(default=None)
+    booking_start_time: Optional[str] = Field(default=None)
+    booking_end_time: Optional[str] = Field(default=None)
+    professional_name: Optional[str] = Field(default=None)
+
 class IntentDecision(BaseModel):
     """
     AI decision for the CURRENT user turn.
@@ -502,6 +526,7 @@ class IntentDecision(BaseModel):
         "order_tracking",
         "order_cancel",
         "customer_support",
+        "service_booking",
         "cart",
         "general",
     ] = Field(
@@ -586,6 +611,11 @@ Supported fields:
 - order_reference
 - order_reference_type
 - commerce_vertical
+- service_name
+- booking_date
+- booking_start_time
+- booking_end_time
+- professional_name
 - support_issue_type
 - support_description
 - support_transaction_id
@@ -2766,6 +2796,16 @@ def get_missing_fields(
     # Order Creation
     # =====================================================
 
+    elif intent == "service_booking":
+        if not entities.service_name and entities.service_id is None:
+            missing.append("service_name")
+        elif not entities.booking_date:
+            missing.append("booking_date")
+        elif not entities.booking_start_time:
+            missing.append("booking_start_time")
+        elif entities.address_id is None:
+            missing.append("address_selection")
+
     elif intent == "order_create":
 
         # Product
@@ -2949,6 +2989,11 @@ def _safe_llm_entity_result(
 
     return LLMEntityOutput(
         commerce_vertical=_normalize_text(result.commerce_vertical),
+        service_name=_normalize_text(result.service_name),
+        booking_date=_normalize_text(result.booking_date),
+        booking_start_time=_normalize_text(result.booking_start_time),
+        booking_end_time=_normalize_text(result.booking_end_time),
+        professional_name=_normalize_text(result.professional_name),
         product_name=_normalize_text(result.product_name),
         quantity=result.quantity,
         order_id=result.order_id,
@@ -3505,6 +3550,26 @@ def entity_node(
 
     if explicit_product:
         entities["product_name"] = explicit_product
+
+    # =====================================================
+    # Service booking conversational fields
+    # =====================================================
+    if resolved_current_intent == "service_booking":
+        if not entities.get("service_name") and extracted_entities.get("service_name"):
+            entities["service_name"] = _normalize_text(extracted_entities["service_name"])
+        if not entities.get("booking_date"):
+            date_match = re.search(r"\b(?:on\s+)?(\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b", message, re.I)
+            if date_match:
+                entities["booking_date"] = date_match.group(1)
+        if not entities.get("booking_start_time"):
+            time_match = re.search(r"\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\b", message, re.I)
+            if time_match:
+                entities["booking_start_time"] = time_match.group(1).strip()
+        if not entities.get("booking_end_time"):
+            range_match = re.search(r"\b(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\s*(?:to|-|until)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\b", message, re.I)
+            if range_match:
+                entities["booking_start_time"] = range_match.group(1).strip()
+                entities["booking_end_time"] = range_match.group(2).strip()
 
     # =====================================================
     # Phase 6B: product candidate selection
@@ -4228,6 +4293,14 @@ def entity_node(
         order_reference=entities.get("order_reference"),
         order_reference_type=entities.get("order_reference_type"),
         commerce_vertical=entities.get("commerce_vertical"),
+        service_id=entities.get("service_id"),
+        service_name=entities.get("service_name"),
+        booking_date=entities.get("booking_date"),
+        booking_start_time=entities.get("booking_start_time"),
+        booking_end_time=entities.get("booking_end_time"),
+        professional_id=entities.get("professional_id"),
+        professional_name=entities.get("professional_name"),
+        booking_id=entities.get("booking_id"),
         support_issue_type=entities.get("support_issue_type"),
         support_description=entities.get("support_description"),
         support_transaction_id=entities.get("support_transaction_id"),
@@ -4324,6 +4397,14 @@ def entity_node(
         "order_reference": final_entities.get("order_reference"),
         "order_reference_type": final_entities.get("order_reference_type"),
         "commerce_vertical": final_entities.get("commerce_vertical"),
+        "service_id": final_entities.get("service_id"),
+        "service_name": final_entities.get("service_name"),
+        "booking_date": final_entities.get("booking_date"),
+        "booking_start_time": final_entities.get("booking_start_time"),
+        "booking_end_time": final_entities.get("booking_end_time"),
+        "professional_id": final_entities.get("professional_id"),
+        "professional_name": final_entities.get("professional_name"),
+        "booking_id": final_entities.get("booking_id"),
         "support_issue_type": final_entities.get("support_issue_type"),
         "support_description": final_entities.get("support_description"),
         "support_transaction_id": final_entities.get("support_transaction_id"),

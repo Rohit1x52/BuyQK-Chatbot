@@ -241,6 +241,23 @@ PERSISTED_STATE_FIELDS = (
     "comparison_results",
 
     # -----------------------------------------------------
+    # Phase 11 Service Booking
+    # -----------------------------------------------------
+
+    "service_id",
+    "service_name",
+    "booking_date",
+    "booking_start_time",
+    "booking_end_time",
+    "available_slots",
+    "available_professionals",
+    "professional_id",
+    "professional_name",
+    "booking_id",
+    "booking_status",
+    "payment_status",
+
+    # -----------------------------------------------------
     # AI understanding
     # -----------------------------------------------------
 
