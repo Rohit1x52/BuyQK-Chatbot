@@ -8,9 +8,6 @@ their tables with Base.metadata before database initialization
 or migrations create the schema.
 """
 
-from backend.models.restaurant import Restaurant
-from backend.models.menu import Menu, MenuItem
-
 # =========================================================
 # User and Address
 # =========================================================
@@ -54,10 +51,29 @@ from .support_ticket import SupportTicket
 
 
 # =========================================================
+# Restaurant and Menu
+# =========================================================
+
+from .restaurant import Restaurant
+from .menu import Menu, MenuItem
+
+
+# =========================================================
 # Conversation History
 # =========================================================
 
 from .conversation import ConversationHistory
+
+
+# =========================================================
+# Service Booking
+# =========================================================
+
+from .service import Service
+from .professional import Professional
+from .professional_service import ProfessionalService
+from .availability import Availability
+from .booking import Booking
 
 
 # =========================================================
@@ -87,6 +103,18 @@ __all__ = [
     "Payment",
     "SupportTicket",
 
+    # Restaurant / Menu
+    "Restaurant",
+    "Menu",
+    "MenuItem",
+
     # Conversation
     "ConversationHistory",
+
+    # Service Booking
+    "Service",
+    "Professional",
+    "ProfessionalService",
+    "Availability",
+    "Booking",
 ]
