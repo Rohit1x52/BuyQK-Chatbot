@@ -1,12 +1,16 @@
 """
-The Merchant model will:
-Store merchant/business information.
-Store the merchant's business category.
-Store contact information.
-Store the business address.
-Track merchant verification status.
-Allow products to be associated with a merchant later.
-Support merchant onboarding in the future
+Merchant model.
+
+The Merchant model:
+- Stores merchant/business information.
+- Stores the merchant's business category.
+- Stores contact information.
+- Stores the business address.
+- Tracks merchant onboarding status.
+- Tracks merchant verification status.
+- Tracks merchant approval status.
+- Allows products to be associated with a merchant.
+- Supports merchant onboarding workflows.
 """
 
 from datetime import datetime
@@ -65,10 +69,42 @@ class Merchant(Base):
         nullable=True
     )
 
-    # Merchant verification status
-    # Example values:
-    # pending, verified, rejected
+    # Merchant onboarding status.
+    #
+    # Expected values:
+    # - not_started
+    # - in_progress
+    # - submitted
+    # - completed
+    onboarding_status: Mapped[str] = mapped_column(
+        String(30),
+        default="not_started",
+        nullable=False,
+        index=True
+    )
+
+    # Merchant verification status.
+    #
+    # Expected values:
+    # - pending
+    # - verified
+    # - rejected
     verification_status: Mapped[str] = mapped_column(
+        String(30),
+        default="pending",
+        nullable=False,
+        index=True
+    )
+
+    # Merchant approval status.
+    #
+    # Expected values:
+    # - pending
+    # - approved
+    # - rejected
+    #
+    # Approval is separate from document/information verification.
+    approval_status: Mapped[str] = mapped_column(
         String(30),
         default="pending",
         nullable=False,
