@@ -21,9 +21,15 @@ def _menu_item_to_dict(
     Convert a MenuItem ORM object into a serializable dictionary.
     """
 
+    menu = item.menu
+    restaurant = menu.restaurant if menu is not None else None
+    merchant = restaurant.merchant if restaurant is not None else None
+
     return {
         "id": item.id,
         "menu_id": item.menu_id,
+        "restaurant_id": menu.restaurant_id if menu is not None else None,
+        "restaurant_name": merchant.business_name if merchant is not None else None,
         "name": item.name,
         "description": item.description,
         "category": item.category,

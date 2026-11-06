@@ -21,7 +21,10 @@ def get_saved_addresses(
 
     return (
         db.query(Address)
-        .filter(Address.user_id == user_id)
+        .filter(
+            Address.user_id == user_id,
+            Address.is_deleted.is_(False),
+        )
         .order_by(Address.id.asc())
         .all()
     )
@@ -59,7 +62,10 @@ def get_address(
     query = db.query(Address).filter(Address.id == address_id)
 
     if user_id is not None:
-        query = query.filter(Address.user_id == user_id)
+        query = query.filter(
+            Address.user_id == user_id,
+            Address.is_deleted.is_(False),
+        )
 
     return query.first()
 
@@ -132,7 +138,7 @@ def delete_address(
     address_id: int,
     user_id: int,
 ) -> bool:
-    """Delete a saved address belonging to the specified user."""
+    """Archive an address while preserving historical order references."""
 
     address = get_address(
         db=db,
@@ -143,7 +149,7 @@ def delete_address(
     if address is None:
         return False
 
-    db.delete(address)
+    address.is_deleted = True
     db.commit()
 
     return True
