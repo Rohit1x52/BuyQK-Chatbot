@@ -55,8 +55,13 @@ class ChatRequest(BaseModel):
 
     commerce_vertical: str | None = Field(
         default=None,
-        min_length=1,
         max_length=50,
+    )
+
+    comparison_product_ids: list[int] | None = Field(
+        default=None,
+        min_length=2,
+        max_length=4,
     )
 
     # --------------------------------------------------------
