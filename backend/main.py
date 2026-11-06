@@ -86,6 +86,10 @@ from backend.api.cart import (
     router as cart_router,
 )
 
+from backend.api.onboarding import (
+    router as onboarding_router,
+)
+
 
 # =========================================================
 # FastAPI Application
@@ -176,6 +180,14 @@ app.include_router(
 
 app.include_router(
     cart_router,
+)
+
+# ---------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------
+
+app.include_router(
+    onboarding_router,
 )
 
 
