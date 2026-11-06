@@ -3,17 +3,26 @@
 .env.*
 *.env
 frontend/.env.local
+!.env.example
+!frontend/.env.example
 
 # Node / Frontend
 node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/.vercel/
+frontend/coverage/
 
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Virtual environments
 .buyqkai/
@@ -26,12 +35,24 @@ venv/
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
 
 # Logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+
+# Build / test output
+dist/
+build/
+.nyc_output/
+playwright-report/
+test-results/
 
 # IDE & OS
 .vscode/
