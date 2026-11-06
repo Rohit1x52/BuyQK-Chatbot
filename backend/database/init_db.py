@@ -25,7 +25,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 
 # =========================================================
@@ -60,8 +60,10 @@ from backend.database.sqlite import engine
 # Cart and CartItem are included as part of Phase 3.
 #
 # Service booking models are included as part of Phase 11.
+#
+# Merchant/Rider document models are included as part of
+# Phase 12.
 # =========================================================
-
 from backend.models import (
     User,
     Address,
@@ -84,6 +86,8 @@ from backend.models import (
     ProfessionalService,
     Availability,
     Booking,
+    MerchantDocument,
+    RiderDocument,
 )
 
 
@@ -564,6 +568,306 @@ def _migrate_products_table(
 
 
 # =========================================================
+# Phase 12 Merchant Schema Migration
+# =========================================================
+
+
+def _migrate_merchants_table(
+    connection,
+) -> None:
+    """
+    Perform lightweight migrations required by Phase 12
+    Merchant onboarding.
+
+    New Merchant fields:
+
+        merchants.onboarding_status
+        merchants.approval_status
+
+    Existing merchant records remain valid:
+
+        onboarding_status = 'not_started'
+        approval_status = 'pending'
+
+    The existing verification_status column is preserved.
+    """
+
+    if not _table_exists(
+        connection,
+        "merchants",
+    ):
+        return
+
+    # ---------------------------------------------------------
+    # Add onboarding_status.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "merchants",
+        "onboarding_status",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "merchants.onboarding_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE merchants
+                ADD COLUMN onboarding_status
+                VARCHAR(30) NOT NULL
+                DEFAULT 'not_started'
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "merchants.onboarding_status added."
+        )
+
+    # ---------------------------------------------------------
+    # Add approval_status.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "merchants",
+        "approval_status",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "merchants.approval_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE merchants
+                ADD COLUMN approval_status
+                VARCHAR(30) NOT NULL
+                DEFAULT 'pending'
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "merchants.approval_status added."
+        )
+
+    # ---------------------------------------------------------
+    # Ensure indexes exist.
+    # ---------------------------------------------------------
+
+    index_result = connection.execute(
+        text(
+            'PRAGMA index_list("merchants")'
+        )
+    )
+
+    existing_indexes = {
+        row[1]
+        for row in index_result.fetchall()
+        if len(row) >= 2
+    }
+
+    if "ix_merchants_onboarding_status" not in existing_indexes:
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_merchants_onboarding_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_merchants_onboarding_status
+                ON merchants(onboarding_status)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_merchants_onboarding_status created."
+        )
+
+    if "ix_merchants_approval_status" not in existing_indexes:
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_merchants_approval_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_merchants_approval_status
+                ON merchants(approval_status)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_merchants_approval_status created."
+        )
+
+
+# =========================================================
+# Phase 12 Rider Schema Migration
+# =========================================================
+
+
+def _migrate_riders_table(
+    connection,
+) -> None:
+    """
+    Perform lightweight migrations required by Phase 12
+    Rider onboarding.
+
+    New Rider fields:
+
+        riders.onboarding_status
+        riders.approval_status
+
+    Existing rider records remain valid:
+
+        onboarding_status = 'not_started'
+        approval_status = 'pending'
+
+    The existing verification_status column is preserved.
+    """
+
+    if not _table_exists(
+        connection,
+        "riders",
+    ):
+        return
+
+    # ---------------------------------------------------------
+    # Add onboarding_status.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "riders",
+        "onboarding_status",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "riders.onboarding_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE riders
+                ADD COLUMN onboarding_status
+                VARCHAR(30) NOT NULL
+                DEFAULT 'not_started'
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "riders.onboarding_status added."
+        )
+
+    # ---------------------------------------------------------
+    # Add approval_status.
+    # ---------------------------------------------------------
+
+    if not _column_exists(
+        connection,
+        "riders",
+        "approval_status",
+    ):
+        print(
+            "[DATABASE MIGRATION] Adding "
+            "riders.approval_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE riders
+                ADD COLUMN approval_status
+                VARCHAR(30) NOT NULL
+                DEFAULT 'pending'
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "riders.approval_status added."
+        )
+
+    # ---------------------------------------------------------
+    # Ensure indexes exist.
+    # ---------------------------------------------------------
+
+    index_result = connection.execute(
+        text(
+            'PRAGMA index_list("riders")'
+        )
+    )
+
+    existing_indexes = {
+        row[1]
+        for row in index_result.fetchall()
+        if len(row) >= 2
+    }
+
+    if "ix_riders_onboarding_status" not in existing_indexes:
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_riders_onboarding_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_riders_onboarding_status
+                ON riders(onboarding_status)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_riders_onboarding_status created."
+        )
+
+    if "ix_riders_approval_status" not in existing_indexes:
+        print(
+            "[DATABASE MIGRATION] Creating "
+            "ix_riders_approval_status ..."
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_riders_approval_status
+                ON riders(approval_status)
+                """
+            )
+        )
+
+        print(
+            "[DATABASE MIGRATION] "
+            "ix_riders_approval_status created."
+        )
+
+
+# =========================================================
 # Payment Schema Migration
 # =========================================================
 
@@ -731,23 +1035,11 @@ def _migrate_payments_table(
     Existing order payment records remain unchanged.
     """
 
-    # ---------------------------------------------------------
-    # Nothing to migrate when payments does not exist.
-    #
-    # Base.metadata.create_all() will create the current schema
-    # on a new database.
-    # ---------------------------------------------------------
-
     if not _table_exists(
         connection,
         "payments",
     ):
         return
-
-    # ---------------------------------------------------------
-    # Determine whether the current table already matches the
-    # new generic Payment structure.
-    # ---------------------------------------------------------
 
     has_booking_id = _column_exists(
         connection,
@@ -777,17 +1069,9 @@ def _migrate_payments_table(
         "payments table for generic Order/Booking payments ..."
     )
 
-    # ---------------------------------------------------------
-    # Validate data before changing the table.
-    # ---------------------------------------------------------
-
     _validate_existing_payment_data(
         connection
     )
-
-    # ---------------------------------------------------------
-    # Rename the existing table.
-    # ---------------------------------------------------------
 
     legacy_table_name = "payments_legacy"
 
@@ -809,20 +1093,6 @@ def _migrate_payments_table(
             """
         )
     )
-
-    # ---------------------------------------------------------
-    # Create the new Payment table.
-    #
-    # Exactly one parent:
-    #
-    #   Order payment:
-    #       order_id != NULL
-    #       booking_id = NULL
-    #
-    #   Booking payment:
-    #       order_id = NULL
-    #       booking_id != NULL
-    # ---------------------------------------------------------
 
     connection.execute(
         text(
@@ -880,15 +1150,6 @@ def _migrate_payments_table(
             """
         )
     )
-
-    # ---------------------------------------------------------
-    # Copy legacy records.
-    #
-    # Existing payments are Order payments, therefore:
-    #
-    #   order_id   = existing order_id
-    #   booking_id = NULL
-    # ---------------------------------------------------------
 
     if has_booking_id:
         connection.execute(
@@ -949,10 +1210,6 @@ def _migrate_payments_table(
             )
         )
 
-    # ---------------------------------------------------------
-    # Recreate indexes matching Payment model.
-    # ---------------------------------------------------------
-
     connection.execute(
         text(
             """
@@ -993,10 +1250,6 @@ def _migrate_payments_table(
         )
     )
 
-    # ---------------------------------------------------------
-    # Drop the legacy table only after successful data copy.
-    # ---------------------------------------------------------
-
     connection.execute(
         text(
             """
@@ -1014,6 +1267,24 @@ def _migrate_payments_table(
 # =========================================================
 # Database Initialization
 # =========================================================
+
+def _migrate_addresses_table(connection) -> None:
+    """Add saved-address archival state to existing databases."""
+    inspector = inspect(connection)
+    if not inspector.has_table("addresses"):
+        return
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("addresses")
+    }
+    if "is_deleted" not in columns:
+        connection.execute(
+            text(
+                "ALTER TABLE addresses "
+                "ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
 
 
 def init_db() -> None:
@@ -1042,7 +1313,8 @@ def init_db() -> None:
     # ---------------------------------------------------------
     # Existing database migrations
     #
-    # Orders and products can be migrated independently.
+    # Orders, products, merchants, and riders can be migrated
+    # independently before new tables are created.
     # ---------------------------------------------------------
 
     with engine.begin() as connection:
@@ -1055,15 +1327,32 @@ def init_db() -> None:
             connection
         )
 
+        _migrate_merchants_table(
+            connection
+        )
+
+        _migrate_riders_table(
+            connection
+        )
+
+        _migrate_addresses_table(
+            connection
+        )
+
     # ---------------------------------------------------------
     # Create missing tables.
     #
     # This must happen BEFORE the payment migration because
     # payments.booking_id references bookings.id.
     #
+    # Phase 12 document tables are also created here:
+    #
+    #     merchant_documents
+    #     rider_documents
+    #
     # On an existing database:
     #     - existing tables remain unchanged
-    #     - missing tables such as bookings are created
+    #     - missing tables are created
     #
     # On a new database:
     #     - the complete current schema is created
