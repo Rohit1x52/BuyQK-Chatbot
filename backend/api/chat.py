@@ -213,10 +213,17 @@ def _build_run_chat_kwargs(
         "commerce_vertical",
     )
 
-    if commerce_vertical is not None:
+    if "commerce_vertical" in getattr(request, "model_fields_set", set()):
         kwargs[
             "commerce_vertical"
-        ] = commerce_vertical
+        ] = commerce_vertical or ""
+
+    comparison_product_ids = _request_value(
+        request,
+        "comparison_product_ids",
+    )
+    if comparison_product_ids is not None:
+        kwargs["comparison_product_ids"] = comparison_product_ids
 
     # =====================================================
     # Frontend-authoritative address selection

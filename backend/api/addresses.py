@@ -38,11 +38,20 @@ class AddressCreateRequest(BaseModel):
         max_length=500,
     )
 
-    city: str | None = None
+    city: str = Field(
+        min_length=1,
+        max_length=100,
+    )
 
-    state: str | None = None
+    state: str = Field(
+        min_length=1,
+        max_length=100,
+    )
 
-    postal_code: str | None = None
+    postal_code: str = Field(
+        min_length=1,
+        max_length=20,
+    )
 
 
 # =========================================================
