@@ -93,6 +93,13 @@ class Address(Base):
         nullable=False,
     )
 
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        index=True,
+    )
+
     # =========================================================
     # Timestamps
     # =========================================================

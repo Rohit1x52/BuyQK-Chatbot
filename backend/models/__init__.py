@@ -56,6 +56,7 @@ from .support_ticket import SupportTicket
 
 from .restaurant import Restaurant
 from .menu import Menu, MenuItem
+from .food_order import FoodOrder, FoodOrderItem
 
 
 # =========================================================
@@ -74,6 +75,14 @@ from .professional import Professional
 from .professional_service import ProfessionalService
 from .availability import Availability
 from .booking import Booking
+
+
+# =========================================================
+# Merchant / Rider Onboarding - Phase 12
+# =========================================================
+
+from .merchant_document import MerchantDocument
+from .rider_document import RiderDocument
 
 
 # =========================================================
@@ -107,6 +116,8 @@ __all__ = [
     "Restaurant",
     "Menu",
     "MenuItem",
+    "FoodOrder",
+    "FoodOrderItem",
 
     # Conversation
     "ConversationHistory",
@@ -117,4 +128,8 @@ __all__ = [
     "ProfessionalService",
     "Availability",
     "Booking",
+
+    # Merchant / Rider Onboarding
+    "MerchantDocument",
+    "RiderDocument",
 ]

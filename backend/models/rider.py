@@ -1,18 +1,16 @@
 """
-Rider model.
-
-The Rider model:
-- Stores delivery partner information.
-- Stores the rider's vehicle type.
-- Stores driving-license information.
-- Stores government-ID information.
-- Stores bank details needed for payouts.
-- Tracks rider onboarding status.
-- Tracks rider verification status.
-- Tracks rider approval status.
-- Supports different vehicle types such as bike and bicycle.
-- Later connects riders to assigned orders.
-- Supports rider onboarding and approval workflows.
+The Rider model will:
+- Store delivery partner information.
+- Store the rider's vehicle type.
+- Store driving-license information.
+- Track government-ID verification.
+- Store bank details needed for payouts.
+- Track rider verification status.
+- Track rider onboarding status.
+- Track rider approval status.
+- Support different vehicle types such as bike and bicycle.
+- Later connect riders to assigned orders.
+- Support rider onboarding and approval workflows.
 """
 
 from datetime import datetime
@@ -76,9 +74,9 @@ class Rider(Base):
         nullable=True
     )
 
-    # Rider onboarding status.
+    # Rider onboarding status
     #
-    # Expected values:
+    # Possible values:
     # - not_started
     # - in_progress
     # - submitted
@@ -90,9 +88,9 @@ class Rider(Base):
         index=True
     )
 
-    # Rider verification status.
+    # Rider verification status
     #
-    # Expected values:
+    # Possible values:
     # - pending
     # - verified
     # - rejected
@@ -103,14 +101,12 @@ class Rider(Base):
         index=True
     )
 
-    # Rider approval status.
+    # Rider approval status
     #
-    # Expected values:
+    # Possible values:
     # - pending
     # - approved
     # - rejected
-    #
-    # Approval is separate from document/information verification.
     approval_status: Mapped[str] = mapped_column(
         String(30),
         default="pending",
@@ -137,4 +133,11 @@ class Rider(Base):
     orders = relationship(
         "Order",
         back_populates="rider"
+    )
+
+    # Relationship with rider onboarding documents
+    documents = relationship(
+        "RiderDocument",
+        back_populates="rider",
+        cascade="all, delete-orphan",
     )
