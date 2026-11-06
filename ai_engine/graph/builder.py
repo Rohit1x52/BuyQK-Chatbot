@@ -2,7 +2,7 @@
 # BuyQK AI - Graph Builder
 # =========================================================
 #
-# Phase 3 Architecture
+# Phase 3 Architecture + Phase 13 Multi-Intent Routing Foundation
 #
 # =========================================================
 #
@@ -117,6 +117,10 @@ from ai_engine.nodes.response_node import (
     response_node,
 )
 
+from ai_engine.nodes.multi_intent_node import (
+    multi_intent_node,
+)
+
 
 # =========================================================
 # Constants
@@ -225,6 +229,21 @@ def _get_missing_fields(
             )
 
     return result
+
+
+def _has_value(value: Any) -> bool:
+    """Return whether a graph value is present and non-empty."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _get_entities(state: GraphState) -> dict[str, Any]:
+    """Return a defensive entity-state mapping."""
+    entities = state.get("entities")
+    return dict(entities) if isinstance(entities, dict) else {}
 
 
 # =========================================================
@@ -529,9 +548,23 @@ def _route_after_followup(
     Otherwise continue to Planner.
     """
 
-    if _is_awaiting_user_input(
-        state
-    ):
+    # Phase 13: when the active task in a multi-intent request is
+    # waiting for clarification, keep the entire graph on the response
+    # path. Do not let a queued secondary task run before the active task
+    # has received the required user input.
+    queue = state.get("multi_intent_queue")
+    active_index = state.get("active_intent_index")
+    multi_status = _normalize_string(state.get("multi_intent_status"))
+
+    active_task_waiting = (
+        isinstance(queue, list)
+        and bool(queue)
+        and isinstance(active_index, int)
+        and 0 <= active_index < len(queue)
+        and multi_status == "waiting"
+    )
+
+    if _is_awaiting_user_input(state) or active_task_waiting:
         print(
             "[GRAPH ROUTE]"
             " followup -> response"
@@ -541,6 +574,85 @@ def _route_after_followup(
         return ROUTE_RESPONSE
 
     return ROUTE_PLANNER
+
+
+def _route_after_multi_intent(state: GraphState) -> str:
+    """Send the coordinator's selected task through the normal graph path."""
+    if state.get("orchestration_directive") == "execute_active_intent":
+        return "active"
+    return ROUTE_RESPONSE
+
+
+def _coordinate_after_response(state: GraphState) -> GraphState:
+    """Advance only after a task completes; retain tasks awaiting user input."""
+    tool_result = state.get("tool_result")
+    tool_data = getattr(tool_result, "data", None)
+    tool_success = getattr(tool_result, "success", None)
+    result_type = None
+
+    if isinstance(tool_result, dict):
+        tool_data = tool_result.get("data")
+        tool_success = tool_result.get("success")
+        result_type = tool_result.get("type")
+
+    if isinstance(tool_data, dict):
+        result_type = result_type or tool_data.get("type")
+
+    metadata = state.get("metadata")
+    metadata_type = metadata.get("type") if isinstance(metadata, dict) else None
+    waiting = bool(state.get("awaiting_user_input")) or result_type in {
+        "address_selection",
+        "payment_selection",
+    } or metadata_type in {
+        "address_selection",
+        "payment_selection",
+        "product_input",
+        "quantity_input",
+    }
+
+    if waiting:
+        outcome = None
+    elif tool_success is False or state.get("transaction_error"):
+        outcome = {"status": "failed"}
+    else:
+        outcome = {"status": "completed"}
+
+    coordinated = multi_intent_node(
+        {
+            **state,
+            "awaiting_user_input": waiting,
+            "task_outcome": outcome,
+        }
+    )
+    updates = dict(coordinated)
+    updates["awaiting_user_input"] = waiting
+
+    if coordinated.get("orchestration_directive") == "execute_active_intent":
+        updates.update(
+            {
+                "tool_result": None,
+                "tool_name": None,
+                "tool_args": {},
+                "planner_args": {},
+                "policy_result": None,
+                "policy_error": None,
+                "decision": None,
+                "decision_route": None,
+                "metadata": {},
+                "response": None,
+                "awaiting_user_input": False,
+                "task_outcome": None,
+            }
+        )
+
+    return updates
+
+
+def _route_after_multi_intent_response(state: GraphState) -> str:
+    """Loop to the next task only when the coordinator selected one."""
+    if state.get("orchestration_directive") == "execute_active_intent":
+        return "active"
+    return "end"
 
 
 # =========================================================
@@ -573,6 +685,20 @@ def _route_after_decision(
     tool_name = _get_tool_name(
         state
     )
+
+    # Product search is a read-only capability. Preserve the canonical
+    # search route when a legacy/partial decision payload omitted the
+    # top-level tool_name but the approved action and extracted product
+    # reference are already present.
+    if (
+        action == "SEARCH_PRODUCTS"
+        and not tool_name
+        and _get_intent(state) == "product_search"
+        and _has_value(
+            _get_entities(state).get("product_name")
+        )
+    ):
+        tool_name = "search_products"
 
     decision_route = _normalize_string(
         state.get("decision_route")
@@ -678,6 +804,17 @@ def _create_tool_wrapper(
         if db is None:
             db = default_db
 
+        if (
+            _get_intent(state) == "product_search"
+            and _get_action(state) == "SEARCH_PRODUCTS"
+            and not _get_tool_name(state)
+            and _has_value(
+                _get_entities(state).get("product_name")
+            )
+        ):
+            state = dict(state)
+            state["tool_name"] = "search_products"
+
         # -------------------------------------------------
         # Defensive guard.
         #
@@ -761,6 +898,16 @@ def build_graph(
     )
 
     graph.add_node(
+        "multi_intent",
+        multi_intent_node,
+    )
+
+    graph.add_node(
+        "multi_intent_after_response",
+        _coordinate_after_response,
+    )
+
+    graph.add_node(
         "entity",
         entity_node,
     )
@@ -821,7 +968,16 @@ def build_graph(
 
     graph.add_edge(
         "intent",
-        "entity",
+        "multi_intent",
+    )
+
+    graph.add_conditional_edges(
+        "multi_intent",
+        _route_after_multi_intent,
+        {
+            "active": "entity",
+            ROUTE_RESPONSE: "response",
+        },
     )
 
     # =====================================================
@@ -928,12 +1084,21 @@ def build_graph(
     )
 
     # =====================================================
-    # Response → END
+    # Response → coordinator → next task OR END
     # =====================================================
 
     graph.add_edge(
         "response",
-        END,
+        "multi_intent_after_response",
+    )
+
+    graph.add_conditional_edges(
+        "multi_intent_after_response",
+        _route_after_multi_intent_response,
+        {
+            "active": "entity",
+            "end": END,
+        },
     )
 
     # =====================================================

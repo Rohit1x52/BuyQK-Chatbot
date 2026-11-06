@@ -184,6 +184,7 @@ class GraphState(TypedDict, total=False):
     # This is conversational routing context; backend remains
     # authoritative for product/merchant identity and availability.
     commerce_vertical: str | None
+    comparison_product_ids: list[int]
 
     # Restaurant/merchant context used by food ordering.
     restaurant_id: int | None
@@ -217,6 +218,36 @@ class GraphState(TypedDict, total=False):
     booking_id: int | None
     booking_status: str | None
     payment_status: str | None
+
+    # =========================================================
+    # MERCHANT ONBOARDING - PHASE 12
+    # =========================================================
+
+    merchant_id: int | None
+    merchant_business_name: str | None
+    merchant_category: str | None
+    merchant_phone: str | None
+    merchant_email: str | None
+    merchant_address: str | None
+    merchant_documents: list[dict[str, Any]]
+    merchant_verification_status: str | None
+    merchant_approval_status: str | None
+
+    # =========================================================
+    # RIDER ONBOARDING - PHASE 12
+    # =========================================================
+
+    rider_id: int | None
+    rider_name: str | None
+    rider_phone: str | None
+    rider_vehicle_type: str | None
+    rider_documents: list[dict[str, Any]]
+
+    # Backend-safe status/reference information only; raw bank
+    # credentials must not be placed into LLM prompts.
+    rider_bank_details: dict[str, Any] | None
+    rider_verification_status: str | None
+    rider_approval_status: str | None
 
     # =========================================================
     # AI UNDERSTANDING
@@ -720,3 +751,33 @@ class GraphState(TypedDict, total=False):
     #
     # Metadata must come from actual graph/backend state.
     metadata: dict[str, Any]
+
+    # =========================================================
+    # MULTI-INTENT ORCHESTRATION - PHASE 13
+    # =========================================================
+    # The intent/entity/planner nodes must populate/use these fields.
+    # This schema alone does not classify multiple intents.
+    #
+    # detected_intents: ordered intents detected in the current request.
+    # multi_intent_queue: ordered tasks; each item is a JSON-safe dict.
+    # active_intent: intent currently being handled by the graph.
+    # active_intent_index: index into multi_intent_queue.
+    # multi_intent_status: idle | active | waiting | completed | failed.
+    # multi_intent_initialized: prevents rebuilding the queue every turn.
+    # multi_intent_results: completed/failed task summaries, based only on
+    # backend/tool outcomes and never fabricated by the orchestration layer.
+    detected_intents: list[dict[str, Any]]
+    intent_entities: dict[str, dict[str, Any]]
+    intent_statuses: dict[str, str]
+    pending_intents: list[str]
+    multi_intent: dict[str, Any]
+    orchestration_directive: str | None
+    task_outcome: dict[str, Any] | None
+    multi_intent_queue: list[dict[str, Any]]
+    active_intent: str | None
+    active_intent_index: int | None
+    multi_intent_status: str | None
+    multi_intent_initialized: bool
+    multi_intent_results: list[dict[str, Any]]
+    active_intent_message: str | None
+    multi_intent_error: str | None

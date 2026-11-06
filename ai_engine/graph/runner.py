@@ -202,6 +202,24 @@ PERSISTED_STATE_FIELDS = (
     "awaiting_cancellation_reason",
 
     # -----------------------------------------------------
+    # Phase 13 Multi-Intent Orchestration
+    # -----------------------------------------------------
+    "detected_intents",
+    "intent_entities",
+    "intent_statuses",
+    "pending_intents",
+    "multi_intent",
+    "orchestration_directive",
+    "multi_intent_queue",
+    "active_intent",
+    "active_intent_index",
+    "multi_intent_status",
+    "multi_intent_initialized",
+    "multi_intent_results",
+    "active_intent_message",
+    "multi_intent_error",
+
+    # -----------------------------------------------------
     # Phase 1 conversation/task memory
     # -----------------------------------------------------
 
@@ -303,6 +321,51 @@ PERSISTED_STATE_FIELDS = (
     "support_ticket_reference",
     "support_status",
     "support_escalation_required",
+
+    # -----------------------------------------------------
+    # Phase 12 Merchant Onboarding
+    # -----------------------------------------------------
+
+    "merchant_id",
+    "business_name",
+    "category",
+    "phone",
+    "email",
+    "address_text",
+    "merchant_documents",
+    "merchant_document_type",
+    "merchant_document_reference",
+    "merchant_document_status",
+    "merchant_onboarding_status",
+    "merchant_verification_status",
+    "merchant_approval_status",
+
+    # -----------------------------------------------------
+    # Phase 12 Rider Onboarding
+    # -----------------------------------------------------
+
+    "rider_id",
+    "name",
+    "vehicle_type",
+    "license_number",
+    "government_id",
+    "bank_details",
+    "rider_documents",
+    "rider_document_type",
+    "rider_document_reference",
+    "rider_document_status",
+    "rider_onboarding_status",
+    "rider_verification_status",
+    "rider_approval_status",
+
+    # Shared onboarding fields used by planner/tool contracts.
+    # Values are persisted only when the graph supplies them.
+    "documents",
+    "document_type",
+    "document_reference",
+    "onboarding_status",
+    "verification_status",
+    "approval_status",
 )
 
 
@@ -528,6 +591,8 @@ def _build_initial_state(
     payment_method: str | None,
     checkout_id: str | None,
     evidence_url: str | None = None,
+    commerce_vertical: str | None = None,
+    comparison_product_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
     Build the GraphState for the current request.
@@ -571,6 +636,16 @@ def _build_initial_state(
     if evidence_url is not None and str(evidence_url).strip():
         state["support_evidence_url"] = str(evidence_url).strip()
 
+    if commerce_vertical is not None:
+        normalized_vertical = str(commerce_vertical).strip().casefold()
+        if normalized_vertical:
+            state["commerce_vertical"] = normalized_vertical
+        else:
+            state.pop("commerce_vertical", None)
+
+    if comparison_product_ids is not None:
+        state["comparison_product_ids"] = list(comparison_product_ids)
+
     # =====================================================
     # Current User Input
     # =====================================================
@@ -578,6 +653,11 @@ def _build_initial_state(
     state[
         "message"
     ] = message
+
+    # These are turn-scoped signals. A previous response may have been
+    # waiting for input, but the current turn must be processed.
+    state["awaiting_user_input"] = False
+    state["task_outcome"] = None
 
     state[
         "session_id"
@@ -757,6 +837,22 @@ def _build_initial_state(
     )
 
     # =====================================================
+    # Phase 13 multi-intent defaults
+    # =====================================================
+    # Do not synthesize intents or tasks in the runner. The intent/
+    # orchestration nodes must provide them; the runner only preserves them.
+    state.setdefault("detected_intents", [])
+    state.setdefault("multi_intent_queue", [])
+    state.setdefault("active_intent", None)
+    state.setdefault("active_intent_index", None)
+    state.setdefault("multi_intent_status", "idle")
+    state.setdefault("multi_intent_initialized", False)
+    state.setdefault("multi_intent_results", [])
+    state.setdefault("active_intent_message", None)
+    state.setdefault("multi_intent_error", None)
+
+
+    # =====================================================
     # Phase 10 commerce-vertical defaults
     # =====================================================
 
@@ -849,6 +945,53 @@ def _build_initial_state(
         "references",
         {},
     )
+
+    # =====================================================
+    # Phase 12 onboarding defaults
+    # =====================================================
+    # Defaults are intentionally non-authoritative. Existing values from
+    # restored state are preserved, and IDs/statuses are never generated here.
+    # Backend services remain the source of truth for onboarding outcomes.
+
+    for field in (
+        "merchant_id",
+        "business_name",
+        "category",
+        "phone",
+        "email",
+        "address_text",
+        "merchant_document_type",
+        "merchant_document_reference",
+        "merchant_document_status",
+        "merchant_onboarding_status",
+        "merchant_verification_status",
+        "merchant_approval_status",
+        "rider_id",
+        "name",
+        "vehicle_type",
+        "license_number",
+        "government_id",
+        "bank_details",
+        "rider_document_type",
+        "rider_document_reference",
+        "rider_document_status",
+        "rider_onboarding_status",
+        "rider_verification_status",
+        "rider_approval_status",
+        "document_type",
+        "document_reference",
+        "onboarding_status",
+        "verification_status",
+        "approval_status",
+    ):
+        state.setdefault(field, None)
+
+    for field in (
+        "merchant_documents",
+        "rider_documents",
+        "documents",
+    ):
+        state.setdefault(field, [])
 
     return state
 
@@ -1246,6 +1389,8 @@ def run_chat(
     payment_method: str | None = None,
     checkout_id: str | None = None,
     evidence_url: str | None = None,
+    commerce_vertical: str | None = None,
+    comparison_product_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
     Execute the BuyQK AI graph.
@@ -1401,6 +1546,8 @@ def run_chat(
         payment_method=payment_method,
         checkout_id=checkout_id,
         evidence_url=evidence_url,
+        commerce_vertical=commerce_vertical,
+        comparison_product_ids=comparison_product_ids,
     )
 
     # =====================================================
