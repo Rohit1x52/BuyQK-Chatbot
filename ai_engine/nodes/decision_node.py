@@ -213,72 +213,16 @@ def _get_entities(
 def _get_order_items(
     state: GraphState,
 ) -> list[dict[str, Any]]:
-    """Return normalized order items from the authoritative state."""
-    items = state.get("order_items")
-    if isinstance(items, list):
-        normalized = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            quantity = item.get("quantity")
-            product_name = item.get("product_name")
-            product_id = item.get("product_id")
-            if quantity is None:
-                continue
-            try:
-                parsed_quantity = int(quantity)
-            except (TypeError, ValueError):
-                continue
-            if parsed_quantity <= 0:
-                continue
-            order_item: dict[str, Any] = {"quantity": parsed_quantity}
-            if product_id is not None:
-                order_item["product_id"] = product_id
-            elif _has_value(product_name):
-                order_item["product_name"] = str(product_name).strip()
-            else:
-                continue
-            normalized.append(order_item)
-        if normalized:
-            return normalized
-
+    """Return item records so checkout validation can inspect every line."""
     entities = _get_entities(state)
-    raw_items = entities.get("items")
-    if isinstance(raw_items, list):
-        normalized = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            product_name = item.get("product_name")
-            quantity = item.get("quantity")
-            if quantity is None:
-                continue
-            try:
-                parsed_quantity = int(quantity)
-            except (TypeError, ValueError):
-                continue
-            if parsed_quantity <= 0:
-                continue
-            if not _has_value(product_name):
-                continue
-            normalized.append({
-                "product_name": str(product_name).strip(),
-                "quantity": parsed_quantity,
-            })
-        if normalized:
-            return normalized
+    for candidate in (state.get("order_items"), entities.get("items")):
+        if isinstance(candidate, list) and candidate:
+            return [item for item in candidate if isinstance(item, dict)]
 
     product_name = entities.get("product_name")
     quantity = entities.get("quantity")
-
-    if _has_value(product_name):
-        try:
-            parsed_quantity = int(quantity)
-        except (TypeError, ValueError):
-            parsed_quantity = None
-        if parsed_quantity is not None and parsed_quantity > 0:
-            return [{"product_name": str(product_name).strip(), "quantity": parsed_quantity}]
-
+    if _has_value(product_name) or quantity is not None:
+        return [{"product_name": product_name, "quantity": quantity}]
     return []
 
 
@@ -488,8 +432,20 @@ def _calculate_checkout_missing_fields(
     # -----------------------------------------------------
 
     order_items = _get_order_items(state)
-    
-    if not order_items:
+
+    if order_items:
+        for item in order_items:
+            product_id = item.get("product_id")
+            try:
+                valid_product_id = int(product_id) > 0
+            except (TypeError, ValueError):
+                valid_product_id = False
+            if not valid_product_id and not _has_value(item.get("product_name")):
+                if "product_name" not in missing:
+                    missing.append("product_name")
+            if not _quantity_is_valid(item.get("quantity")) and "quantity" not in missing:
+                missing.append("quantity")
+    else:
         product_name = entities.get(
             "product_name"
         )
@@ -937,7 +893,7 @@ def _decision_result(*, route: str, allowed: bool, action: str | None,
     return result
 
 
-def decision_node(state: GraphState) -> GraphState:
+def _decision_node_for_current_task(state: GraphState) -> GraphState:
     """Route the authoritative Policy result to Tool or Response.
 
     The Policy node is the source of authorization.  Decision does not
@@ -1170,6 +1126,218 @@ def decision_node(state: GraphState) -> GraphState:
         tool=tool,
         reason=reason,
     )
+
+
+# =========================================================
+# Phase 13: Multi-Intent Orchestration Helpers
+# =========================================================
+
+def _active_intent_from_state(state: GraphState) -> str | None:
+    """Resolve the coordinator-selected task without guessing an intent."""
+    candidates = (
+        state.get("active_intent"),
+        state.get("current_intent"),
+        (state.get("multi_intent") or {}).get("active_intent")
+        if isinstance(state.get("multi_intent"), dict)
+        else None,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _is_multi_intent_state(state: GraphState) -> bool:
+    """Detect coordinator metadata; this does not classify user language."""
+    if isinstance(state.get("multi_intent"), dict):
+        return True
+    detected_intents = state.get("detected_intents")
+    if isinstance(detected_intents, (list, tuple)) and len(detected_intents) > 1:
+        return True
+
+    for key in ("pending_intents", "intent_statuses", "intent_entities"):
+        value = state.get(key)
+        if isinstance(value, (dict, list, tuple)) and len(value) > 0:
+            return True
+    return False
+
+
+def _state_for_active_intent(state: GraphState, active_intent: str) -> GraphState:
+    """Create a shallow state view scoped to the coordinator's active task."""
+    scoped = dict(state)
+    scoped["intent"] = active_intent
+
+    intent_entities = state.get("intent_entities")
+    if isinstance(intent_entities, dict):
+        bucket = intent_entities.get(active_intent)
+        if isinstance(bucket, dict):
+            scoped["entities"] = dict(bucket)
+        elif active_intent in intent_entities:
+            # A malformed bucket must not fall back to another intent's entities.
+            scoped["entities"] = {}
+    return scoped
+
+
+def _intent_statuses(state: GraphState) -> dict[str, Any]:
+    statuses = state.get("intent_statuses")
+    if not isinstance(statuses, dict):
+        multi = state.get("multi_intent")
+        statuses = multi.get("intent_statuses") if isinstance(multi, dict) else None
+    return dict(statuses) if isinstance(statuses, dict) else {}
+
+
+def _pending_intents(state: GraphState) -> list[str]:
+    pending = state.get("pending_intents")
+    if not isinstance(pending, list):
+        multi = state.get("multi_intent")
+        pending = multi.get("pending_intents") if isinstance(multi, dict) else None
+    return [item for item in pending if isinstance(item, str) and item.strip()] if isinstance(pending, list) else []
+
+
+def _orchestrator_directive(
+    state: GraphState,
+    result: GraphState,
+    active_intent: str | None,
+) -> dict[str, Any]:
+    """
+    Describe the next orchestration step without advancing the queue.
+
+    A Decision node runs before tool execution, so only the runner/coordinator
+    can mark a task complete and advance to a queued intent after observing the
+    tool result.
+    """
+    decision = result.get("decision")
+    decision = decision if isinstance(decision, dict) else {}
+    action = _normalize_action(decision.get("action"))
+    route = decision.get("route")
+    allowed = bool(decision.get("allowed"))
+    reason = decision.get("reason")
+
+    if action == "ASK_CLARIFICATION" or reason in {
+        "missing_order_reference",
+        "missing_product_reference",
+        "missing_quantity",
+        "checkout_incomplete",
+        "new_address_incomplete",
+    }:
+        directive = "wait_for_input"
+    elif route == ROUTE_TOOL and allowed:
+        directive = "execute_active_intent"
+    elif not allowed:
+        policy = state.get("policy_result")
+        retryable = isinstance(policy, dict) and bool(policy.get("retryable"))
+        directive = "wait_for_input" if retryable else "stop_on_policy_rejection"
+    elif action == "END_CONVERSATION":
+        directive = "finish_conversation"
+    else:
+        directive = "continue_current_intent"
+
+    statuses = _intent_statuses(state)
+    pending = _pending_intents(state)
+    result_meta: dict[str, Any] = {
+        "orchestrator_action": directive,
+        "active_intent": active_intent,
+        "pending_intents": pending,
+        "intent_statuses": statuses,
+        # Queue advancement is deliberately delegated to the runner after
+        # the current task's actual result is known.
+        "advance_intent_queue": False,
+    }
+
+    if statuses:
+        terminal_values = {"completed", "complete", "done", "failed", "skipped", "cancelled"}
+        all_terminal = all(
+            (isinstance(status, str) and status.strip().casefold() in terminal_values)
+            or (isinstance(status, dict) and str(status.get("status", "")).strip().casefold() in terminal_values)
+            for status in statuses.values()
+        )
+        if all_terminal and not pending and directive not in {"wait_for_input", "execute_active_intent"}:
+            result_meta["orchestrator_action"] = "finish_multi_intent"
+        elif active_intent and pending:
+            active_status = statuses.get(active_intent)
+            if isinstance(active_status, dict):
+                active_status = active_status.get("status")
+            if isinstance(active_status, str) and active_status.strip().casefold() in {"completed", "complete", "done"}:
+                # This is a signal for the coordinator, not permission to execute
+                # the next intent from inside Decision.
+                result_meta["orchestrator_action"] = "resume_next_intent"
+                result_meta["advance_intent_queue"] = False
+
+    return result_meta
+
+
+def decision_node(state: GraphState) -> GraphState:
+    """
+    Phase 13 wrapper around the existing decision logic.
+
+    Multi-intent tasks must have a coordinator-selected active intent and an
+    existing policy result. This node never promotes a queued intent directly
+    to execution and never advances the queue before the active task's result.
+    """
+    multi_intent = _is_multi_intent_state(state)
+    active_intent = _active_intent_from_state(state)
+
+    if multi_intent and not active_intent:
+        result = _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=False,
+            action=None,
+            tool=None,
+            reason="missing_active_intent",
+            orchestrator_action="wait_for_coordinator",
+            active_intent=None,
+            advance_intent_queue=False,
+        )
+        return result
+
+    scoped_state = _state_for_active_intent(state, active_intent) if active_intent else dict(state)
+
+    policy = scoped_state.get("policy_result")
+    if not isinstance(policy, dict):
+        policy = scoped_state.get("policy")
+
+    # Legacy direct routing is retained only for single-intent compatibility.
+    # In a multi-intent turn, every active task must pass the normal policy gate.
+    if multi_intent and not isinstance(policy, dict):
+        result = _decision_result(
+            route=ROUTE_RESPONSE,
+            allowed=False,
+            action=None,
+            tool=None,
+            reason="policy_result_required_for_multi_intent",
+            orchestrator_action="stop_on_policy_rejection",
+            active_intent=active_intent,
+            advance_intent_queue=False,
+        )
+        return result
+
+    result = _decision_node_for_current_task(scoped_state)
+
+    if multi_intent:
+        # Detect explicit provenance conflicts when upstream nodes provide it.
+        policy_intent = None
+        if isinstance(policy, dict):
+            policy_intent = policy.get("active_intent") or policy.get("intent")
+        planner_decision = scoped_state.get("planner_decision")
+        if policy_intent is None and isinstance(planner_decision, dict):
+            policy_intent = planner_decision.get("active_intent") or planner_decision.get("intent")
+
+        if isinstance(policy_intent, str) and policy_intent.strip() and policy_intent.strip() != active_intent:
+            result = _decision_result(
+                route=ROUTE_RESPONSE,
+                allowed=False,
+                action=_normalize_action(policy.get("action")) if isinstance(policy, dict) else None,
+                tool=None,
+                reason="active_intent_policy_mismatch",
+                active_intent=active_intent,
+                policy_intent=policy_intent.strip(),
+                orchestrator_action="stop_on_policy_rejection",
+                advance_intent_queue=False,
+            )
+            return result
+
+    result.update(_orchestrator_directive(scoped_state, result, active_intent))
+    return result
 
 
 __all__ = [

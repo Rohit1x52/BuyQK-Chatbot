@@ -100,6 +100,22 @@ SUPPORTED_TOOLS = {
     "get_booking",
     "cancel_booking",
     "process_booking_payment",
+
+    # -----------------------------------------------------
+    # Phase 12: Merchant and Rider Onboarding
+    # -----------------------------------------------------
+    "register_merchant",
+    "get_merchant_status",
+    "submit_merchant_document",
+    "verify_merchant",
+    "approve_merchant",
+    "reject_merchant",
+    "register_rider",
+    "get_rider_status",
+    "submit_rider_document",
+    "verify_rider",
+    "approve_rider",
+    "reject_rider",
 }
 
 
@@ -632,6 +648,42 @@ def _checkout_has_required_state(
     """
 
     missing: list[str] = []
+
+    entities = state.get("entities")
+    if not isinstance(entities, dict):
+        entities = {}
+
+    if str(state.get("commerce_vertical") or entities.get("commerce_vertical") or "").casefold() == "food":
+        if not _has_value(state.get("checkout_id")):
+            missing.append("checkout_id")
+
+        food_items = state.get("order_items") or entities.get("items")
+        if not isinstance(food_items, list) or not food_items:
+            if not (entities.get("product_name") and entities.get("quantity")):
+                missing.append("order_items")
+        else:
+            for item in food_items:
+                if not isinstance(item, dict):
+                    missing.append("order_items")
+                    break
+                quantity = item.get("quantity")
+                try:
+                    valid_quantity = not isinstance(quantity, bool) and int(quantity) > 0
+                except (TypeError, ValueError):
+                    valid_quantity = False
+                if not (item.get("product_name") or item.get("menu_item_id")) or not valid_quantity:
+                    missing.append("order_items")
+                    break
+
+        if not _has_value(state.get("address_id") or state.get("selected_address_id")):
+            missing.append("address_id")
+        if not _has_value(
+            state.get("selected_payment_method")
+            or state.get("payment_method")
+            or entities.get("payment_method")
+        ):
+            missing.append("payment_method")
+        return not missing, missing
 
     # -----------------------------------------------------
     # Checkout ID
@@ -1331,6 +1383,162 @@ def _validate_booking_tool(state: GraphState, action: str, tool: str | None) -> 
 
 
 # =========================================================
+# Phase 12: Merchant / Rider Onboarding Validation
+# =========================================================
+
+MERCHANT_ONBOARDING_TOOLS = {
+    "REGISTER_MERCHANT": "register_merchant",
+    "GET_MERCHANT_STATUS": "get_merchant_status",
+    "SUBMIT_MERCHANT_DOCUMENT": "submit_merchant_document",
+    "VERIFY_MERCHANT": "verify_merchant",
+    "APPROVE_MERCHANT": "approve_merchant",
+    "REJECT_MERCHANT": "reject_merchant",
+}
+
+RIDER_ONBOARDING_TOOLS = {
+    "REGISTER_RIDER": "register_rider",
+    "GET_RIDER_STATUS": "get_rider_status",
+    "SUBMIT_RIDER_DOCUMENT": "submit_rider_document",
+    "VERIFY_RIDER": "verify_rider",
+    "APPROVE_RIDER": "approve_rider",
+    "REJECT_RIDER": "reject_rider",
+}
+
+
+def _onboarding_field_present(
+    state: GraphState,
+    *keys: str,
+) -> bool:
+    """Check planned arguments, state, and accumulated entities for a field."""
+    entities = _get_entities(state)
+    return any(
+        _has_value(_get_argument(state, key))
+        or _has_value(entities.get(key))
+        for key in keys
+    )
+
+
+def _onboarding_failure(
+    action: str,
+    tool: str | None,
+    reason: str,
+    *,
+    missing_fields: list[str] | None = None,
+    retryable: bool = True,
+) -> GraphState:
+    """Return a standard policy rejection, including missing fields when relevant."""
+    result: dict[str, Any] = {
+        "allowed": False,
+        "action": action,
+        "tool": tool,
+        "reason": reason,
+        "retryable": retryable,
+    }
+    if missing_fields:
+        result["missing_fields"] = missing_fields
+
+    response: GraphState = {
+        "policy_result": result,
+        "policy_error": result,
+        "policy_decision": "deny",
+        "policy_allowed": False,
+        "policy_reason": reason,
+        "tool_name": None,
+        "planner_action": action,
+        "planner_tool": tool,
+        "planner_status": "rejected",
+    }
+    if missing_fields:
+        response["missing_fields"] = missing_fields
+    return response
+
+
+def _validate_onboarding_action(
+    state: GraphState,
+    action: str,
+    tool: str | None,
+) -> GraphState:
+    """
+    Validate onboarding request structure and the presence of backend-issued IDs.
+
+    This layer does not inspect documents, perform identity checks, mutate records,
+    or make verification/approval decisions. Those operations belong to backend
+    onboarding services.
+    """
+    if action in MERCHANT_ONBOARDING_TOOLS:
+        expected_tool = MERCHANT_ONBOARDING_TOOLS[action]
+        entity_id_key = "merchant_id"
+        entity_name = "merchant"
+        registration_fields = {
+            "business_name": ("business_name",),
+            "category": ("category",),
+            "phone": ("phone", "merchant_phone"),
+            "email": ("email", "merchant_email"),
+            "address": ("address_text", "address", "business_address"),
+        }
+        document_action = "SUBMIT_MERCHANT_DOCUMENT"
+    elif action in RIDER_ONBOARDING_TOOLS:
+        expected_tool = RIDER_ONBOARDING_TOOLS[action]
+        entity_id_key = "rider_id"
+        entity_name = "rider"
+        registration_fields = {
+            "name": ("name", "rider_name"),
+            "phone": ("phone", "rider_phone"),
+            "vehicle_type": ("vehicle_type",),
+            "license_number": ("license_number",),
+            "government_id": ("government_id",),
+            "bank_account": ("bank_account", "bank_details"),
+        }
+        document_action = "SUBMIT_RIDER_DOCUMENT"
+    else:
+        return _failure("unsupported_onboarding_action", action=action, tool=tool, retryable=False)
+
+    if tool != expected_tool:
+        return _onboarding_failure(
+            action, tool, "onboarding_action_tool_mismatch", retryable=False
+        )
+
+    if action == ("REGISTER_MERCHANT" if entity_name == "merchant" else "REGISTER_RIDER"):
+        missing_fields = [
+            field_name
+            for field_name, aliases in registration_fields.items()
+            if not _onboarding_field_present(state, *aliases)
+        ]
+        if missing_fields:
+            return _onboarding_failure(
+                action, tool, f"{entity_name}_registration_incomplete",
+                missing_fields=missing_fields, retryable=True,
+            )
+        return _success(action, tool)
+
+    # Subsequent onboarding operations require an ID supplied by the backend or
+    # already present in trusted graph state. Never synthesize an entity ID here.
+    if not _onboarding_field_present(state, entity_id_key):
+        return _onboarding_failure(
+            action, tool, f"missing_{entity_id_key}",
+            missing_fields=[entity_id_key], retryable=True,
+        )
+
+    if action == document_action:
+        missing_fields = []
+        if not _onboarding_field_present(state, "document_type"):
+            missing_fields.append("document_type")
+        if not _onboarding_field_present(
+            state, "document_reference", "document_id", "document_url", "document_path"
+        ):
+            missing_fields.append("document_reference")
+        if missing_fields:
+            return _onboarding_failure(
+                action, tool, "onboarding_document_details_incomplete",
+                missing_fields=missing_fields, retryable=True,
+            )
+
+    # Verification and approval/rejection are only routed to the backend.
+    # Policy checks structure; it does not assert a document is valid or approve anyone.
+    return _success(action, tool)
+
+
+# =========================================================
 # Validate Generic Tool
 # =========================================================
 
@@ -1403,7 +1611,7 @@ def _validate_request_support(
     return _success(action, tool)
 
 
-def policy_node(
+def _policy_node_for_state(
     state: GraphState,
 ) -> GraphState:
     """
@@ -1554,6 +1762,12 @@ def policy_node(
         "CHECKOUT": "CHECKOUT_CART",
     }.get(action, action)
 
+    # Normalize onboarding intent aliases to the concrete registration actions.
+    action = {
+        "MERCHANT_ONBOARDING": "REGISTER_MERCHANT",
+        "RIDER_ONBOARDING": "REGISTER_RIDER",
+    }.get(action, action)
+
     # =====================================================
     # Resolve Tool
     # =====================================================
@@ -1596,6 +1810,9 @@ def policy_node(
                 tool=tool,
                 retryable=False,
             )
+
+    elif not tool and (action in MERCHANT_ONBOARDING_TOOLS or action in RIDER_ONBOARDING_TOOLS):
+        tool = MERCHANT_ONBOARDING_TOOLS.get(action) or RIDER_ONBOARDING_TOOLS.get(action)
 
     elif not tool and action in {
         "CREATE_ORDER",
@@ -1779,6 +1996,12 @@ def policy_node(
         return _validate_booking_tool(state, action, tool)
 
     # =====================================================
+    # PHASE 12: MERCHANT / RIDER ONBOARDING
+    # =====================================================
+    if action in MERCHANT_ONBOARDING_TOOLS or action in RIDER_ONBOARDING_TOOLS:
+        return _validate_onboarding_action(state, action, tool)
+
+    # =====================================================
     # All Other Tool Actions
     # =====================================================
 
@@ -1795,3 +2018,194 @@ def policy_node(
         action,
         tool,
     )
+
+
+# =========================================================
+# Phase 13: Active-Intent Policy Gate
+# =========================================================
+
+def _active_intent_from_state(state: GraphState) -> Any:
+    """Resolve the coordinator's active intent without inferring one."""
+    multi_intent = state.get("multi_intent")
+    if isinstance(multi_intent, dict):
+        value = multi_intent.get("active_intent")
+        if _has_value(value):
+            return value
+
+    for key in ("active_intent", "current_intent"):
+        value = state.get(key)
+        if _has_value(value):
+            return value
+
+    return None
+
+
+def _intent_identity(value: Any) -> str | None:
+    """Normalize supported intent representations for identity comparison."""
+    if isinstance(value, str):
+        return value.strip().casefold() or None
+    if isinstance(value, dict):
+        for key in ("intent_id", "id", "name", "intent", "type"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip().casefold()
+    return None
+
+
+def _multi_intent_is_present(state: GraphState) -> bool:
+    """Return true only when state explicitly indicates coordinated intents."""
+    multi_intent = state.get("multi_intent")
+    if isinstance(multi_intent, dict) and multi_intent:
+        return True
+
+    for key in ("detected_intents", "pending_intents"):
+        value = state.get(key)
+        if isinstance(value, (list, tuple)) and len(value) > 1:
+            return True
+
+    intent_entities = state.get("intent_entities")
+    if isinstance(intent_entities, dict) and len(intent_entities) > 1:
+        return True
+
+    return False
+
+
+def _decision_intent(planner_decision: Any, state: GraphState) -> Any:
+    """Read optional intent provenance attached to the proposed decision."""
+    if isinstance(planner_decision, dict):
+        for key in ("active_intent", "intent", "intent_id", "source_intent"):
+            value = planner_decision.get(key)
+            if _has_value(value):
+                return value
+
+    planner = state.get("planner")
+    if isinstance(planner, dict):
+        for key in ("active_intent", "intent", "intent_id", "source_intent"):
+            value = planner.get(key)
+            if _has_value(value):
+                return value
+
+    return None
+
+
+def _phase13_rejection(
+    reason: str,
+    *,
+    active_intent: Any = None,
+    proposed_intent: Any = None,
+) -> GraphState:
+    """Build a deny result using the existing policy result contract."""
+    result: dict[str, Any] = {
+        "allowed": False,
+        "action": None,
+        "tool": None,
+        "reason": reason,
+        "retryable": False,
+    }
+    if _has_value(active_intent):
+        result["active_intent"] = active_intent
+    if _has_value(proposed_intent):
+        result["proposed_intent"] = proposed_intent
+
+    return {
+        "policy_result": result,
+        "policy_error": result,
+        "policy_decision": "deny",
+        "policy_allowed": False,
+        "policy_reason": reason,
+        "tool_name": None,
+        "planner_status": "rejected",
+        "policy_active_intent": active_intent,
+    }
+
+
+def policy_node(state: GraphState) -> GraphState:
+    """
+    Phase 13 policy entry point.
+
+    The coordinator's active intent is the only intent eligible for this
+    policy pass. The selected action still passes through the existing
+    deterministic policy checks below; queued intents do not get a separate
+    execution path or a policy bypass.
+    """
+    multi_intent = _multi_intent_is_present(state)
+    active_intent = _active_intent_from_state(state)
+
+    # If coordination is in use, a missing active task is not permission to
+    # execute whichever action happens to be present in the planner output.
+    if multi_intent and active_intent is None:
+        return _phase13_rejection("missing_active_intent")
+
+    # Resolve the proposal using the same compatibility order as the original
+    # policy node so provenance can be checked before any action is approved.
+    planner_decision = state.get("planner_decision")
+    if not isinstance(planner_decision, dict):
+        planner = state.get("planner")
+        if isinstance(planner, dict):
+            planner_decision = planner
+        elif _has_value(state.get("planner_action")):
+            planner_decision = {
+                "action": state.get("planner_action"),
+                "tool": state.get("planner_tool"),
+                "arguments": state.get("planner_args", {}),
+            }
+        elif _has_value(state.get("action")):
+            planner_decision = {
+                "action": state.get("action"),
+                "tool": state.get("tool") or state.get("tool_name"),
+                "arguments": state.get("arguments", {}),
+            }
+        else:
+            planner_decision = None
+
+    proposed_intent = _decision_intent(planner_decision, state)
+    active_identity = _intent_identity(active_intent)
+    proposed_identity = _intent_identity(proposed_intent)
+
+    # When the planner provides provenance, reject any proposal belonging to
+    # a different intent. Do not guess intent ownership from action names.
+    if (
+        active_identity is not None
+        and proposed_identity is not None
+        and active_identity != proposed_identity
+    ):
+        return _phase13_rejection(
+            "planner_intent_mismatch",
+            active_intent=active_intent,
+            proposed_intent=proposed_intent,
+        )
+
+    # Scope accumulated entities to the active task when the coordinator
+    # provides per-intent entity buckets. Keep all other state fields intact
+    # for existing policy rules and single-intent compatibility.
+    scoped_state = dict(state)
+    if active_intent is not None:
+        scoped_state["active_intent"] = active_intent
+        scoped_state["intent"] = active_intent
+        intent_entities = state.get("intent_entities")
+        active_key = _intent_identity(active_intent)
+        if isinstance(intent_entities, dict) and active_key is not None:
+            matching_bucket = None
+            for key, bucket in intent_entities.items():
+                if _intent_identity(key) == active_key:
+                    matching_bucket = bucket
+                    break
+            if isinstance(matching_bucket, dict):
+                scoped_state["entities"] = dict(matching_bucket)
+
+    result = _policy_node_for_state(scoped_state)
+
+    # Preserve intent provenance in the result without changing the existing
+    # allow/deny contract consumed by the decision/tool routing nodes.
+    result = dict(result)
+    if active_intent is not None:
+        result["policy_active_intent"] = active_intent
+        policy_result = result.get("policy_result")
+        if isinstance(policy_result, dict):
+            policy_result = dict(policy_result)
+            policy_result["active_intent"] = active_intent
+            result["policy_result"] = policy_result
+            if result.get("policy_error") is not None and isinstance(result.get("policy_error"), dict):
+                result["policy_error"] = dict(policy_result)
+
+    return result

@@ -105,6 +105,11 @@ class EntityOutput(BaseModel):
         ),
     )
 
+    restaurant_name: Optional[str] = Field(
+        default=None,
+        description="Restaurant name explicitly mentioned for a food search or order.",
+    )
+
     # -----------------------------------------------------
     # Quantity
     # -----------------------------------------------------
@@ -284,6 +289,11 @@ class LLMEntityOutput(BaseModel):
     product_name: Optional[str] = Field(
         default=None,
         description="Product name mentioned or implied by the user.",
+    )
+
+    restaurant_name: Optional[str] = Field(
+        default=None,
+        description="Restaurant name explicitly mentioned for a food search or order.",
     )
 
     quantity: int | str | None = Field(
@@ -652,6 +662,28 @@ For order cancellation:
 - extract cancellation_reason only when the user explicitly provides one
 - never invent a cancellation reason
 - cancellation eligibility is determined only by the backend
+
+=========================================================
+PHASE 13: MULTI-INTENT ENTITY OWNERSHIP
+=========================================================
+
+A user message may contain more than one independent request. Extract all
+explicitly stated entities, but keep each entity semantically associated
+with the request it belongs to:
+
+- Product names, product quantities, and commerce vertical belong to the
+  product/order/cart request that mentions them.
+- Order IDs and order references belong to the relevant tracking or
+  cancellation request, not to product quantity.
+- Service and professional details belong to the service-booking request.
+- Payment, address, and checkout details belong to the relevant purchase
+  flow only when the user supplies them or the current conversation clearly
+  establishes that they continue that flow.
+
+Do not use an entity from one request to fill a missing field in another
+request merely because both appear in the same message. Do not infer product
+names, quantities, order IDs, or other values that are not stated or
+supported by conversation state. Keep backend-authoritative IDs unchanged.
 
 
 =========================================================
@@ -1805,6 +1837,7 @@ def _clean_product_candidate(value: Any) -> Optional[str]:
         flags=re.IGNORECASE,
     )
     candidate = re.sub(r"^\d+(?:\.\d+)?\s+", "", candidate).strip()
+    candidate = re.sub(r"^(?:of|the)\s+", "", candidate, flags=re.IGNORECASE).strip()
 
     # Remove common conversational suffixes.
     candidate = re.sub(
@@ -2356,60 +2389,7 @@ def _fallback_current_turn_intent(
     state: GraphState,
     message: str,
 ) -> IntentDecision:
-    """Safe fallback used when the intent LLM is unavailable/rate-limited.
-
-    This does not replace AI understanding in the normal path. It only
-    preserves the checkout protocol when the model provider is unavailable.
-    """
-    text = (message or "").strip()
-    entities = state.get("entities", {}) or {}
-    checkout_id = state.get("checkout_id") or _recover_checkout_id_from_history(
-        state.get("conversation_history", []) or []
-    )
-    completed = bool(state.get("order_created")) or str(
-        state.get("checkout_status") or ""
-    ).casefold() in {"completed", "order_created", "success"}
-
-    if _is_explicit_tracking_request(text):
-        return IntentDecision(intent="order_tracking", order_action="none", confidence=0.0)
-    if _is_explicit_cancel_request(text):
-        return IntentDecision(intent="order_cancel", order_action="none", confidence=0.0)
-    if _is_explicit_support_request(text):
-        return IntentDecision(intent="customer_support", order_action="none", confidence=0.0)
-
-    if _is_new_order_request(text):
-        return IntentDecision(intent="order_create", order_action="start_new_order", confidence=0.0)
-
-    continuation = (
-        detect_quantity(text) is not None
-        or detect_address_id(text) is not None
-        or detect_address_text(text) is not None
-        or detect_payment_method(text) is not None
-        or bool(re.fullmatch(r"\s*(?:use\s+)?(?:the\s+)?selected\s+(?:delivery\s+)?address\.?\s*", text, re.I))
-    )
-
-    if continuation and (checkout_id or entities.get("product_name")) and not completed:
-        return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
-
-    # When an active checkout is collecting and the user sends a short
-    # reply (e.g. a product name like "Maggi"), treat it as a checkout
-    # continuation even if product_name is not yet populated (since
-    # that is exactly what is being collected).
-    active_checkout = (
-        checkout_id
-        and not completed
-        and str(state.get("checkout_status") or "").casefold()
-        in {"collecting", "ready", ""}
-    )
-
-    if text and active_checkout and len(text.split()) <= 5:
-        return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
-
-    if text and not completed and entities.get("product_name") and state.get("checkout_status") in {"collecting", "ready", None}:
-        # A short continuation/reference can still belong to checkout.
-        if len(text.split()) <= 5:
-            return IntentDecision(intent="order_create", order_action="continue_order", confidence=0.0)
-
+    """Fail closed when the intent model is unavailable."""
     return IntentDecision(intent="general", order_action="none", confidence=0.0)
 
 
@@ -2417,26 +2397,6 @@ def resolve_current_turn_intent(
     state: GraphState,
     message: str,
 ) -> IntentDecision:
-    # High-confidence checkout turns do not need an LLM call.
-    # This keeps checkout operational during provider rate limits.
-    deterministic = (
-        _is_new_order_request(message)
-        or detect_quantity(message) is not None
-        or detect_address_id(message) is not None
-        or detect_address_text(message) is not None
-        or detect_payment_method(message) is not None
-        or bool(re.fullmatch(
-            r"\s*(?:use\s+)?(?:the\s+)?selected\s+(?:delivery\s+)?address\.?\s*",
-            message or "",
-            flags=re.IGNORECASE,
-        ))
-    )
-    if deterministic:
-        return _fallback_current_turn_intent(
-            state=state,
-            message=message,
-        )
-
     """
     Ask the LLM to classify the CURRENT turn.
 
@@ -2988,42 +2948,44 @@ def _safe_llm_entity_result(
         return LLMEntityOutput()
 
     return LLMEntityOutput(
-        commerce_vertical=_normalize_text(result.commerce_vertical),
-        service_name=_normalize_text(result.service_name),
-        booking_date=_normalize_text(result.booking_date),
-        booking_start_time=_normalize_text(result.booking_start_time),
-        booking_end_time=_normalize_text(result.booking_end_time),
-        professional_name=_normalize_text(result.professional_name),
-        product_name=_normalize_text(result.product_name),
-        quantity=result.quantity,
-        order_id=result.order_id,
-        order_reference=result.order_reference,
-        order_reference_type=result.order_reference_type,
-        support_issue_type=_normalize_text(result.support_issue_type),
+        commerce_vertical=_normalize_text(getattr(result, "commerce_vertical", None)),
+        items=getattr(result, "items", None),
+        service_name=_normalize_text(getattr(result, "service_name", None)),
+        booking_date=_normalize_text(getattr(result, "booking_date", None)),
+        booking_start_time=_normalize_text(getattr(result, "booking_start_time", None)),
+        booking_end_time=_normalize_text(getattr(result, "booking_end_time", None)),
+        professional_name=_normalize_text(getattr(result, "professional_name", None)),
+        product_name=_normalize_text(getattr(result, "product_name", None)),
+        restaurant_name=_normalize_text(getattr(result, "restaurant_name", None)),
+        quantity=getattr(result, "quantity", None),
+        order_id=getattr(result, "order_id", None),
+        order_reference=getattr(result, "order_reference", None),
+        order_reference_type=getattr(result, "order_reference_type", None),
+        support_issue_type=_normalize_text(getattr(result, "support_issue_type", None)),
         support_description=(
-            result.support_description.strip()
-            if result.support_description
+            getattr(result, "support_description", None).strip()
+            if getattr(result, "support_description", None)
             else None
         ),
         support_transaction_id=(
-            result.support_transaction_id.strip()
-            if result.support_transaction_id
+            getattr(result, "support_transaction_id", None).strip()
+            if getattr(result, "support_transaction_id", None)
             else None
         ),
         support_evidence_url=(
-            result.support_evidence_url.strip()
-            if result.support_evidence_url
+            getattr(result, "support_evidence_url", None).strip()
+            if getattr(result, "support_evidence_url", None)
             else None
         ),
-        address_id=result.address_id,
-        address_text=(result.address_text.strip() if result.address_text else None),
-        address_action=(result.address_action.strip().lower() if result.address_action else None),
-        address_label=(result.address_label.strip() if result.address_label else None),
-        address_line_2=(result.address_line_2.strip() if result.address_line_2 else None),
-        address_city=(result.address_city.strip() if result.address_city else None),
-        address_state=(result.address_state.strip() if result.address_state else None),
-        address_postal_code=(result.address_postal_code.strip() if result.address_postal_code else None),
-        payment_method=_normalize_text(result.payment_method),
+        address_id=getattr(result, "address_id", None),
+        address_text=(getattr(result, "address_text", None).strip() if getattr(result, "address_text", None) else None),
+        address_action=(getattr(result, "address_action", None).strip().lower() if getattr(result, "address_action", None) else None),
+        address_label=(getattr(result, "address_label", None).strip() if getattr(result, "address_label", None) else None),
+        address_line_2=(getattr(result, "address_line_2", None).strip() if getattr(result, "address_line_2", None) else None),
+        address_city=(getattr(result, "address_city", None).strip() if getattr(result, "address_city", None) else None),
+        address_state=(getattr(result, "address_state", None).strip() if getattr(result, "address_state", None) else None),
+        address_postal_code=(getattr(result, "address_postal_code", None).strip() if getattr(result, "address_postal_code", None) else None),
+        payment_method=_normalize_text(getattr(result, "payment_method", None)),
         cart_action=None,
     )
 
@@ -3037,8 +2999,7 @@ def extract_entities(
 
     The LLM remains the primary semantic extractor. If the provider rejects
     the structured tool call, the second attempt uses a smaller prompt
-    without history. If both attempts fail, an empty result is returned and
-    entity_node() performs deterministic extraction/recovery.
+    without history. If both attempts fail, an empty result is returned.
 
     product_id is never accepted from the LLM.
     """
@@ -3072,12 +3033,6 @@ def extract_entities(
                 f" attempt={attempt_number}/2 "
                 f"{type(exc).__name__}: {exc}"
             )
-
-    if last_error is not None:
-        print(
-            "[ENTITY LLM FALLBACK]"
-            " deterministic recovery will be used"
-        )
 
     return LLMEntityOutput()
 
@@ -3188,20 +3143,49 @@ def entity_node(
     # become the intent of the next user message.
     # =====================================================
 
-    # Deterministic order-reference extraction is available before current-turn
-    # intent finalization so a bare numeric reply can continue a tracking prompt.
-    explicit_order_id = detect_order_id(message)
-    if (
-        explicit_order_id is None
-        and bool(state.get("awaiting_order_tracking_order_id"))
-        and re.fullmatch(r"\s*\d+\s*", message)
-    ):
-        explicit_order_id = int(message.strip())
+    # Order identity comes from structured extraction or backend state.
+    # Natural-language order references are not parsed locally.
+    explicit_order_id = None
 
+    detected_intent_records = state.get("detected_intents") or []
+    coordinated_intent = state.get("active_intent")
+    is_coordinated_request = (
+        isinstance(detected_intent_records, list)
+        and len(detected_intent_records) > 1
+        and isinstance(coordinated_intent, str)
+        and coordinated_intent.strip().lower() in {
+            "product_search",
+            "order_create",
+            "order_tracking",
+            "order_cancel",
+            "customer_support",
+            "service_booking",
+            "cart",
+            "general",
+        }
+    )
+
+    # The coordinator has selected the task for this pass. Do not let a
+    # second classifier replace a queued intent using the full original text.
+    if is_coordinated_request:
+        resolved_current_intent = coordinated_intent.strip().lower()
+        order_action = "none"
+        if resolved_current_intent == "order_create":
+            order_action = (
+                "continue_order"
+                if state.get("checkout_id") and not state.get("order_created")
+                else "start_new_order"
+            )
+        intent_decision = IntentDecision(
+            intent=resolved_current_intent,
+            order_action=order_action,
+            cart_action="none",
+            confidence=1.0,
+        )
     # intent_node already classified the CURRENT turn. Trust it for
     # cart and all non-order turns. Re-running a second classifier here
     # was the source of the cart Literal validation failure.
-    if str(original_intent or "general").strip().lower() != "order_create":
+    elif str(original_intent or "general").strip().lower() != "order_create":
         resolved_current_intent = str(original_intent or "general").strip().lower()
         if resolved_current_intent not in {
             "product_search", "order_tracking", "order_cancel",
@@ -3298,6 +3282,11 @@ def entity_node(
         )
 
         existing_entities.pop(
+            "items",
+            None,
+        )
+
+        existing_entities.pop(
             "address_id",
             None,
         )
@@ -3338,68 +3327,11 @@ def entity_node(
         existing_entities.pop("cancellation_reason", None)
 
     # =====================================================
-    # Deterministic cart-action detection
-    # =====================================================
-    #
-    # FIX: previously the deterministic-turn shortcut below checked
-    # detect_quantity()/detect_product_from_message()/etc. with NO
-    # guard for cart intent. A message such as:
-    #
-    #     "Add 3 Tata Tea Gold and 2 Surf Excel Matic in cart"
-    #
-    # matched the quantity pattern ("add 3 <word>"), which made
-    # deterministic_turn True and skipped the LLM entity-extraction
-    # call entirely -- so cart_action was never resolved by anything,
-    # leaving entities = {"quantity": 3} and missing_fields =
-    # ["cart_action"] even though the message obviously requested an
-    # add_item cart operation.
-    #
-    # Resolve cart_action deterministically first. For clear/show/
-    # checkout, no product information is needed, so the LLM call can
-    # still be safely skipped. For add/remove/update, product/quantity
-    # details still require the LLM extraction call.
-    # =====================================================
-
-    cart_action_resolved_deterministically = False
-
-    if resolved_current_intent == "cart":
-
-        detected_cart_action = detect_cart_action_from_message(
-            message
-        )
-
-        if detected_cart_action:
-
-            existing_entities["cart_action"] = detected_cart_action
-
-            if detected_cart_action in {
-                "clear_cart",
-                "show_cart",
-                "checkout",
-            }:
-                cart_action_resolved_deterministically = True
-
-    # =====================================================
-    # LLM extraction
-    # =====================================================
-    # Product/order messages still go through the LLM FIRST.
-    # Deterministic extraction below is the safety net and normalization
-    # layer, not a catalog-specific replacement for the LLM.
-    deterministic_turn = (
-        resolved_current_intent != "cart"
-        and _is_continuation_only_message(message)
-    ) or (
-        resolved_current_intent == "cart"
-        and cart_action_resolved_deterministically
-    )
-
-    extracted = (
-        LLMEntityOutput()
-        if deterministic_turn
-        else extract_entities(
-            message=message,
-            conversation_history=conversation_history,
-        )
+    # Natural-language entities and cart actions come exclusively from the
+    # structured entity model. Existing state is preserved separately below.
+    extracted = extract_entities(
+        message=message,
+        conversation_history=conversation_history,
     )
 
 
@@ -3423,6 +3355,8 @@ def entity_node(
     decision_vertical = getattr(intent_decision, "commerce_vertical", None)
     if isinstance(decision_vertical, str):
         decision_vertical = decision_vertical.strip() or None
+    if not decision_vertical:
+        decision_vertical = _normalize_text(state.get("commerce_vertical"))
     if decision_vertical:
         entities["commerce_vertical"] = decision_vertical
 
@@ -3502,75 +3436,40 @@ def entity_node(
     # Deterministic current-message extraction
     # =====================================================
 
-    explicit_quantity = detect_quantity(
-        message
+    explicit_order_items = (
+        _extract_multi_item_order(message)
+        if resolved_current_intent == "order_create"
+        else None
     )
+    if explicit_order_items:
+        entities["items"] = explicit_order_items
+        entities["product_name"] = explicit_order_items[0]["product_name"]
+        entities["quantity"] = explicit_order_items[0]["quantity"]
 
-    explicit_address = detect_address_text(
-        message
+    # Structured extraction remains primary. The deterministic parser is a
+    # catalog-agnostic fallback for explicit product names when the provider
+    # omits a field or its structured response fails.
+    explicit_quantity = (
+        detect_quantity(message)
+        if resolved_current_intent in {"order_create", "cart"}
+        else None
     )
-
-    explicit_address_id = detect_address_id(
-        message
+    explicit_address = None
+    explicit_address_id = None
+    explicit_order_reference = None
+    explicit_order_reference_type = None
+    explicit_payment = None
+    explicit_delivery_preference = None
+    explicit_cancellation_reason = None
+    explicit_product = (
+        detect_product_from_message(message)
+        if resolved_current_intent == "order_create"
+        else None
     )
-
-    explicit_order_reference = detect_order_reference(message)
-    explicit_order_reference_type = detect_order_reference_type(message)
-
-    if explicit_order_id is not None and bool(state.get("awaiting_order_tracking_order_id")):
-        explicit_order_reference_type = "specific"
-
-    explicit_payment = detect_payment_method(
-        message
-    )
-
-    explicit_delivery_preference = detect_delivery_preference(
-        message
-    )
-
-    explicit_cancellation_reason = detect_cancellation_reason(message)
-
-    if (
-        explicit_cancellation_reason is None
-        and bool(state.get("awaiting_cancellation_reason"))
-        and message.strip()
-    ):
-        explicit_cancellation_reason = message.strip()
-
-    # Direct product extraction for both ordering and product-search turns.
-    # This is only a conservative name extraction; product identity remains
-    # backend-authoritative.
-    explicit_product = None
-    if resolved_current_intent in {
-        "order_create",
-        "product_search",
-        "cart",
-    }:
-        explicit_product = detect_product_from_message(message)
-
-    if explicit_product:
-        entities["product_name"] = explicit_product
 
     # =====================================================
     # Service booking conversational fields
     # =====================================================
-    if resolved_current_intent == "service_booking":
-        if not entities.get("service_name") and extracted_entities.get("service_name"):
-            entities["service_name"] = _normalize_text(extracted_entities["service_name"])
-        if not entities.get("booking_date"):
-            date_match = re.search(r"\b(?:on\s+)?(\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b", message, re.I)
-            if date_match:
-                entities["booking_date"] = date_match.group(1)
-        if not entities.get("booking_start_time"):
-            time_match = re.search(r"\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\b", message, re.I)
-            if time_match:
-                entities["booking_start_time"] = time_match.group(1).strip()
-        if not entities.get("booking_end_time"):
-            range_match = re.search(r"\b(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\s*(?:to|-|until)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\b", message, re.I)
-            if range_match:
-                entities["booking_start_time"] = range_match.group(1).strip()
-                entities["booking_end_time"] = range_match.group(2).strip()
-
     # =====================================================
     # Phase 6B: product candidate selection
     # =====================================================
@@ -3581,6 +3480,9 @@ def entity_node(
         message=message,
         product_search_results=state.get("product_search_results"),
     )
+
+    if explicit_product:
+        entities["product_name"] = explicit_product
 
     if selected_search_product is not None:
         selected_product_id = selected_search_product.get("id")
@@ -3630,29 +3532,6 @@ def entity_node(
     # Recover quantity from previous USER messages.
     # =====================================================
 
-    elif (
-        not new_order
-        and checkout_context
-    ):
-
-        recovered_quantity = (
-            recover_quantity_from_history(
-                conversation_history
-            )
-        )
-
-        if recovered_quantity is not None:
-
-            # Only use history recovery when quantity is
-            # not already known.
-            if not entities.get(
-                "quantity"
-            ):
-
-                entities["quantity"] = (
-                    recovered_quantity
-                )
-
     # =====================================================
     # New-address action
     # =====================================================
@@ -3661,45 +3540,12 @@ def entity_node(
         existing_entities.get("address_action") or ""
     ).strip().lower()
 
-    explicit_add_address = bool(
-        re.search(
-            r"\b(?:add|create|save)\s+(?:a\s+)?(?:new\s+)?address\b|\b(?:new|naya|nayi)\s+address\b",
-            message,
-            flags=re.IGNORECASE,
-        )
-    )
-
-    if explicit_add_address:
-        entities["address_action"] = "add"
-    elif existing_address_action in {"add", "select"}:
+    if existing_address_action in {"add", "select"}:
         entities["address_action"] = existing_address_action
 
     # =====================================================
     # New-address fields from structured text
     # =====================================================
-
-    def _extract_address_field(*names: str) -> str | None:
-        for name in names:
-            match = re.search(
-                rf"(?:^|[,;])\s*{re.escape(name)}\s*[:=]\s*([^,;]+)",
-                message,
-                flags=re.IGNORECASE,
-            )
-            if match:
-                value = match.group(1).strip()
-                if value:
-                    return value
-        return None
-
-    for _field, _value in {
-        "address_label": _extract_address_field("label", "address label"),
-        "address_line_2": _extract_address_field("address_line_2", "line 2", "landmark"),
-        "address_city": _extract_address_field("city"),
-        "address_state": _extract_address_field("state"),
-        "address_postal_code": _extract_address_field("postal_code", "postal code", "pincode", "pin code"),
-    }.items():
-        if _value:
-            entities[_field] = _value
 
     # =====================================================
     # Address text
@@ -3736,32 +3582,6 @@ def entity_node(
         )
 
     # =====================================================
-    # Recover address ID from history
-    # =====================================================
-
-    elif (
-        not new_order
-        and checkout_context
-    ):
-
-        recovered_address_id = (
-            recover_address_id_from_history(
-                conversation_history
-            )
-        )
-
-        if (
-            recovered_address_id is not None
-            and not entities.get(
-                "address_id"
-            )
-        ):
-
-            entities["address_id"] = (
-                recovered_address_id
-            )
-
-    # =====================================================
     # Cancellation Reason
     # =====================================================
 
@@ -3789,31 +3609,6 @@ def entity_node(
         entities["order_reference"] = explicit_order_reference
         entities["order_reference_type"] = "specific"
 
-    elif (
-        not new_order
-        and original_intent in {
-            "order_tracking",
-            "order_cancel",
-        }
-    ):
-
-        recovered_order_id = (
-            recover_order_id_from_history(
-                conversation_history
-            )
-        )
-
-        if (
-            recovered_order_id is not None
-            and not entities.get(
-                "order_id"
-            )
-        ):
-
-            entities["order_id"] = (
-                recovered_order_id
-            )
-
     # =====================================================
     # Payment
     # =====================================================
@@ -3823,28 +3618,6 @@ def entity_node(
         entities["payment_method"] = (
             explicit_payment
         )
-
-    elif (
-        not new_order
-        and checkout_context
-    ):
-
-        recovered_payment = (
-            recover_payment_from_history(
-                conversation_history
-            )
-        )
-
-        if (
-            recovered_payment is not None
-            and not entities.get(
-                "payment_method"
-            )
-        ):
-
-            entities["payment_method"] = (
-                recovered_payment
-            )
 
     # =====================================================
     # Delivery preference
@@ -4021,31 +3794,6 @@ def entity_node(
             entities["cart_action"] = normalized_cart_action
         else:
             entities.pop("cart_action", None)
-
-    multi_item_order = _extract_multi_item_order(message)
-    if multi_item_order and len(multi_item_order) >= 2:
-        entities["items"] = multi_item_order
-        entities["product_name"] = multi_item_order[0]["product_name"]
-        entities["quantity"] = multi_item_order[0]["quantity"]
-
-    # =====================================================
-    # Product fallback
-    # =====================================================
-
-    if not entities.get(
-        "product_name"
-    ):
-
-        product = detect_product_fallback(
-            message=message,
-            conversation_history=conversation_history,
-        )
-
-        if product:
-
-            entities["product_name"] = (
-                product
-            )
 
     # =====================================================
     # Normalize product
@@ -4284,6 +4032,7 @@ def entity_node(
         product_name=entities.get(
             "product_name"
         ),
+        restaurant_name=entities.get("restaurant_name"),
         quantity=entities.get(
             "quantity"
         ),
@@ -4382,10 +4131,95 @@ def entity_node(
     # Return Graph Updates
     # =====================================================
 
+    # =====================================================
+    # Phase 13: associate entities with their detected intent
+    # =====================================================
+    # Keep the legacy flat `entities` snapshot for existing nodes, while
+    # exposing an intent-scoped view so a secondary task does not consume
+    # unrelated fields (e.g. an order ID as a product quantity).
+    #
+    # The detected intent list is supplied by intent_node; this node does
+    # not invent new intent labels or product/catalog values.
+    detected_intent_records = state.get("detected_intents") or []
+    detected_intent_names: list[str] = []
+    for record in detected_intent_records:
+        if isinstance(record, dict):
+            name = record.get("intent")
+        elif isinstance(record, str):
+            name = record
+        else:
+            name = None
+        if isinstance(name, str):
+            name = name.strip().lower()
+            if name and name not in detected_intent_names:
+                detected_intent_names.append(name)
+
+    # If this graph turn predates Phase 13 metadata, preserve single-intent
+    # compatibility by scoping the entity snapshot to the current intent.
+    if not detected_intent_names:
+        detected_intent_names = [resolved_intent]
+
+    # Field ownership is based on the existing entity schema, not product
+    # names or catalog assumptions. Shared fields are copied only where
+    # they are relevant to the corresponding intent.
+    intent_field_groups = {
+        "product_search": {
+            "product_name", "restaurant_name", "commerce_vertical",
+        },
+        "order_create": {
+            "items", "product_id", "product_name", "restaurant_name", "quantity",
+            "commerce_vertical", "address_id", "address_text",
+            "address_action", "address_label", "address_line_2",
+            "address_city", "address_state", "address_postal_code",
+            "payment_method", "delivery_preference", "cart_action",
+        },
+        "cart": {
+            "items", "product_id", "product_name", "quantity",
+            "cart_action", "commerce_vertical",
+        },
+        "order_tracking": {
+            "order_id", "order_reference", "order_reference_type",
+        },
+        "order_cancel": {
+            "order_id", "order_reference", "order_reference_type",
+            "cancellation_reason",
+        },
+        "customer_support": {
+            "order_id", "order_reference", "order_reference_type",
+            "support_issue_type", "support_description",
+            "support_transaction_id", "support_evidence_url",
+        },
+        "service_booking": {
+            "service_id", "service_name", "booking_date",
+            "booking_start_time", "booking_end_time",
+            "professional_id", "professional_name", "booking_id",
+        },
+        "general": set(),
+    }
+
+    intent_entities: dict[str, dict[str, Any]] = {}
+    for detected_name in detected_intent_names:
+        allowed_fields = intent_field_groups.get(detected_name)
+        if allowed_fields is None:
+            # Unknown labels are not given an unrestricted entity snapshot.
+            intent_entities[detected_name] = {}
+            continue
+        intent_entities[detected_name] = {
+            key: value
+            for key, value in final_entities.items()
+            if key in allowed_fields
+        }
+
     return {
         "intent": resolved_intent,
 
+        # Phase 13: intent-scoped entities prevent unrelated tasks from
+        # consuming each other's values. Existing consumers can continue
+        # using the legacy flat `entities` object.
+        "intent_entities": intent_entities,
+
         "entities": final_entities,
+        "order_items": final_entities.get("items", []),
 
         # Convenience mirrors for downstream graph/tool nodes.
         # The authoritative product_id still comes from backend

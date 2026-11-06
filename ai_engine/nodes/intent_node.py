@@ -29,7 +29,6 @@
 from __future__ import annotations
 
 from typing import Literal
-import re
 
 from pydantic import BaseModel, Field
 
@@ -84,6 +83,17 @@ class IntentOutput(BaseModel):
     )
 
 
+    intents: list[IntentType] = Field(
+        default_factory=list,
+        description=(
+            "All distinct supported intents explicitly requested in the "
+            "current message, ordered with the primary request first. "
+            "Return one item for a single-intent message. Do not infer "
+            "requests that the user did not make."
+        ),
+    )
+
+
 # =========================================================
 # System Prompt
 # =========================================================
@@ -91,8 +101,12 @@ class IntentOutput(BaseModel):
 INTENT_SYSTEM_PROMPT = """
 You are the intent-classification component of BuyQK AI.
 
-Classify the user's message into exactly one of the
-following intents:
+Identify every distinct supported intent explicitly requested in the
+user's current message. Return the primary intent in `intent` and all
+distinct requested intents in `intents`, ordered with the primary request
+first. For a single-intent message, return a one-item `intents` list.
+
+Supported intents are:
 
 1. product_search
    User wants to find, search, browse, compare, or know the
@@ -194,7 +208,14 @@ following intents:
 
 Classification Rules:
 
-- Select exactly one intent.
+- Return all distinct intents explicitly requested in the current message.
+- Put the primary request first; preserve the user's order for remaining
+  requests when possible.
+- Do not split one operation into multiple intents. Buying a product is one
+  order_create intent, not both product_search and order_create unless the
+  user separately asks to search/browse as another task.
+- Do not duplicate an intent in the list.
+- If only one intent is requested, return exactly one item in `intents`.
 - Determine the user's PRIMARY goal.
 - Do not invent information.
 - Do not confuse a new purchase request with an existing
@@ -281,6 +302,7 @@ def _normalize_intent(value: object) -> str:
             "order_tracking",
             "order_cancel",
             "customer_support",
+            "service_booking",
             "general",
         }:
             return value
@@ -315,18 +337,8 @@ def _looks_like_order_continuation(state: GraphState) -> bool:
 
 
 def _has_explicit_new_intent(message: str) -> bool:
-    """Conservatively identify a message that starts a distinct request."""
-    text = message.casefold().strip()
-    if not text:
-        return False
-
-    # These are semantic operation indicators, not product names.
-    return bool(
-        re.search(
-            r"\b(?:find|search|show|compare|browse|track|tracking|cancel|refund|complaint)\b",
-            text,
-        )
-    )
+    """Deprecated language heuristic; intent classification belongs to AI."""
+    return False
 
 
 def _looks_like_cart_continuation(state: GraphState) -> bool:
@@ -375,6 +387,68 @@ def _classify_with_context(
 
 
 # =========================================================
+# Classify Multiple Intents
+# =========================================================
+
+def classify_intents(
+    message: str,
+    state: GraphState | None = None,
+) -> list[str]:
+    """
+    Return distinct supported intents in primary-first order.
+
+    The legacy classify_intent() function remains available and still
+    returns one primary intent for existing callers.
+    """
+    if not isinstance(message, str) or not message.strip():
+        return ["general"]
+
+    if (
+        isinstance(state, dict)
+        and str(state.get("commerce_vertical") or "").casefold() == "electronics"
+        and isinstance(state.get("comparison_product_ids"), list)
+        and len(state["comparison_product_ids"]) >= 2
+    ):
+        return ["product_search"]
+
+    clean_message = message.strip()
+    try:
+        result: IntentOutput = structured_llm.invoke(
+            [
+                SystemMessage(content=INTENT_SYSTEM_PROMPT),
+                HumanMessage(content=clean_message),
+            ]
+        )
+        primary = _normalize_intent(getattr(result, "intent", None))
+        raw_intents = getattr(result, "intents", None) or []
+        intents: list[str] = []
+
+        for raw in raw_intents:
+            value = _normalize_intent(raw)
+            if value not in intents:
+                intents.append(value)
+
+        if primary in intents:
+            intents.remove(primary)
+        intents.insert(0, primary)
+
+        if primary in intents:
+            intents.remove(primary)
+        intents.insert(0, primary)
+        return intents or [primary]
+
+    except Exception as exc:
+        print(f"[INTENT ERROR] {type(exc).__name__}: {exc}")
+        contextual_intent = _classify_with_context(
+            clean_message,
+            state or {},
+        )
+        if contextual_intent is not None:
+            return [contextual_intent]
+        return ["general"]
+
+
+# =========================================================
 # Classify Intent
 # =========================================================
 
@@ -396,6 +470,14 @@ def classify_intent(
     if not message or not message.strip():
         return "general"
 
+    if (
+        isinstance(state, dict)
+        and str(state.get("commerce_vertical") or "").casefold() == "electronics"
+        and isinstance(state.get("comparison_product_ids"), list)
+        and len(state["comparison_product_ids"]) >= 2
+    ):
+        return "product_search"
+
     messages = [
         SystemMessage(
             content=INTENT_SYSTEM_PROMPT
@@ -412,49 +494,9 @@ def classify_intent(
             )
         )
 
-        # Protect high-confidence transactional intents from an
-        # inconsistent provider classification. These checks only
-        # resolve unambiguous operation semantics; product identity
-        # and all transaction values remain AI/backend controlled.
-        text = message.strip().casefold()
-        if re.search(r"\b(cancel|cancellation)\b", text) and re.search(r"\border\b", text):
-            return "order_cancel"
-        if (
-            re.search(r"\b(track|tracking|status)\b", text)
-            and re.search(r"\border\b", text)
-        ) or re.search(
-            r"\bwhere\s+is\s+(?:my\s+)?order\b",
-            text,
-        ):
-            return "order_tracking"
-
-        if re.search(
-            r"\b(?:i\s+(?:want|need)|please\s+)?(?:buy|purchase|order|get)\b",
-            text,
-        ) and not _has_explicit_new_intent(text):
-            return "order_create"
-
-        if re.search(
-            r"^\s*i\s+(?:want|need)\s+(?!to\s+).+",
-            text,
-        ) or re.search(
-            r"^\s*(?:give|get)\s+me\s+.+",
-            text,
-        ):
-            return "order_create"
-
         normalized_intent = _normalize_intent(
             getattr(result, "intent", None)
         )
-
-        if state is not None:
-            contextual_intent = _classify_with_context(
-                message,
-                state,
-            )
-            if contextual_intent is not None:
-                return contextual_intent
-
         return normalized_intent
 
     except Exception as exc:
@@ -483,156 +525,6 @@ def classify_intent(
             if contextual_intent is not None:
                 return contextual_intent
 
-        text = message.lower().strip()
-
-        # -------------------------------------------------
-        # Cart intent
-        # -------------------------------------------------
-        #
-        # Check explicit cart operations first so that
-        # phrases such as "add to my cart" do not get
-        # incorrectly classified as order_create.
-        # -------------------------------------------------
-
-        cart_phrases = [
-            "my cart",
-            "the cart",
-            "shopping cart",
-            "to cart",
-            "in cart",
-            "into cart",
-            "from cart",
-            "cart",
-        ]
-
-        cart_actions = [
-            "add",
-            "remove",
-            "delete",
-            "clear",
-            "empty",
-            "show",
-            "view",
-            "checkout",
-            "update",
-            "change",
-            "make",
-        ]
-
-        if (
-            any(phrase in text for phrase in cart_phrases)
-            and any(action in text for action in cart_actions)
-        ):
-            return "cart"
-
-        # Explicit cart commands without the word "cart".
-        #
-        # Examples:
-        # "Remove Maggi"
-        # "Make Maggi 5"
-        #
-        # These are conservative patterns and are only
-        # used when the LLM itself is unavailable.
-
-        if text.startswith(
-            (
-                "remove ",
-                "delete ",
-                "clear ",
-                "empty ",
-            )
-        ):
-            return "cart"
-
-        if (
-            text.startswith("make ")
-            or text.startswith("change ")
-            or text.startswith("update ")
-        ):
-            return "cart"
-
-        # -------------------------------------------------
-        # Cancellation must be checked before generic order
-        # handling.  "Cancel order 123" contains the word
-        # "order", but its primary intent is cancellation.
-        # -------------------------------------------------
-
-        if "cancel" in text and "order" in text:
-            return "order_cancel"
-
-        # -------------------------------------------------
-        # Order-related intents
-        # -------------------------------------------------
-
-        if any(
-            keyword in text
-            for keyword in [
-                "buy",
-                "purchase",
-                "i want",
-                "i need",
-                "give me",
-                "order",
-            ]
-        ):
-
-            # Distinguish tracking queries such as:
-            # "Where is my order?"
-            # "What is my order status?"
-            # "Track my order"
-
-            if any(
-                keyword in text
-                for keyword in [
-                    "where",
-                    "status",
-                    "track",
-                    "tracking",
-                ]
-            ):
-                return "order_tracking"
-
-            return "order_create"
-
-        # -------------------------------------------------
-        # Product search
-        # -------------------------------------------------
-
-        if any(
-            keyword in text
-            for keyword in [
-                "find",
-                "search",
-                "available",
-                "price",
-                "how much",
-                "do you have",
-                "show me",
-                "what",
-                "compare",
-            ]
-        ):
-            return "product_search"
-
-        # -------------------------------------------------
-        # Customer support
-        # -------------------------------------------------
-
-        if any(
-            keyword in text
-            for keyword in [
-                "payment",
-                "refund",
-                "failed",
-                "complaint",
-            ]
-        ):
-            return "customer_support"
-
-        # -------------------------------------------------
-        # Default
-        # -------------------------------------------------
-
         return "general"
 
 
@@ -646,23 +538,18 @@ def intent_node(
     """
     LangGraph node responsible for intent classification.
 
-    Reads:
-        state["message"]
-
     Writes:
-        state["intent"]
+        intent: backward-compatible primary intent.
+        detected_intents: ordered list of detected intent records.
     """
-
-    message = state.get(
-        "message",
-        "",
-    )
-
-    intent = classify_intent(
-        message,
-        state,
-    )
+    message = state.get("message", "")
+    intents = classify_intents(message, state)
+    primary_intent = intents[0] if intents else "general"
 
     return {
-        "intent": intent,
+        "intent": primary_intent,
+        "detected_intents": [
+            {"intent": item, "status": "pending", "position": index}
+            for index, item in enumerate(intents)
+        ],
     }

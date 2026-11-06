@@ -105,6 +105,22 @@ PLANNER_ACTIONS: set[str] = {
     "get_booking",
     "cancel_booking",
     "process_booking_payment",
+
+    # Phase 12 merchant onboarding capabilities.
+    "register_merchant",
+    "get_merchant_status",
+    "submit_merchant_document",
+    "verify_merchant",
+    "approve_merchant",
+    "reject_merchant",
+
+    # Phase 12 rider onboarding capabilities.
+    "register_rider",
+    "get_rider_status",
+    "submit_rider_document",
+    "verify_rider",
+    "approve_rider",
+    "reject_rider",
 }
 
 
@@ -457,6 +473,8 @@ def _normalize_plan(
             "show_cart": "show_cart",
             "checkout_cart": "checkout_cart",
             "search_product": "search_products",
+            "merchant_onboarding": "register_merchant",
+            "rider_onboarding": "register_rider",
         }
         action = action_aliases.get(action, action)
 
@@ -482,6 +500,8 @@ def _normalize_plan(
                     "show_cart": "show_cart",
                     "checkout_cart": "checkout_cart",
                     "search_product": "search_products",
+                    "merchant_onboarding": "register_merchant",
+                    "rider_onboarding": "register_rider",
                 }.get(action, action)
                 break
 
@@ -567,6 +587,63 @@ def _normalize_plan(
         "confidence": confidence,
         "reason": reason,
     }
+
+
+# =========================================================
+# Phase 13: Active-intent planning context
+# =========================================================
+
+def _active_intent_from_state(state: dict[str, Any]) -> str | None:
+    """Return the coordinator-selected intent, if one is present.
+
+    Multi-intent sequencing belongs to the coordinator/graph. The planner
+    only plans the currently active task and never advances the queue itself.
+    """
+    candidates = (
+        state.get("active_intent"),
+        state.get("current_intent"),
+        (state.get("multi_intent") or {}).get("active_intent")
+        if isinstance(state.get("multi_intent"), dict) else None,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _state_for_active_intent(state: dict[str, Any]) -> dict[str, Any]:
+    """Project state to the active task without mutating the caller's state.
+
+    If Entity Node provides an ``intent_entities`` mapping, use only the
+    entity bucket for the active intent. This prevents details belonging to
+    queued tasks from leaking into the current plan. Legacy single-intent
+    states continue to use ``entities`` unchanged.
+    """
+    projected = dict(state)
+    active_intent = _active_intent_from_state(state)
+    if active_intent:
+        projected["intent"] = active_intent
+        projected["active_intent"] = active_intent
+
+    intent_entities = state.get("intent_entities")
+    if isinstance(intent_entities, dict) and intent_entities:
+        selected_intent = active_intent or str(state.get("intent") or "").strip()
+        bucket = intent_entities.get(selected_intent) if selected_intent else None
+        projected["entities"] = dict(bucket) if isinstance(bucket, dict) else {}
+
+    # Task-local entities take precedence over stale top-level entity values
+    # in the planner's view. Keep all other authoritative workflow state.
+    return projected
+
+
+def _multi_intent_prompt_context(state: dict[str, Any]) -> dict[str, Any]:
+    """Expose coordinator state as context; do not create or reorder tasks."""
+    result: dict[str, Any] = {}
+    for key in ("active_intent", "detected_intents", "pending_intents", "intent_statuses", "intent_results", "multi_intent"):
+        value = state.get(key)
+        if value is not None:
+            result[key] = value
+    return result
 
 
 # =========================================================
@@ -714,13 +791,26 @@ def _build_planner_prompt(
         "cart": cart_state,
         "frontend_selection": frontend_state,
         "booking": booking_state,
+        "multi_intent_context": _multi_intent_prompt_context(state),
     }
 
     return f"""
 You are the BuyQK AI Planner.
 
 Your job is to understand the user's CURRENT goal and
-produce exactly ONE structured execution plan.
+produce exactly ONE structured execution plan for the ACTIVE intent only.
+
+PHASE 13 MULTI-INTENT RULE:
+- The graph/coordinator owns task ordering, queue persistence, and advancing
+  to the next intent. You must not advance, complete, remove, or reorder tasks.
+- If coordinator state identifies an active_intent, plan only for that intent.
+- Use only entities associated with the active intent in the supplied context.
+- Do not mix product/quantity entities from one task with order references or
+  other entities belonging to another task.
+- If the active task needs information, return ask_clarification and the
+  missing fields for that task only. Do not switch to a queued task.
+- Never mark another intent complete or claim an operation succeeded.
+- Keep the existing single-intent behavior when no multi-intent state exists.
 
 You are a conversational reasoning layer.
 
@@ -839,6 +929,28 @@ cancel_order
 request_support
 
 - request_support
+
+MERCHANT AND RIDER ONBOARDING CAPABILITIES:
+
+- register_merchant
+- get_merchant_status
+- submit_merchant_document
+- verify_merchant
+- approve_merchant
+- reject_merchant
+- register_rider
+- get_rider_status
+- submit_rider_document
+- verify_rider
+- approve_rider
+- reject_rider
+
+ONBOARDING RULES:
+- Map merchant_onboarding intent to register_merchant when the planner needs a registration capability.
+- Map rider_onboarding intent to register_rider when the planner needs a registration capability.
+- Pass through only fields already present in entity or graph state.
+- Do not invent merchant/rider IDs, document references, verification results, or approval status.
+- Backend services own validation, document verification, and approval decisions.
 
 SERVICE BOOKING CAPABILITIES:
 
@@ -1068,6 +1180,63 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         return {"action":"create_booking","tool_name":"create_booking","arguments":args,"missing_fields":[],"confidence":0.0,"reason":"Booking creation fallback."}
 
     # =====================================================
+    # MERCHANT / RIDER ONBOARDING FALLBACK
+    # =====================================================
+    # This fallback maps an already-classified intent to a capability.
+    # It forwards only user/entity/state values and performs no validation,
+    # document verification, approval, or database mutation.
+    onboarding_fields = {
+        "merchant_onboarding": (
+            "business_name",
+            "category",
+            "phone",
+            "email",
+            "address_text",
+            "documents",
+            "merchant_id",
+            "document_type",
+            "document_reference",
+        ),
+        "rider_onboarding": (
+            "name",
+            "phone",
+            "vehicle_type",
+            "license_number",
+            "government_id",
+            "bank_details",
+            "documents",
+            "rider_id",
+            "document_type",
+            "document_reference",
+        ),
+    }
+    if intent in onboarding_fields:
+        arguments: dict[str, Any] = {}
+        for key in onboarding_fields[intent]:
+            value = entities.get(key)
+            if value is None:
+                value = state.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                arguments[key] = value
+
+        action = (
+            "register_merchant"
+            if intent == "merchant_onboarding"
+            else "register_rider"
+        )
+        return {
+            "action": action,
+            "tool_name": action,
+            "arguments": arguments,
+            "missing_fields": missing,
+            "confidence": 0.0,
+            "reason": (
+                "Deterministic onboarding fallback used because the planner "
+                "model was unavailable."
+            ),
+        }
+
+    # =====================================================
     # ORDER CREATE FALLBACK
     # =====================================================
 
@@ -1125,6 +1294,7 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
             }
 
         for key in (
+            "items",
             "product_name",
             "quantity",
             "address_id",
@@ -1133,6 +1303,9 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
             value = entities.get(key)
             if value is not None:
                 args[key] = value
+
+        if "items" not in args and isinstance(state.get("order_items"), list):
+            args["items"] = state["order_items"]
 
         # Preserve already-resolved checkout context. These values are
         # carried forward only; the planner does not calculate or invent
@@ -1280,6 +1453,8 @@ def _deterministic_plan_fallback(state: dict[str, Any]) -> dict[str, Any]:
         "order_tracking": "track_order",
         "order_cancel": "cancel_order",
         "customer_support": "request_support",
+        "merchant_onboarding": "register_merchant",
+        "rider_onboarding": "register_rider",
     }
     action = mapping.get(intent, "answer")
 
@@ -1490,6 +1665,50 @@ def _preserve_booking_arguments(state: dict[str, Any], plan: dict[str, Any]) -> 
     return plan
 
 
+def _preserve_onboarding_arguments(
+    state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry only already-provided onboarding values into the plan."""
+    action = _normalize_action(plan.get("action"))
+    merchant_actions = {
+        "register_merchant", "get_merchant_status", "submit_merchant_document",
+        "verify_merchant", "approve_merchant", "reject_merchant",
+    }
+    rider_actions = {
+        "register_rider", "get_rider_status", "submit_rider_document",
+        "verify_rider", "approve_rider", "reject_rider",
+    }
+    if action not in merchant_actions | rider_actions:
+        return plan
+
+    merchant_fields = (
+        "merchant_id", "business_name", "category", "phone", "email",
+        "address_text", "documents", "document_type", "document_reference",
+    )
+    rider_fields = (
+        "rider_id", "name", "phone", "vehicle_type", "license_number",
+        "government_id", "bank_details", "documents", "document_type",
+        "document_reference",
+    )
+    fields = merchant_fields if action in merchant_actions else rider_fields
+    entities = state.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    arguments = plan.get("arguments")
+    merged = dict(arguments) if isinstance(arguments, dict) else {}
+    for key in fields:
+        value = state.get(key)
+        if value is None:
+            value = entities.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            merged[key] = value
+    plan["arguments"] = merged
+    plan["tool_name"] = action
+    return plan
+
+
 def _attach_commerce_context(
     state: dict[str, Any],
     plan: dict[str, Any],
@@ -1528,6 +1747,10 @@ def planner_node(
 
     This node does NOT execute backend operations.
     """
+
+    # Phase 13: isolate the coordinator-selected task. This is a shallow
+    # state projection; the input GraphState and pending queue are untouched.
+    state = _state_for_active_intent(state)
 
     # -----------------------------------------------------
     # Deterministic checkout orchestration
@@ -1597,6 +1820,9 @@ def planner_node(
         plan = _deterministic_plan_fallback(state)
 
     plan = _attach_commerce_context(state, plan)
+    active_intent = _active_intent_from_state(state)
+    if active_intent:
+        plan["active_intent"] = active_intent
 
     # -----------------------------------------------------
     # Phase 3 cart capability enforcement
@@ -1708,6 +1934,10 @@ def planner_node(
         plan,
     )
     plan = _preserve_booking_arguments(
+        state,
+        plan,
+    )
+    plan = _preserve_onboarding_arguments(
         state,
         plan,
     )

@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import re
 import uuid
+import importlib
+import inspect
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -60,6 +62,14 @@ from backend.models.product import Product
 from backend.services.product_service import (
     search_products,
     check_product_availability,
+)
+from backend.services.restaurant_service import search_restaurants
+from backend.services.menu_service import search_menu_items
+from backend.services.food_order_service import create_food_order
+from backend.services.electronics_service import (
+    compare_electronics,
+    get_electronic_variants,
+    search_electronics,
 )
 
 from backend.services.order_service import (
@@ -305,6 +315,10 @@ def _serialize_product(
             "specifications": _product_value(
                 product,
                 "specifications",
+            ),
+            "variants": _product_value(
+                product,
+                "variants",
             ),
             "prescription_required": _product_value(
                 product,
@@ -1985,6 +1999,267 @@ def _support_ticket_subject(issue_type: str) -> str:
     return labels.get(issue_type, "general_support")
 
 
+
+
+# =========================================================
+# Phase 12: Merchant / Rider Onboarding Dispatch
+# =========================================================
+
+MERCHANT_ONBOARDING_TOOLS = {
+    "register_merchant",
+    "get_merchant_status",
+    "submit_merchant_document",
+    "verify_merchant",
+    "approve_merchant",
+    "reject_merchant",
+}
+
+RIDER_ONBOARDING_TOOLS = {
+    "register_rider",
+    "get_rider_status",
+    "submit_rider_document",
+    "verify_rider",
+    "approve_rider",
+    "reject_rider",
+}
+
+ONBOARDING_TOOLS = MERCHANT_ONBOARDING_TOOLS | RIDER_ONBOARDING_TOOLS
+
+
+def _onboarding_value(
+    state: GraphState,
+    entities: dict[str, Any],
+    key: str,
+) -> Any:
+    """Read supplied onboarding input without fabricating values."""
+    for source in (
+        state,
+        entities,
+        state.get("planner_args"),
+        state.get("planned_arguments"),
+        state.get("arguments"),
+    ):
+        if isinstance(source, dict):
+            value = source.get(key)
+            if value is not None and (
+                not isinstance(value, str) or value.strip()
+            ):
+                return value
+    return None
+
+
+def _onboarding_result_payload(result: Any) -> dict[str, Any]:
+    """
+    Preserve backend-returned fields and statuses without generating IDs
+    or deriving verification/approval outcomes in the AI node.
+    """
+    if isinstance(result, dict):
+        return dict(result)
+
+    if hasattr(result, "model_dump") and callable(result.model_dump):
+        try:
+            dumped = result.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+
+    if hasattr(result, "dict") and callable(result.dict):
+        try:
+            dumped = result.dict()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+
+    fields = (
+        "id", "merchant_id", "rider_id", "business_name", "category",
+        "phone", "email", "address", "name", "vehicle_type",
+        "license_number", "government_id", "document_id",
+        "document_type", "document_reference", "document_status",
+        "onboarding_status", "verification_status", "approval_status",
+        "status", "message", "reason", "created_at", "updated_at",
+    )
+    payload = {}
+    for field in fields:
+        value = getattr(result, field, None)
+        if value is not None:
+            payload[field] = value
+    return payload
+
+
+def _execute_onboarding_operation(
+    tool_name: str,
+    state: GraphState,
+    entities: dict[str, Any],
+    db: Session,
+    user_id: Any,
+) -> GraphState:
+    """
+    Dispatch Phase 12 operations to the corresponding backend service.
+
+    This node performs no SQL, identity/document verification, or approval
+    decision. The backend service owns persistence and authoritative results.
+    """
+    is_merchant = tool_name in MERCHANT_ONBOARDING_TOOLS
+    service_module_name = (
+        "backend.services.merchant_service"
+        if is_merchant
+        else "backend.services.rider_service"
+    )
+    entity_id_key = "merchant_id" if is_merchant else "rider_id"
+
+    try:
+        service_module = importlib.import_module(service_module_name)
+    except ImportError as exc:
+        return {
+            "tool_name": tool_name,
+            "tool_result": {
+                "success": False,
+                "type": "onboarding_error",
+                "error_code": "service_unavailable",
+                "error": f"Onboarding backend service is unavailable: {service_module_name}.",
+            },
+        }
+
+    service_function = getattr(service_module, tool_name, None)
+    if not callable(service_function):
+        return {
+            "tool_name": tool_name,
+            "tool_result": {
+                "success": False,
+                "type": "onboarding_error",
+                "error_code": "operation_unavailable",
+                "error": f"The backend service does not expose the requested operation: {tool_name}.",
+            },
+        }
+
+    # Only pass through values already supplied by state/entities/planner.
+    # Backend IDs and statuses are outputs, not locally generated values.
+    input_keys = (
+        "business_name", "category", "phone", "email", "address",
+        "address_text", "name", "vehicle_type", "license_number",
+        "government_id", "bank_details", "bank_account",
+        "document_type", "document_reference", "document_url",
+        "document_name", "document_metadata", "documents",
+        "reason", "rejection_reason", "notes",
+    )
+    supplied = {
+        key: _onboarding_value(state, entities, key)
+        for key in input_keys
+    }
+    supplied = {key: value for key, value in supplied.items() if value is not None}
+
+    entity_id = _onboarding_value(state, entities, entity_id_key)
+    if entity_id is not None:
+        supplied[entity_id_key] = entity_id
+
+    # A user ID may be relevant to service authorization, but it is passed only
+    # if the backend callable accepts it.
+    if user_id is not None:
+        supplied["user_id"] = user_id
+
+    supplied["db"] = db
+
+    try:
+        signature = inspect.signature(service_function)
+        parameters = signature.parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+        if accepts_kwargs:
+            call_kwargs = supplied
+        else:
+            call_kwargs = {
+                key: value
+                for key, value in supplied.items()
+                if key in parameters
+                and parameters[key].kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+
+        # Some service APIs accept a payload/data object for registration.
+        # Only supply it when the callable explicitly declares that parameter.
+        payload = {
+            key: value
+            for key, value in supplied.items()
+            if key not in {"db", "user_id", entity_id_key}
+        }
+        for payload_key in ("payload", "data", "document_data"):
+            if payload_key in parameters and payload_key not in call_kwargs:
+                call_kwargs[payload_key] = payload
+                break
+
+        result = service_function(**call_kwargs)
+        if inspect.isawaitable(result):
+            return {
+                "tool_name": tool_name,
+                "tool_result": {
+                    "success": False,
+                    "type": "onboarding_error",
+                    "error_code": "async_service_unsupported",
+                    "error": "The onboarding service is asynchronous but this tool node is synchronous.",
+                },
+            }
+
+        payload_result = _onboarding_result_payload(result)
+        if isinstance(result, dict):
+            success = result.get("success")
+            if success is None:
+                success = not bool(result.get("error"))
+            error_value = result.get("error")
+        else:
+            success = True
+            error_value = None
+
+        # Preserve the service's response exactly as returned where possible.
+        tool_result = {
+            **payload_result,
+            "success": bool(success),
+            "type": "onboarding",
+            "action": tool_name,
+        }
+        if error_value is not None:
+            tool_result["error"] = error_value
+
+        updates: dict[str, Any] = {"tool_name": tool_name, "tool_result": tool_result}
+        for key in (
+            "merchant_id", "rider_id", "document_id", "document_reference",
+            "document_status", "onboarding_status", "verification_status",
+            "approval_status", "status",
+        ):
+            if key in payload_result:
+                updates[key] = payload_result[key]
+
+        # If the service returns the generic primary key, map it only when its
+        # returned payload identifies this entity type; never create an ID.
+        if entity_id_key not in updates and payload_result.get(entity_id_key) is not None:
+            updates[entity_id_key] = payload_result[entity_id_key]
+        return updates
+
+    except Exception as exc:
+        print(
+            f"[TOOL {tool_name} ERROR]",
+            type(exc).__name__,
+            str(exc),
+        )
+        return {
+            "tool_name": tool_name,
+            "tool_result": {
+                "success": False,
+                "type": "onboarding_error",
+                "error_code": "backend_error",
+                "error": str(exc),
+            },
+        }
+
+
+
 # =========================================================
 # Tool Node
 # =========================================================
@@ -2033,6 +2308,8 @@ def _tool_node_impl(
             "cancel": "cancel_order",
             "order_cancel": "cancel_order",
             "order_cancellation": "cancel_order",
+            "merchant_onboarding": "register_merchant",
+            "rider_onboarding": "register_rider",
         }
 
         tool_name = tool_aliases.get(
@@ -2108,6 +2385,87 @@ def _tool_node_impl(
 
     if tool_name == "search_products":
 
+        commerce_vertical = str(
+            state.get("commerce_vertical")
+            or updated_entities.get("commerce_vertical")
+            or ""
+        ).strip().casefold()
+
+        if commerce_vertical == "food":
+            query = str(
+                updated_entities.get("product_name")
+                or updated_entities.get("restaurant_name")
+                or ""
+            ).strip()
+            restaurant_name = updated_entities.get("restaurant_name")
+            try:
+                restaurants = search_restaurants(
+                    db=db,
+                    query=str(restaurant_name).strip() if restaurant_name else query,
+                )
+                restaurant_id = (
+                    restaurants[0].get("id")
+                    if restaurant_name and len(restaurants) == 1
+                    else None
+                )
+                menu_items = search_menu_items(
+                    db=db,
+                    restaurant_id=restaurant_id,
+                    query=(
+                        query or None
+                        if restaurant_id is None
+                        else None
+                    ),
+                    available_only=True,
+                )
+                return {
+                    "tool_name": "search_products",
+                    "tool_result": {
+                        "success": True,
+                        "type": "food_menu_search",
+                        "restaurants": restaurants,
+                        "menu_items": menu_items,
+                    },
+                    "entities": updated_entities,
+                }
+            except Exception as exc:
+                return {
+                    "tool_name": "search_products",
+                    "tool_result": {
+                        "success": False,
+                        "type": "food_menu_search",
+                        "error": str(exc),
+                    },
+                }
+
+        if commerce_vertical == "electronics":
+            comparison_ids = state.get("comparison_product_ids")
+            if isinstance(comparison_ids, list) and len(comparison_ids) >= 2:
+                try:
+                    comparison = compare_electronics(
+                        db=db,
+                        product_ids=comparison_ids,
+                    )
+                    return {
+                        "tool_name": "search_products",
+                        "tool_result": {
+                            "success": True,
+                            "type": "electronics_comparison",
+                            **comparison,
+                        },
+                        "comparison_results": comparison,
+                        "entities": updated_entities,
+                    }
+                except (TypeError, ValueError) as exc:
+                    return {
+                        "tool_name": "search_products",
+                        "tool_result": {
+                            "success": False,
+                            "type": "electronics_comparison",
+                            "error": str(exc),
+                        },
+                    }
+
         product_name = (
             updated_entities.get(
                 "product_name"
@@ -2130,12 +2488,21 @@ def _tool_node_impl(
 
         try:
 
-            products = search_products(
-                db=db,
-                query=str(
-                    product_name
-                ).strip(),
-            )
+            if commerce_vertical == "electronics":
+                products = search_electronics(
+                    db=db,
+                    query=str(product_name).strip(),
+                )
+                for product in products:
+                    product["variants"] = get_electronic_variants(
+                        db=db,
+                        product_id=product["id"],
+                    )
+            else:
+                products = search_products(
+                    db=db,
+                    query=str(product_name).strip(),
+                )
 
             if products is None:
                 products = []
@@ -2647,6 +3014,64 @@ def _tool_node_impl(
     # =====================================================
 
     if tool_name == "create_order":
+
+        commerce_vertical = str(
+            state.get("commerce_vertical")
+            or updated_entities.get("commerce_vertical")
+            or ""
+        ).strip().casefold()
+
+        if commerce_vertical == "food":
+            order_items = updated_entities.get("items")
+            if not isinstance(order_items, list) or not order_items:
+                product_name = updated_entities.get("product_name")
+                quantity = updated_entities.get("quantity")
+                order_items = (
+                    [{"product_name": product_name, "quantity": quantity}]
+                    if product_name and quantity is not None
+                    else []
+                )
+
+            try:
+                food_result = create_food_order(
+                    db=db,
+                    user_id=user_id,
+                    address_id=(
+                        state.get("selected_address_id")
+                        or state.get("address_id")
+                        or updated_entities.get("address_id")
+                    ),
+                    checkout_id=checkout_id,
+                    payment_method=(
+                        state.get("selected_payment_method")
+                        or state.get("payment_method")
+                        or updated_entities.get("payment_method")
+                    ),
+                    items=order_items,
+                    restaurant_name=updated_entities.get("restaurant_name"),
+                )
+                return {
+                    "tool_name": "create_order",
+                    "tool_result": food_result,
+                    "checkout_id": checkout_id,
+                    "checkout_status": "completed",
+                    "checkout_completed": True,
+                    "order_created": True,
+                    "order_id": food_result.get("order_id"),
+                    "order_type": "food",
+                    "entities": updated_entities,
+                    "bill": food_result.get("bill"),
+                    "billing": food_result.get("bill"),
+                }
+            except Exception as exc:
+                return {
+                    "tool_name": "create_order",
+                    "tool_result": {
+                        "success": False,
+                        "type": "food_order_error",
+                        "error": str(exc),
+                    },
+                }
 
         # =================================================
         # USER
@@ -4557,6 +4982,19 @@ def _tool_node_impl(
             return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":str(exc),"error_code":"validation_error"}}
         except Exception as exc:
             return {"tool_name":tool_name,"tool_result":{"success":False,"type":"booking_error","error":str(exc)}}
+
+    # =====================================================
+    # PHASE 12: MERCHANT / RIDER ONBOARDING
+    # =====================================================
+
+    if tool_name in ONBOARDING_TOOLS:
+        return _execute_onboarding_operation(
+            tool_name=tool_name,
+            state=state,
+            entities=updated_entities,
+            db=db,
+            user_id=user_id,
+        )
 
     # =====================================================
     # UNKNOWN TOOL

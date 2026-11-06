@@ -1772,6 +1772,14 @@ For cancellation:
 For support:
 - use only returned ticket information
 
+For merchant and rider onboarding:
+- use only identifiers and statuses explicitly returned by the backend
+- preserve returned merchant_id and rider_id exactly
+- report onboarding, verification, and approval status only when supplied
+- never claim documents were verified or a merchant/rider was approved unless
+  the backend result explicitly provides that outcome
+- never create onboarding IDs, document references, or status values
+
 For errors:
 - recognize the canonical error category when provided
 - not_found: explain that the requested resource could not be found
@@ -2327,6 +2335,130 @@ planning notes, JSON, markdown code fences, or implementation details.
 # =========================================================
 
 
+def _onboarding_result_kind(
+    tool_result: Any,
+    tool_name: str | None = None,
+) -> str | None:
+    """Identify merchant/rider onboarding results from tool/backend labels."""
+    if not isinstance(tool_result, dict):
+        return None
+
+    labels = (
+        tool_name,
+        tool_result.get("tool"),
+        tool_result.get("type"),
+        tool_result.get("action"),
+    )
+    normalized = [
+        value.strip().casefold().replace("-", "_").replace(" ", "_")
+        for value in labels
+        if isinstance(value, str) and value.strip()
+    ]
+
+    onboarding_terms = (
+        "onboard",
+        "register",
+        "document",
+        "verification",
+        "verify",
+        "approval",
+        "approve",
+        "reject",
+        "merchant_status",
+        "rider_status",
+    )
+    if not any(
+        any(term in label for term in onboarding_terms)
+        for label in normalized
+    ):
+        return None
+
+    has_merchant = any("merchant" in label for label in normalized)
+    has_rider = any("rider" in label for label in normalized)
+
+    if has_merchant and not has_rider:
+        return "merchant"
+    if has_rider and not has_merchant:
+        return "rider"
+    return None
+
+
+def _onboarding_result_response(
+    tool_result: dict[str, Any],
+    tool_name: str | None = None,
+) -> str:
+    """Present only onboarding identifiers and statuses returned by the backend."""
+    kind = _onboarding_result_kind(tool_result, tool_name)
+    if kind is None:
+        return "The request was processed."
+
+    label = kind.capitalize()
+    entity_id = tool_result.get(f"{kind}_id")
+    onboarding_status = tool_result.get("onboarding_status")
+    approval_status = tool_result.get("approval_status")
+    verification_status = tool_result.get("verification_status")
+    status = tool_result.get("status")
+
+    parts: list[str] = []
+    if entity_id is not None:
+        parts.append(f"{label} ID: {entity_id}.")
+
+    # Report only status fields actually supplied by the backend.
+    if onboarding_status is not None:
+        parts.append(f"Onboarding status: {onboarding_status}.")
+    if verification_status is not None:
+        parts.append(f"Verification status: {verification_status}.")
+    if approval_status is not None:
+        parts.append(f"Approval status: {approval_status}.")
+    if status is not None and all(
+        value is None
+        for value in (onboarding_status, verification_status, approval_status)
+    ):
+        parts.append(f"Status: {status}.")
+
+    if parts:
+        return " ".join(parts)
+
+    return (
+        "The onboarding request was processed, but the backend did not "
+        "return an identifier or status."
+    )
+
+
+def _onboarding_result_metadata(
+    tool_result: dict[str, Any],
+    missing_fields: list[str],
+    tool_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Expose only onboarding values explicitly returned by the backend."""
+    kind = _onboarding_result_kind(tool_result, tool_name)
+    if kind is None:
+        return None
+
+    metadata: dict[str, Any] = {
+        "type": tool_result.get("type"),
+        "entity_type": kind,
+        "missing_fields": missing_fields,
+    }
+    for field in (
+        f"{kind}_id",
+        "onboarding_id",
+        "onboarding_status",
+        "verification_status",
+        "approval_status",
+        "status",
+        "documents",
+        "document_status",
+        "verification",
+        "message",
+        "error_code",
+    ):
+        if field in tool_result:
+            metadata[field] = tool_result[field]
+
+    return metadata
+
+
 def _tool_fallback(
     tool_result: dict[str, Any],
 ) -> str:
@@ -2376,6 +2508,12 @@ def _tool_fallback(
         return (
             "I couldn't complete that request."
         )
+
+    # -----------------------------------------------------
+    # Merchant / rider onboarding
+    # -----------------------------------------------------
+    if _onboarding_result_kind(tool_result) is not None:
+        return _onboarding_result_response(tool_result)
 
     # -----------------------------------------------------
     # Cart add / remove
@@ -2875,6 +3013,8 @@ def _order_success_metadata(
         "payment_method": tool_result.get(
             "payment_method"
         ),
+        "order_type": tool_result.get("order_type"),
+        "subtotal": tool_result.get("subtotal"),
         "total_amount": tool_result.get(
             "total_amount"
         ),
@@ -2979,11 +3119,31 @@ def _tool_metadata(
         }
 
     if result_type == "product_search":
-
-        return _product_metadata(
+        metadata = _product_metadata(
             tool_result,
             missing_fields,
         )
+        metadata["commerce_vertical"] = (
+            state.get("commerce_vertical")
+            or _get_entities(state).get("commerce_vertical")
+        )
+        return metadata
+
+    if result_type == "food_menu_search":
+        return {
+            "type": "food_menu_search",
+            "restaurants": tool_result.get("restaurants", []),
+            "menu_items": tool_result.get("menu_items", []),
+            "missing_fields": missing_fields,
+        }
+
+    if result_type == "electronics_comparison":
+        return {
+            "type": "electronics_comparison",
+            "products": tool_result.get("products", []),
+            "dimensions": tool_result.get("dimensions", []),
+            "missing_fields": missing_fields,
+        }
 
     if result_type == "address_selection":
 
@@ -3166,7 +3326,7 @@ def _cart_tool_metadata(
 # Response Node
 # =========================================================
 
-def response_node(
+def _response_node_single_intent(
     state: GraphState,
 ) -> GraphState:
     """
@@ -3584,6 +3744,50 @@ def response_node(
             "metadata": failure_metadata,
             "missing_fields": missing_fields,
             "next_missing": next_missing,
+        }
+
+    # ---------------------------------------------------------
+    # Phase 12: Merchant / rider onboarding results
+    #
+    # Present only backend-returned identifiers and status fields.
+    # This node never performs verification or makes approval decisions.
+    # ---------------------------------------------------------
+    onboarding_metadata = (
+        _onboarding_result_metadata(
+            tool_result,
+            missing_fields,
+            tool_name,
+        )
+        if isinstance(tool_result, dict)
+        else None
+    )
+    if (
+        onboarding_metadata is not None
+        and isinstance(tool_result, dict)
+        and tool_result.get("success") is True
+    ):
+        response = _sanitize_user_response(
+            _onboarding_result_response(tool_result, tool_name)
+        )
+        onboarding_metadata.update(metadata)
+        onboarding_metadata["type"] = tool_result.get("type")
+        onboarding_metadata["entity_type"] = _onboarding_result_kind(
+            tool_result, tool_name
+        )
+        onboarding_metadata["missing_fields"] = missing_fields
+        return {
+            "response": response,
+            "response_language": response_language,
+            "tool_result": tool_result_object,
+            "metadata": onboarding_metadata,
+            "missing_fields": missing_fields,
+            "next_missing": next_missing,
+            "merchant_id": tool_result.get("merchant_id"),
+            "rider_id": tool_result.get("rider_id"),
+            "onboarding_status": tool_result.get("onboarding_status"),
+            "verification_status": tool_result.get("verification_status"),
+            "approval_status": tool_result.get("approval_status"),
+            "status": tool_result.get("status"),
         }
 
     # ---------------------------------------------------------
@@ -4054,6 +4258,113 @@ def response_node(
         "missing_fields": missing_fields,
         "next_missing": next_missing,
     }
+
+# =========================================================
+# Phase 13 — Multi-Intent Presentation Coordination
+# =========================================================
+
+
+def _active_intent_for_response(state: GraphState) -> str | None:
+    """Resolve the coordinator-selected task without inferring user intent."""
+    candidates = (
+        state.get("active_intent"),
+        state.get("current_intent"),
+        (state.get("multi_intent") or {}).get("active_intent")
+        if isinstance(state.get("multi_intent"), dict)
+        else None,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _active_task_state(state: GraphState) -> GraphState:
+    """Project response context onto the active task when scoped data exists."""
+    projected = dict(state)
+    active_intent = _active_intent_for_response(state)
+    if active_intent:
+        projected["intent"] = active_intent
+
+    intent_entities = state.get("intent_entities")
+    if active_intent and isinstance(intent_entities, dict):
+        scoped_entities = intent_entities.get(active_intent)
+        projected["entities"] = dict(scoped_entities) if isinstance(scoped_entities, dict) else {}
+
+    multi_intent = state.get("multi_intent")
+    if isinstance(multi_intent, dict):
+        projected["multi_intent"] = dict(multi_intent)
+    return projected
+
+
+def _pending_intents_for_response(state: GraphState) -> list[Any]:
+    """Read queued work from coordinator state; do not infer or schedule tasks."""
+    multi_intent = state.get("multi_intent")
+    candidates = []
+    if isinstance(multi_intent, dict):
+        candidates.extend((multi_intent.get("pending_intents"), multi_intent.get("queue")))
+    candidates.append(state.get("pending_intents"))
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if item is not None and item != ""]
+    return []
+
+
+def response_node(state: GraphState) -> GraphState:
+    """Present the active task's result and expose coordinator state safely.
+
+    This wrapper does not advance the queue, mark a task complete, or assert
+    success. Those decisions belong to the orchestrator and backend results.
+    """
+    active_state = _active_task_state(state)
+    result = _response_node_single_intent(active_state)
+    if not isinstance(result, dict):
+        return result
+
+    active_intent = _active_intent_for_response(active_state)
+    pending_intents = _pending_intents_for_response(active_state)
+    multi_intent_state = active_state.get("multi_intent")
+    statuses = (
+        multi_intent_state.get("intent_statuses")
+        if isinstance(multi_intent_state, dict)
+        else active_state.get("intent_statuses")
+    )
+
+    metadata = result.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    if active_intent is not None or pending_intents:
+        orchestration_metadata = {
+            "active_intent": active_intent,
+            "pending_intents": pending_intents,
+        }
+        if isinstance(statuses, dict):
+            orchestration_metadata["intent_statuses"] = statuses
+        metadata["multi_intent"] = orchestration_metadata
+        result["metadata"] = metadata
+
+    # Acknowledge deferred work only while the active task is waiting for
+    # user input. Do not expose raw internal intent labels or claim completion.
+    waiting = bool(
+        result.get("awaiting_user_input")
+        or active_state.get("awaiting_user_input")
+        or active_state.get("orchestration_directive") in {"wait_for_input", "await_input"}
+    )
+    if pending_intents and waiting:
+        language = _response_language_for_generation(active_state)
+        acknowledgement = {
+            "english": " I’ll handle the remaining request(s) after we finish this step.",
+            "hindi": " Is step ke baad main aapki baaki request(s) bhi handle karunga.",
+            "hinglish": " Is step ke baad main aapki remaining request(s) bhi handle karunga.",
+        }.get(language, " I’ll handle the remaining request(s) after we finish this step.")
+        current_response = result.get("response")
+        if isinstance(current_response, str) and current_response.strip():
+            if acknowledgement.strip() not in current_response:
+                result["response"] = current_response.rstrip() + acknowledgement
+
+    result.setdefault("response_language", _response_language_for_generation(active_state))
+    return result
+
 
 # =========================================================
 # Backward-Compatible Public API
