@@ -167,7 +167,6 @@ def _get_missing_fields(
 
 
 def _has_value(value: Any) -> bool:
-    """Return whether a graph value is present and non-empty."""
     if value is None:
         return False
     if isinstance(value, str):
@@ -176,7 +175,6 @@ def _has_value(value: Any) -> bool:
 
 
 def _get_entities(state: GraphState) -> dict[str, Any]:
-    """Return a defensive entity-state mapping."""
     entities = state.get("entities")
     return dict(entities) if isinstance(entities, dict) else {}
 
@@ -206,9 +204,6 @@ def _get_intent(
 def _get_action(
     state: GraphState,
 ) -> str | None:
-    """
-    Read the action selected by Decision/Policy.
-    """
 
     candidates = (
         state.get("action"),
@@ -264,11 +259,6 @@ def _get_action(
 def _get_tool_name(
     state: GraphState,
 ) -> str | None:
-    """
-    Read the canonical tool name from state.
-
-    This does not execute anything.
-    """
 
     tool_name = _normalize_string(
         state.get("tool_name")
@@ -320,11 +310,6 @@ def _get_tool_name(
 def _is_awaiting_user_input(
     state: GraphState,
 ) -> bool:
-    """
-    Return True when Followup Node explicitly says
-    that the workflow is waiting for another user message.
-    """
-
     return bool(
         state.get(
             "awaiting_user_input"
@@ -340,16 +325,6 @@ def _is_awaiting_user_input(
 def _checkout_has_blocking_missing_field(
     state: GraphState,
 ) -> bool:
-    """
-    Determine whether checkout is missing a prerequisite
-    that must be supplied before backend checkout tools can
-    execute.
-
-    Product and quantity are hard prerequisites.
-
-    Address/payment are interactive checkout steps and can
-    legitimately trigger their corresponding selection tools.
-    """
 
     intent = _get_intent(
         state
@@ -362,10 +337,6 @@ def _checkout_has_blocking_missing_field(
     missing_fields = _get_missing_fields(
         state
     )
-
-    # -----------------------------------------------------
-    # Only apply this guard to order checkout flows.
-    # -----------------------------------------------------
 
     checkout_intent = intent in {
         "order_create",
@@ -386,13 +357,7 @@ def _checkout_has_blocking_missing_field(
     ):
         return False
 
-    # -----------------------------------------------------
-    # Product and quantity are hard prerequisites.
-    #
-    # We must NEVER load addresses/payment methods or
-    # execute create_order while either is missing.
-    # -----------------------------------------------------
-
+    
     blocking_fields = {
         "product_name",
         "quantity",
@@ -413,22 +378,6 @@ def _checkout_has_blocking_missing_field(
 def _tool_is_safe_to_execute(
     state: GraphState,
 ) -> bool:
-    """
-    Structural safety guard before Tool Node execution.
-
-    The Policy/Decision nodes remain authoritative for business
-    authorization.
-
-    This function only prevents obviously invalid graph routing.
-
-    In particular:
-
-        START_CHECKOUT
-            +
-        missing product/quantity
-            =
-        NEVER execute a backend tool.
-    """
 
     action = _get_action(
         state
@@ -438,23 +387,11 @@ def _tool_is_safe_to_execute(
         state
     )
 
-    # -----------------------------------------------------
-    # No tool = no tool execution.
-    # -----------------------------------------------------
-
     if not tool_name:
         return False
 
-    # -----------------------------------------------------
-    # Conversational actions are never tool-routed.
-    # -----------------------------------------------------
-
     if action in TOOLLESS_ACTIONS:
         return False
-
-    # -----------------------------------------------------
-    # Checkout prerequisite guard.
-    # -----------------------------------------------------
 
     if _checkout_has_blocking_missing_field(
         state
@@ -472,21 +409,6 @@ def _tool_is_safe_to_execute(
 def _route_after_followup(
     state: GraphState,
 ) -> str:
-    """
-    Route after Followup Node.
-
-    Followup Node owns the question/clarification decision.
-
-    If it says the system is waiting for user input,
-    Response Node must present that question.
-
-    Otherwise continue to Planner.
-    """
-
-    # Phase 13: when the active task in a multi-intent request is
-    # waiting for clarification, keep the entire graph on the response
-    # path. Do not let a queued secondary task run before the active task
-    # has received the required user input.
     queue = state.get("multi_intent_queue")
     active_index = state.get("active_intent_index")
     multi_status = _normalize_string(state.get("multi_intent_status"))
@@ -512,14 +434,12 @@ def _route_after_followup(
 
 
 def _route_after_multi_intent(state: GraphState) -> str:
-    """Send the coordinator's selected task through the normal graph path."""
     if state.get("orchestration_directive") == "execute_active_intent":
         return "active"
     return ROUTE_RESPONSE
 
 
 def _coordinate_after_response(state: GraphState) -> GraphState:
-    """Advance only after a task completes; retain tasks awaiting user input."""
     tool_result = state.get("tool_result")
     tool_data = getattr(tool_result, "data", None)
     tool_success = getattr(tool_result, "success", None)
@@ -584,7 +504,6 @@ def _coordinate_after_response(state: GraphState) -> GraphState:
 
 
 def _route_after_multi_intent_response(state: GraphState) -> str:
-    """Loop to the next task only when the coordinator selected one."""
     if state.get("orchestration_directive") == "execute_active_intent":
         return "active"
     return "end"
@@ -598,20 +517,6 @@ def _route_after_multi_intent_response(state: GraphState) -> str:
 def _route_after_decision(
     state: GraphState,
 ) -> str:
-    """
-    Route after Decision Node.
-
-    Decision Node is responsible for producing the authoritative
-    decision contract.
-
-    The graph performs structural safety checks before allowing
-    Tool Node execution.
-
-    Possible routes:
-
-        tool
-        response
-    """
 
     action = _get_action(
         state
@@ -621,10 +526,6 @@ def _route_after_decision(
         state
     )
 
-    # Product search is a read-only capability. Preserve the canonical
-    # search route when a legacy/partial decision payload omitted the
-    # top-level tool_name but the approved action and extracted product
-    # reference are already present.
     if (
         action == "SEARCH_PRODUCTS"
         and not tool_name
@@ -639,10 +540,6 @@ def _route_after_decision(
         state.get("decision_route")
     )
 
-    # -----------------------------------------------------
-    # 1. Conversational actions ALWAYS go to Response.
-    # -----------------------------------------------------
-
     if action in TOOLLESS_ACTIONS:
         print(
             "[GRAPH ROUTE]"
@@ -652,12 +549,6 @@ def _route_after_decision(
         )
 
         return ROUTE_RESPONSE
-
-    # -----------------------------------------------------
-    # 2. Explicit decision route.
-    #
-    # Only honor "tool" if structural safety passes.
-    # -----------------------------------------------------
 
     if decision_route:
         normalized_route = (
@@ -683,12 +574,6 @@ def _route_after_decision(
         if normalized_route == ROUTE_RESPONSE:
             return ROUTE_RESPONSE
 
-    # -----------------------------------------------------
-    # 3. Compatibility fallback.
-    #
-    # Some older Decision Nodes only populate tool_name.
-    # -----------------------------------------------------
-
     if tool_name:
 
         if _tool_is_safe_to_execute(
@@ -705,10 +590,6 @@ def _route_after_decision(
 
         return ROUTE_RESPONSE
 
-    # -----------------------------------------------------
-    # 4. No executable tool.
-    # -----------------------------------------------------
-
     return ROUTE_RESPONSE
 
 
@@ -720,15 +601,6 @@ def _route_after_decision(
 def _create_tool_wrapper(
     default_db: Any = None,
 ):
-    """
-    Create the Tool Node wrapper.
-
-    Runtime DB sessions are passed through invocation config so they are not
-    included in checkpointed graph state.
-
-    default_db remains supported for backwards compatibility.
-    """
-
     def _tool_wrapper(
         state: GraphState,
         config: RunnableConfig,
@@ -750,12 +622,6 @@ def _create_tool_wrapper(
         ):
             state = dict(state)
             state["tool_name"] = "search_products"
-
-        # -------------------------------------------------
-        # Defensive guard.
-        #
-        # This is the final protection before backend execution.
-        # -------------------------------------------------
 
         if not _tool_is_safe_to_execute(
             state
@@ -788,30 +654,6 @@ def build_graph(
     db: Any = None,
     checkpointer: Any = None,
 ):
-    """
-    Build and compile the BuyQK LangGraph workflow.
-    Supports durable Redis checkpointing with rolling 24h TTL.
-
-    Phase 2:
-        - checkout
-        - order creation
-        - tracking
-        - cancellation
-        - addresses
-        - payment
-        - product search
-        - conversation actions
-
-    Phase 3:
-        - add_to_cart
-        - remove_from_cart
-        - update_cart_item
-        - clear_cart
-        - show_cart
-        - checkout_cart
-
-    The graph itself contains only orchestration/routing logic.
-    """
 
     # =====================================================
     # State Graph
@@ -930,39 +772,7 @@ def build_graph(
     # =====================================================
     # Followup → Response OR Planner
     # =====================================================
-    #
-    # IMPORTANT FIX:
-    #
-    # If Followup Node determines that user input is required,
-    # Planner MUST NOT run.
-    #
-    # Example:
-    #
-    # User:
-    #     "Mujhe Amul Full Cream Milk chahiye"
-    #
-    # Entity:
-    #     missing_fields = ["product_name"]
-    #
-    # Followup:
-    #     awaiting_user_input = True
-    #
-    # Route:
-    #
-    #     Followup
-    #        ↓
-    #     Response
-    #
-    # NOT:
-    #
-    #     Followup
-    #        ↓
-    #     Planner
-    #        ↓
-    #     list_saved_addresses
-    #
-    # =====================================================
-
+    
     graph.add_conditional_edges(
         "followup",
         _route_after_followup,
@@ -1006,16 +816,7 @@ def build_graph(
     # =====================================================
     # Tool → Response
     # =====================================================
-    #
-    # CRITICAL:
-    #
-    # Every tool execution must pass through Response.
-    #
-    # This guarantees that the graph cannot finish after
-    # Tool Node without producing a user-facing response.
-    #
-    # =====================================================
-
+    
     graph.add_edge(
         "tool",
         "response",
@@ -1054,19 +855,6 @@ def build_graph(
         return graph.compile(checkpointer=checkpointer)
 
     return graph.compile()
-
-
-# =========================================================
-# Default Compiled Graph
-# =========================================================
-#
-# The default graph does not own a database session.
-#
-# Runtime callers should pass the DB session in invocation config:
-#
-#     config={"configurable": {"thread_id": session_id, "db": db}}
-#
-# =========================================================
 
 app = build_graph()
 
