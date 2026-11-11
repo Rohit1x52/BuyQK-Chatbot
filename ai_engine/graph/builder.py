@@ -1,73 +1,8 @@
-# =========================================================
-# BuyQK AI - Graph Builder
-# =========================================================
-#
-# Phase 3 Architecture + Phase 13 Multi-Intent Routing Foundation
-#
-# =========================================================
-#
-# WORKFLOW
-#
-# START
-#   ↓
-# context
-#   ↓
-# intent
-#   ↓
-# entity
-#   ↓
-# followup
-#   ├───────────────┐
-#   │               │
-#   │ awaiting      │ ready
-#   │ user input    │
-#   ↓               ↓
-# response        planner
-#                   ↓
-#                 policy
-#                   ↓
-#                 decision
-#                /        \
-#             tool       response
-#              ↓
-#           response
-#              ↓
-#             END
-#
-# =========================================================
-#
-# IMPORTANT
-#
-# The Graph Builder owns ONLY orchestration/routing.
-#
-# It does NOT:
-#
-#   - resolve products
-#   - validate stock
-#   - calculate prices
-#   - calculate taxes
-#   - calculate discounts
-#   - calculate delivery charges
-#   - modify cart state
-#   - create orders
-#   - modify backend state
-#
-# Those responsibilities remain inside:
-#
-#   Entity Node
-#   Planner Node
-#   Policy Node
-#   Decision Node
-#   Tool Node
-#   Backend Services
-#
-# =========================================================
-
-
 from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import (
     END,
     START,
@@ -788,18 +723,19 @@ def _create_tool_wrapper(
     """
     Create the Tool Node wrapper.
 
-    Runtime DB sessions are preferred from GraphState.
+    Runtime DB sessions are passed through invocation config so they are not
+    included in checkpointed graph state.
 
     default_db remains supported for backwards compatibility.
     """
 
     def _tool_wrapper(
         state: GraphState,
+        config: RunnableConfig,
     ) -> GraphState:
 
-        db = state.get(
-            "db"
-        )
+        configurable = config.get("configurable", {})
+        db = configurable.get("db") if isinstance(configurable, dict) else None
 
         if db is None:
             db = default_db
@@ -850,9 +786,11 @@ def _create_tool_wrapper(
 
 def build_graph(
     db: Any = None,
+    checkpointer: Any = None,
 ):
     """
     Build and compile the BuyQK LangGraph workflow.
+    Supports durable Redis checkpointing with rolling 24h TTL.
 
     Phase 2:
         - checkout
@@ -1102,8 +1040,18 @@ def build_graph(
     )
 
     # =====================================================
-    # Compile
+    # Compile with Durable Checkpointer
     # =====================================================
+
+    if checkpointer is None:
+        try:
+            from ai_engine.checkpointer.durable_redis_saver import get_durable_checkpointer
+            checkpointer = get_durable_checkpointer()
+        except Exception:
+            checkpointer = None
+
+    if checkpointer:
+        return graph.compile(checkpointer=checkpointer)
 
     return graph.compile()
 
@@ -1114,9 +1062,9 @@ def build_graph(
 #
 # The default graph does not own a database session.
 #
-# Runtime callers should inject:
+# Runtime callers should pass the DB session in invocation config:
 #
-#     state["db"] = db
+#     config={"configurable": {"thread_id": session_id, "db": db}}
 #
 # =========================================================
 
