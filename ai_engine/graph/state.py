@@ -1,211 +1,36 @@
-# =========================================================
-# BuyQK AI - Graph State
-# =========================================================
-#
-# Purpose:
-# Central state shared by all nodes in the BuyQK LangGraph.
-#
-# Architecture:
-#
-# User Message
-#       ↓
-# Context
-#       ↓
-# Entity Understanding
-#       ↓
-# Planner
-#       ↓
-# Policy
-#       ↓
-# Tool
-#       ↓
-# Backend Service
-#       ↓
-# Authoritative State
-#       ↓
-# Response
-#
-# The graph state contains conversational information and
-# backend-authoritative snapshots.
-#
-# IMPORTANT:
-#
-# AI is responsible for:
-#   - understanding language
-#   - understanding intent
-#   - resolving conversational references
-#   - identifying user goals
-#   - proposing actions
-#   - selecting capabilities/tools
-#   - generating responses
-#
-# Backend/business logic is responsible for:
-#   - product identity
-#   - product price
-#   - stock
-#   - quantity validation
-#   - cart persistence
-#   - cart calculations
-#   - address validation
-#   - payment validation
-#   - authorization
-#   - order creation
-#   - order ID
-#   - billing
-#   - taxes
-#   - discounts
-#   - delivery charges
-#   - final totals
-#   - cancellation/refund eligibility
-#   - transaction status
-#   - idempotency
-#
-# The AI must NEVER invent authoritative transactional values.
-#
-# =========================================================
-
-
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from typing_extensions import TypedDict
 
 from ai_engine.tools.results import ToolResult
 
-
 class GraphState(TypedDict, total=False):
-
-    # =========================================================
-    # USER INPUT
-    # =========================================================
-
-    # Current raw user message.
     message: str
-
-    # Conversation/session identifier.
     session_id: str
-
-    # Authenticated application user ID.
     user_id: int
-
-    # =========================================================
-    # CONTEXT LOADER
-    # =========================================================
-
-    # Context assembled for the AI.
-    #
-    # This may contain:
-    #   - current message
-    #   - conversation history
-    #   - checkout state
-    #   - cart state
-    #   - order state
-    #   - product references
-    #   - backend results
-    #
-    # Context is informational.
-    # It does not replace backend authority.
     context: dict[str, Any]
 
-    # =========================================================
-    # CONVERSATION HISTORY
-    # =========================================================
-
     conversation_history: list[dict[str, Any]]
-
-    # =========================================================
-    # CONVERSATION / TASK MEMORY - PHASE 1
-    # =========================================================
-
-    # Current conversational task selected by the AI workflow.
-    #
-    # Examples:
-    #
-    #   product_search
-    #   order_create
-    #   order_tracking
-    #   order_cancel
-    #   customer_support
-    #   cart
-    #   general
-    #
     active_task: str | None
-
-    # Lifecycle of the current conversational task.
-    #
-    # Examples:
-    #
-    #   idle
-    #   active
-    #   collecting
-    #   executing
-    #   completed
-    #   failed
-    #
     task_status: str | None
-
-    # Last authoritative execution result exposed to the
-    # conversation layer.
     execution_result: Any
-
-    # Currently selected product reference for conversational
-    # continuity.
-    #
-    # Product identity remains backend-authoritative once
-    # resolved.
-    #
-    # Example:
-    #
-    # {
-    #     "product_id": 10,
-    #     "product_name": "Tata Tea"
-    # }
-    #
     selected_product: dict[str, Any] | None
-
-    # =========================================================
-    # PRODUCT SEARCH / SELECTION - PHASE 6B
-    # =========================================================
-
-    # Normalized product candidates returned by product search.
-    #
-    # These are backend-derived candidates used for conversational
-    # product selection. They are not authoritative until a product
-    # is resolved/validated by the backend.
     product_search_results: list[dict[str, Any]]
-
-    # =========================================================
-    # COMMERCE VERTICAL - PHASE 10
-    # =========================================================
-
-    # Current commerce vertical understood from the conversation.
-    # Examples: grocery, food, medicine, electronics.
-    # This is conversational routing context; backend remains
-    # authoritative for product/merchant identity and availability.
     commerce_vertical: str | None
     comparison_product_ids: list[int]
-
-    # Restaurant/merchant context used by food ordering.
     restaurant_id: int | None
     restaurant_name: str | None
     menu_id: int | None
     menu_items: list[dict[str, Any]]
-
-    # Pharmacy/prescription context used by medicine ordering.
     pharmacy_id: int | None
     pharmacy_name: str | None
     prescription_required: bool | None
     prescription_status: str | None
-
-    # Electronics product intelligence.
     product_specifications: dict[str, Any] | None
     product_variants: list[dict[str, Any]]
     comparison_results: list[dict[str, Any]]
-
-    # =========================================================
-    # SERVICE BOOKING - PHASE 11
-    # =========================================================
     service_id: int | None
     service_name: str | None
     booking_date: str | None
@@ -219,10 +44,6 @@ class GraphState(TypedDict, total=False):
     booking_status: str | None
     payment_status: str | None
 
-    # =========================================================
-    # MERCHANT ONBOARDING - PHASE 12
-    # =========================================================
-
     merchant_id: int | None
     merchant_business_name: str | None
     merchant_category: str | None
@@ -233,540 +54,97 @@ class GraphState(TypedDict, total=False):
     merchant_verification_status: str | None
     merchant_approval_status: str | None
 
-    # =========================================================
-    # RIDER ONBOARDING - PHASE 12
-    # =========================================================
-
     rider_id: int | None
     rider_name: str | None
     rider_phone: str | None
     rider_vehicle_type: str | None
     rider_documents: list[dict[str, Any]]
-
-    # Backend-safe status/reference information only; raw bank
-    # credentials must not be placed into LLM prompts.
     rider_bank_details: dict[str, Any] | None
     rider_verification_status: str | None
     rider_approval_status: str | None
-
-    # =========================================================
-    # AI UNDERSTANDING
-    # =========================================================
-
-    # Semantic intent understood from the conversation.
-    #
-    # Examples:
-    #
-    #   general
-    #   product_search
-    #   cart
-    #   order_create
-    #   order_tracking
-    #   order_cancel
-    #   customer_support
-    #   order_modify
-    #
     intent: str
-
-    # User's underlying conversational goal.
     user_goal: str | None
-
-    # Detected language.
-    #
-    # Examples:
-    #   en
-    #   hi
-    #   hinglish
     detected_language: str | None
-
-    # Conversational references resolved by AI.
     references: dict[str, Any]
-
-    # =========================================================
-    # ACCUMULATED ENTITIES
-    # =========================================================
-
-    # Semantic information accumulated across turns.
-    #
-    # Example:
-    #
-    # {
-    #     "product_id": 9,
-    #     "product_name": "Maggi",
-    #     "quantity": 3,
-    # }
-    #
-    # These values are not automatically authoritative.
     entities: dict[str, Any]
-
-    # Canonical multi-product order request understood from
-    # the user.
-    #
-    # Product IDs remain backend-authoritative and are resolved
-    # later.
     order_items: list[dict[str, Any]]
-
-    # Information currently missing from the conversation
-    # or current transaction.
     missing_fields: list[str]
-
-    # =========================================================
-    # FOLLOW-UP / MISSING-INFORMATION STATE - PHASE 2
-    # =========================================================
-
-    # The single field currently being collected.
     current_missing_field: str | None
-
-    # Natural-language question generated for that field.
     follow_up_question: str | None
-
-    # True only while the graph is waiting for the user's answer.
     awaiting_user_input: bool
-
-    # Compatibility alias used by the frontend/memory layer.
     next_missing: str | None
-
-    # =========================================================
-    # AI PLANNER
-    # =========================================================
-
-    # Planner proposal.
-    #
-    # Example:
-    #
-    # {
-    #     "action": "ADD_CART_ITEM",
-    #     "tool": "add_cart_item",
-    #     "arguments": {
-    #         "product_id": 10,
-    #         "quantity": 2
-    #     },
-    #     "confidence": 0.97
-    # }
-    #
-    # This is only a proposal.
     planner_decision: dict[str, Any]
-
-    # Canonical planner result returned by planner_node.
-    #
-    # planner_node currently writes:
-    #
-    #     planner
-    #     planner_args
-    #
-    # Keep these fields explicitly represented in GraphState so
-    # the planner -> policy -> decision -> tool contract is typed.
     planner: dict[str, Any]
-
-    # Canonical planner arguments consumed by downstream nodes.
     planner_args: dict[str, Any]
-
-    # Proposed capability/action.
-    #
-    # Existing Phase 2 actions:
-    #
-    #   SEARCH_PRODUCT
-    #   START_CHECKOUT
-    #   CONTINUE_CHECKOUT
-    #   SELECT_ADDRESS
-    #   SELECT_PAYMENT
-    #   CREATE_ORDER
-    #   TRACK_ORDER
-    #   CANCEL_ORDER
-    #   MODIFY_ORDER
-    #   SUPPORT
-    #   ANSWER
-    #   ASK_CLARIFICATION
-    #   CONFIRM
-    #   END_CONVERSATION
-    #
-    # Phase 3 cart actions:
-    #
-    #   ADD_CART_ITEM
-    #   REMOVE_CART_ITEM
-    #   UPDATE_CART_ITEM
-    #   CLEAR_CART
-    #   SHOW_CART
-    #   CHECKOUT_CART
-    #
     planned_action: str | None
-
-    # Proposed tool.
     planned_tool: str | None
-
-    # Arguments proposed by planner.
     planned_arguments: dict[str, Any]
-
-    # Informational planner confidence.
-    #
-    # This must never override backend validation.
     planner_confidence: float | None
-
-    # =========================================================
-    # POLICY / VALIDATION
-    # =========================================================
-
-    # Result of policy validation.
     policy_result: dict[str, Any]
-
-    # Executable route produced by decision_node.
-    # This is routing state, not business logic.
     decision_route: str | None
-
-    # Structured policy error.
     policy_error: dict[str, Any] | None
-
-    # =========================================================
-    # CART STATE - PHASE 3
-    # =========================================================
-
-    # Persistent cart identifier.
     cart_id: int | None
-
-    # Current cart lifecycle status.
-    #
-    # Typical values:
-    #
-    #   active
-    #   empty
-    #   checked_out
-    #   abandoned
-    #
-    # Exact values are controlled by backend services.
     cart_status: str | None
-
-    # Current backend-authoritative cart items.
-    #
-    # Example:
-    #
-    # [
-    #     {
-    #         "id": 1,
-    #         "product_id": 10,
-    #         "product_name": "Maggi",
-    #         "quantity": 3,
-    #         "unit_price": 15,
-    #         "line_total": 45
-    #     }
-    # ]
-    #
-    # Values such as price and stock must come from backend
-    # services, not from the LLM.
     cart_items: list[dict[str, Any]]
-
-    # Backend-authoritative cart calculation.
     cart_summary: dict[str, Any] | None
-
-    # Requested cart operation.
-    #
-    # Examples:
-    #
-    #   add_item
-    #   remove_item
-    #   update_quantity
-    #   clear_cart
-    #   show_cart
-    #   checkout
-    #
     cart_action: str | None
-
-    # Authoritative result returned by Cart Service.
     cart_result: dict[str, Any] | None
-
-    # Whether the backend says the current cart is ready
-    # for checkout.
     cart_checkout_ready: bool
-
-    # =========================================================
-    # CHECKOUT / TRANSACTION IDENTITY
-    # =========================================================
-
-    # Unique checkout transaction identifier.
-    #
-    # checkout_id is NOT the cart ID.
-    # checkout_id is NOT the order ID.
     checkout_id: str | None
-
-    # =========================================================
-    # CHECKOUT STATUS
-    # =========================================================
-
-    # Typical lifecycle:
-    #
-    #   collecting
-    #       ↓
-    #   ready
-    #       ↓
-    #   creating
-    #       ↓
-    #   completed
-    #
-    # Other possible states:
-    #
-    #   failed
-    #   cancelled
     checkout_status: str | None
-
-    # =========================================================
-    # CHECKOUT SELECTION - FRONTEND INPUT
-    # =========================================================
-
-    # Address selected by frontend/user.
-    #
-    # Backend must verify ownership and validity.
     selected_address_id: int | None
-
-    # Payment method selected by frontend/user.
-    #
-    # Backend must verify availability and validity.
     selected_payment_method: str | None
-
-    # Backward-compatible alias.
     payment_method: str | None
-
-    # =========================================================
-    # DATABASE
-    # =========================================================
-
-    # SQLAlchemy session.
-    #
-    # Infrastructure state only.
-    # Never expose this to the LLM.
     db: Any
-
-    # =========================================================
-    # PRODUCT RESOLUTION
-    # =========================================================
-
-    # Natural-language product reference.
     product_name: str | None
-
-    # Authoritative product ID.
     product_id: int | None
-
-    # =========================================================
-    # QUANTITY
-    # =========================================================
-
-    # Quantity understood/requested for the current operation.
-    #
-    # Backend validates final quantity against stock.
     quantity: int | None
-
-    # =========================================================
-    # GROCERY ORDER DETAILS - PHASE 6A
-    # =========================================================
-
-    # Optional product size requested by the user.
-    # This is conversational input; backend/product resolution
-    # remains authoritative.
     size: str | None
-
-    # Optional product variant requested by the user.
-    # This is conversational input; it does not identify a
-    # backend product by itself.
     variant: str | None
-
-    # User's requested delivery preference.
-    # Actual delivery availability/time is backend-authoritative.
     delivery_preference: str | None
-
-    # =========================================================
-    # SELECTED ADDRESS
-    # =========================================================
-
-    # Authoritative address ID used by checkout.
     address_id: int | None
-
-    # =========================================================
-    # NEW ADDRESS INPUT - PHASE 7A
-    # =========================================================
-
-    # User-provided fields used only when creating a new address.
-    # Backend address identity is created by the address service.
     address_action: str | None
     address_label: str | None
     address_line_2: str | None
     address_city: str | None
     address_state: str | None
     address_postal_code: str | None
-
-    # =========================================================
-    # SELECTED PAYMENT
-    # =========================================================
-
-    # Backend-normalized payment method.
     selected_payment_method_normalized: str | None
-
-    # =========================================================
-    # TOOL EXECUTION
-    # =========================================================
-
-    # Actual tool selected after policy validation.
     tool_name: str | None
-
-    # Authoritative result returned by backend/tool.
-    #
-    # May contain:
-    #   - products
-    #   - cart
-    #   - order
-    #   - billing
-    #   - tracking
-    #   - support
-    #   - validation errors
-    tool_result: ToolResult | None
-
-    # =========================================================
-    # ORDER STATE
-    # =========================================================
-
-    # Backend-created order ID.
-    #
-    # NEVER generated by AI.
+    tool_result: ToolResult | dict[str, Any] | None
     order_id: int | None
-
-    # Whether an order has successfully been created.
     order_created: bool
-
-    # Whether order creation has already been attempted.
     order_creation_attempted: bool
-
-    # Whether checkout reached a terminal state.
     checkout_completed: bool
-
-    # Whether the AI is waiting for tracking confirmation.
     awaiting_order_tracking_confirmation: bool
-
-    # User-provided cancellation reason.
-    # This is conversational input only; the backend does not infer it.
     cancellation_reason: str | None
-
-    # Cancellation workflow state.
     cancellation_eligibility: dict[str, Any] | None
     refund_eligibility: dict[str, Any] | None
-
-    # True while the graph is waiting for the cancellation reason
-    # after backend eligibility has been confirmed.
     awaiting_cancellation_reason: bool
-
-    # =========================================================
-    # TRANSACTION ERROR
-    # =========================================================
-
-    # Structured backend transaction error.
     transaction_error: dict[str, Any] | None
-
-    # =========================================================
-    # CUSTOMER SUPPORT - PHASE 9
-    # =========================================================
-
-    # Current support issue category understood from the user.
-    # Examples: wrong_product, payment_failure, delivery_delay,
-    # refund_status, human_escalation, general_support.
     support_issue_type: str | None
-
-    # Natural-language description of the support issue.
     support_description: str | None
-
-    # Payment transaction/reference identifier when supplied.
     support_transaction_id: str | None
-
-    # Evidence supplied by the user (normally an uploaded image/document URL).
     support_evidence_url: str | None
-
-    # Backend-authoritative support verification result.
     support_verification: dict[str, Any] | None
-
-    # Whether backend verification resolved the issue without escalation.
     support_resolved: bool
-
-    # Ticket reference returned by the backend after ticket creation.
     support_ticket_id: int | None
-
-    # Human-readable ticket reference, e.g. SUP10231.
     support_ticket_reference: str | None
-
-    # Current support lifecycle status.
     support_status: str | None
-
-    # Whether the support flow requires human escalation.
     support_escalation_required: bool
-
-    # =========================================================
-    # BILLING
-    # =========================================================
-
-    # Primary authoritative billing object.
     billing: dict[str, Any]
-
-    # Backward-compatible billing alias.
     bill: dict[str, Any]
-
-    # Backend-returned billing items.
     billing_items: list[dict[str, Any]]
-
-    # =========================================================
-    # BILLING AMOUNTS
-    # =========================================================
-
-    # Convenience projections of backend billing.
     subtotal: float | None
     delivery_charge: float | None
     discount: float | None
     tax: float | None
     total_amount: float | None
-
-    # Backend-returned currency.
     currency: str | None
-
-    # Backend-normalized payment method associated with order.
     billing_payment_method: str | None
-
-    # =========================================================
-    # FINAL RESPONSE
-    # =========================================================
-
-    # Final natural-language response.
     response: str
-
-    # =========================================================
-    # FRONTEND / GRAPH METADATA
-    # =========================================================
-
-    # Structured metadata consumed by frontend.
-    #
-    # Examples:
-    #
-    #   cart
-    #   cart_updated
-    #   cart_empty
-    #   checkout
-    #   address_selection
-    #   payment_selection
-    #   product_search
-    #   order_success
-    #   tracking
-    #   error
-    #
-    # Metadata must come from actual graph/backend state.
     metadata: dict[str, Any]
-
-    # =========================================================
-    # MULTI-INTENT ORCHESTRATION - PHASE 13
-    # =========================================================
-    # The intent/entity/planner nodes must populate/use these fields.
-    # This schema alone does not classify multiple intents.
-    #
-    # detected_intents: ordered intents detected in the current request.
-    # multi_intent_queue: ordered tasks; each item is a JSON-safe dict.
-    # active_intent: intent currently being handled by the graph.
-    # active_intent_index: index into multi_intent_queue.
-    # multi_intent_status: idle | active | waiting | completed | failed.
-    # multi_intent_initialized: prevents rebuilding the queue every turn.
-    # multi_intent_results: completed/failed task summaries, based only on
-    # backend/tool outcomes and never fabricated by the orchestration layer.
-    detected_intents: list[dict[str, Any]]
+    detected_intents: list[str | dict[str, Any]]
     intent_entities: dict[str, dict[str, Any]]
     intent_statuses: dict[str, str]
     pending_intents: list[str]
@@ -781,3 +159,92 @@ class GraphState(TypedDict, total=False):
     multi_intent_results: list[dict[str, Any]]
     active_intent_message: str | None
     multi_intent_error: str | None
+
+    current_intent: str | None
+    action: str | None
+    decision_action: str | None
+    decision: dict[str, Any] | None
+    tool_args: dict[str, Any]
+    task_completed: bool
+    task_failed: bool
+    followup_required: bool
+    requires_confirmation: bool
+    user_confirmed: bool
+
+    state_version: int
+    state_schema_version: int
+    state_validation_errors: list[dict[str, Any]]
+    state_warnings: list[dict[str, Any]]
+    state_updated_at: str | None
+
+    task_id: str | None
+    task_ids: list[str]
+    task_graph: list[dict[str, Any]]
+    task_dependencies: dict[str, list[str]]
+    task_outputs: dict[str, Any]
+    task_errors: dict[str, Any]
+    task_attempts: dict[str, int]
+    ready_tasks: list[str]
+    running_tasks: list[str]
+    blocked_tasks: list[str]
+    cancelled_tasks: list[str]
+    task_execution_order: list[str]
+    task_execution_mode: Literal["sequential", "parallel"] | None
+    task_scheduler_status: str | None
+    task_deadlock_detected: bool
+    task_cycle_detected: bool
+
+    execution_id: str | None
+    parent_execution_id: str | None
+    idempotency_key: str | None
+    execution_started_at: str | None
+    execution_completed_at: str | None
+    execution_status: str | None
+    execution_attempt: int
+    execution_timeout_seconds: float | None
+    execution_metadata: dict[str, Any]
+
+    error_class: str | None
+    error_code: str | None
+    error_message: str | None
+    error_details: dict[str, Any]
+    error_retryable: bool
+    recovery_action: str | None
+    recovery_status: str | None
+    retry_count: int
+    max_retries: int
+    retry_after_seconds: float | None
+    fallback_used: bool
+    escalation_required: bool
+
+    interrupt_id: str | None
+    interrupt_type: str | None
+    interrupt_reason: str | None
+    interrupt_payload: dict[str, Any]
+    interrupt_status: str | None
+    resume_value: Any
+    resume_from_node: str | None
+    checkpoint_namespace: str | None
+    confirmation_type: str | None
+    confirmation_payload: dict[str, Any]
+    confirmation_expires_at: str | None
+
+    tool_registry_version: str | None
+    tool_execution_id: str | None
+    tool_timeout_seconds: float | None
+    tool_retry_count: int
+    tool_idempotency_key: str | None
+    tool_authorization: dict[str, Any]
+    tool_validation_errors: list[dict[str, Any]]
+    tool_audit: list[dict[str, Any]]
+
+    conversation_id: str | None
+    correlation_id: str | None
+    trace_id: str | None
+    span_id: str | None
+    current_node: str | None
+    node_execution_history: list[dict[str, Any]]
+    graph_started_at: str | None
+    graph_completed_at: str | None
+    graph_error: dict[str, Any] | None
+    metrics: dict[str, Any]
