@@ -1,62 +1,9 @@
-# =========================================================
-# BuyQK AI - Graph Runner
-# =========================================================
-#
-# Purpose:
-# Public entry point for executing the BuyQK AI graph.
-#
-#
-# FastAPI
-#    ↓
-# run_chat()
-#    ↓
-# Load conversation memory
-#    ↓
-# Restore persistent conversation state
-#    ↓
-# Build GraphState
-#    ↓
-# LangGraph
-#    ↓
-# Context
-#    ↓
-# Intent
-#    ↓
-# Entity
-#    ↓
-# Planner
-#    ↓
-# Policy
-#    ↓
-# Decision
-#    ↓
-# Tool
-#    ↓
-# Response
-#    ↓
-# Save conversation state
-#    ↓
-# Response
-#
-# =========================================================
-#
-# MEMORY ARCHITECTURE
-#
-# Redis / in-memory memory:
-#
-#     Short-term conversational state
-#
-# SQLite:
-#
-#     Authoritative transactional state
-#
-# =========================================================
-
-
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+
+import logging
 
 from sqlalchemy.orm import Session
 
@@ -65,28 +12,13 @@ from ai_engine.memory.redis_memory import conversation_memory
 from ai_engine.tools.results import ToolResult
 
 
-# =========================================================
-# Configuration
-# =========================================================
-
 MEMORY_MESSAGE_LIMIT = 10
 
+logger = logging.getLogger("buyqk.runner")
 
-# =========================================================
-# Persisted Graph State
-# =========================================================
-#
-# These fields survive between HTTP requests.
-#
-# The runner does not calculate them.
-# It only restores values that the graph previously produced.
-#
-# =========================================================
 
 PERSISTED_STATE_FIELDS = (
-    # -----------------------------------------------------
-    # Checkout
-    # -----------------------------------------------------
+
 
     "checkout_id",
     "checkout_status",
@@ -95,9 +27,6 @@ PERSISTED_STATE_FIELDS = (
     "checkout_completed",
     "order_id",
 
-    # -----------------------------------------------------
-    # Product
-    # -----------------------------------------------------
 
     "product_id",
     "product_name",
@@ -105,9 +34,6 @@ PERSISTED_STATE_FIELDS = (
     "selected_product",
     "product_search_results",
 
-    # -----------------------------------------------------
-    # Address
-    # -----------------------------------------------------
 
     "address_id",
     "selected_address_id",
@@ -118,23 +44,14 @@ PERSISTED_STATE_FIELDS = (
     "address_state",
     "address_postal_code",
 
-    # -----------------------------------------------------
-    # Delivery
-    # -----------------------------------------------------
 
     "delivery_preference",
 
-    # -----------------------------------------------------
-    # Payment
-    # -----------------------------------------------------
 
     "selected_payment_method",
     "payment_method",
     "billing_payment_method",
 
-    # -----------------------------------------------------
-    # Billing
-    # -----------------------------------------------------
 
     "bill",
     "billing",
@@ -147,16 +64,10 @@ PERSISTED_STATE_FIELDS = (
     "total_amount",
     "currency",
 
-    # -----------------------------------------------------
-    # Transaction / Tool
-    # -----------------------------------------------------
 
     "tool_name",
     "execution_result",
 
-    # -----------------------------------------------------
-    # Planner / Context
-    # -----------------------------------------------------
 
     "context",
     "planner",
@@ -167,9 +78,6 @@ PERSISTED_STATE_FIELDS = (
     "planned_arguments",
     "planner_confidence",
 
-    # -----------------------------------------------------
-    # Policy / Decision
-    # -----------------------------------------------------
 
     "policy_result",
     "policy_error",
@@ -177,33 +85,22 @@ PERSISTED_STATE_FIELDS = (
     "decision",
     "decision_route",
 
-    # -----------------------------------------------------
-    # Tool arguments
-    # -----------------------------------------------------
 
     "tool_args",
 
-    # -----------------------------------------------------
-    # Tracking
-    # -----------------------------------------------------
 
     "order_reference",
     "order_reference_type",
     "awaiting_order_tracking_order_id",
     "awaiting_order_tracking_confirmation",
 
-    # -----------------------------------------------------
-    # Cancellation
-    # -----------------------------------------------------
 
     "cancellation_reason",
     "cancellation_eligibility",
     "refund_eligibility",
     "awaiting_cancellation_reason",
 
-    # -----------------------------------------------------
-    # Phase 13 Multi-Intent Orchestration
-    # -----------------------------------------------------
+
     "detected_intents",
     "intent_entities",
     "intent_statuses",
@@ -218,49 +115,100 @@ PERSISTED_STATE_FIELDS = (
     "multi_intent_results",
     "active_intent_message",
     "multi_intent_error",
+    "current_intent",
+    "intent",
+    "task_id",
+    "task_ids",
+    "task_graph",
+    "task_dependencies",
+    "task_outputs",
+    "task_errors",
+    "task_attempts",
+    "ready_tasks",
+    "running_tasks",
+    "blocked_tasks",
+    "cancelled_tasks",
+    "task_execution_order",
+    "task_execution_mode",
+    "task_scheduler_status",
+    "task_deadlock_detected",
+    "task_cycle_detected",
+    "task_outcome",
+    "task_completed",
+    "task_failed",
+    "requires_confirmation",
+    "user_confirmed",
+    "interrupt_id",
+    "interrupt_type",
+    "interrupt_reason",
+    "interrupt_payload",
+    "interrupt_status",
+    "resume_from_node",
+    "checkpoint_id",
+    "checkpoint_namespace",
+    "confirmation_type",
+    "confirmation_payload",
+    "confirmation_expires_at",
+    "execution_id",
+    "parent_execution_id",
+    "idempotency_key",
+    "execution_status",
+    "execution_attempt",
+    "error_class",
+    "error_code",
+    "error_message",
+    "error_details",
+    "error_retryable",
+    "recovery_action",
+    "recovery_status",
+    "retry_count",
+    "max_retries",
+    "retry_after_seconds",
+    "fallback_used",
+    "escalation_required",
+    "tool_execution_id",
+    "tool_idempotency_key",
+    "tool_authorization",
+    "tool_validation_errors",
+    "tool_audit",
+    "conversation_id",
+    "correlation_id",
+    "trace_id",
+    "span_id",
+    "current_node",
+    "node_execution_history",
+    "execution_metadata",
 
-    # -----------------------------------------------------
-    # Phase 1 conversation/task memory
-    # -----------------------------------------------------
 
     "active_task",
     "task_status",
 
-    # -----------------------------------------------------
-    # Phase 2 follow-up state
-    # -----------------------------------------------------
 
     "current_missing_field",
     "follow_up_question",
     "awaiting_user_input",
     "next_missing",
 
-    # -----------------------------------------------------
-    # Phase 10 Commerce Verticals
-    # -----------------------------------------------------
 
     "commerce_vertical",
 
-    # Food
+
     "restaurant_id",
     "restaurant_name",
     "menu_id",
     "menu_items",
 
-    # Medicine
+
     "pharmacy_id",
     "pharmacy_name",
     "prescription_required",
     "prescription_status",
 
-    # Electronics
+
     "product_specifications",
     "product_variants",
     "comparison_results",
 
-    # -----------------------------------------------------
-    # Phase 11 Service Booking
-    # -----------------------------------------------------
 
     "service_id",
     "service_name",
@@ -275,23 +223,14 @@ PERSISTED_STATE_FIELDS = (
     "booking_status",
     "payment_status",
 
-    # -----------------------------------------------------
-    # AI understanding
-    # -----------------------------------------------------
 
     "user_goal",
     "detected_language",
     "references",
 
-    # -----------------------------------------------------
-    # Order request
-    # -----------------------------------------------------
 
     "order_items",
 
-    # -----------------------------------------------------
-    # Cart state
-    # -----------------------------------------------------
 
     "cart_id",
     "cart_status",
@@ -301,15 +240,9 @@ PERSISTED_STATE_FIELDS = (
     "cart_result",
     "cart_checkout_ready",
 
-    # -----------------------------------------------------
-    # Transaction error
-    # -----------------------------------------------------
 
     "transaction_error",
 
-    # -----------------------------------------------------
-    # Phase 9 Customer Support
-    # -----------------------------------------------------
 
     "support_issue_type",
     "support_description",
@@ -322,9 +255,6 @@ PERSISTED_STATE_FIELDS = (
     "support_status",
     "support_escalation_required",
 
-    # -----------------------------------------------------
-    # Phase 12 Merchant Onboarding
-    # -----------------------------------------------------
 
     "merchant_id",
     "business_name",
@@ -340,9 +270,6 @@ PERSISTED_STATE_FIELDS = (
     "merchant_verification_status",
     "merchant_approval_status",
 
-    # -----------------------------------------------------
-    # Phase 12 Rider Onboarding
-    # -----------------------------------------------------
 
     "rider_id",
     "name",
@@ -358,8 +285,7 @@ PERSISTED_STATE_FIELDS = (
     "rider_verification_status",
     "rider_approval_status",
 
-    # Shared onboarding fields used by planner/tool contracts.
-    # Values are persisted only when the graph supplies them.
+
     "documents",
     "document_type",
     "document_reference",
@@ -369,20 +295,9 @@ PERSISTED_STATE_FIELDS = (
 )
 
 
-# =========================================================
-# Utility Functions
-# =========================================================
-
-
 def _safe_dict(
     value: Any,
 ) -> dict[str, Any]:
-    """
-    Return a defensive dictionary copy.
-
-    Prevents accidental mutation of memory objects.
-    """
-
     if not isinstance(
         value,
         dict,
@@ -397,10 +312,6 @@ def _safe_dict(
 def _safe_list(
     value: Any,
 ) -> list[Any]:
-    """
-    Return a defensive list copy.
-    """
-
     if not isinstance(
         value,
         list,
@@ -415,10 +326,6 @@ def _safe_list(
 def _extract_message_metadata(
     message: Any,
 ) -> dict[str, Any]:
-    """
-    Extract metadata from a stored conversation message.
-    """
-
     if not isinstance(
         message,
         dict,
@@ -434,32 +341,12 @@ def _extract_message_metadata(
     )
 
 
-# =========================================================
-# Restore Previous Graph State
-# =========================================================
-
-
 def _restore_previous_state(
     conversation_history: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """
-    Restore the most recent graph state stored in conversation
-    memory.
-
-    The assistant message metadata is used as the short-term
-    graph-state snapshot.
-
-    SQLite remains authoritative for transactional facts.
-
-    This function does NOT calculate or infer state.
-    """
-
     if not conversation_history:
         return {}
 
-    # -----------------------------------------------------
-    # Find the most recent assistant message.
-    # -----------------------------------------------------
 
     for message in reversed(
         conversation_history
@@ -485,9 +372,6 @@ def _restore_previous_state(
 
         restored: dict[str, Any] = {}
 
-        # -------------------------------------------------
-        # Direct persisted fields
-        # -------------------------------------------------
 
         for field in PERSISTED_STATE_FIELDS:
 
@@ -497,9 +381,6 @@ def _restore_previous_state(
                     metadata[field]
                 )
 
-        # -------------------------------------------------
-        # Entity state
-        # -------------------------------------------------
 
         entities = metadata.get(
             "entities"
@@ -516,9 +397,6 @@ def _restore_previous_state(
                 entities
             )
 
-        # -------------------------------------------------
-        # Missing fields
-        # -------------------------------------------------
 
         missing_fields = metadata.get(
             "missing_fields"
@@ -535,9 +413,6 @@ def _restore_previous_state(
                 missing_fields
             )
 
-        # -------------------------------------------------
-        # Next missing field
-        # -------------------------------------------------
 
         if (
             "next_missing"
@@ -550,9 +425,6 @@ def _restore_previous_state(
                 "next_missing"
             ]
 
-        # -------------------------------------------------
-        # Frontend metadata
-        # -------------------------------------------------
 
         frontend_metadata = metadata.get(
             "frontend_metadata"
@@ -574,17 +446,11 @@ def _restore_previous_state(
     return {}
 
 
-# =========================================================
-# Build Initial State
-# =========================================================
-
-
 def _build_initial_state(
     *,
     message: str,
     session_id: str,
     user_id: int,
-    db: Session,
     conversation_history: list[dict[str, Any]],
     previous_state: dict[str, Any],
     selected_address_id: int | None,
@@ -594,28 +460,10 @@ def _build_initial_state(
     commerce_vertical: str | None = None,
     comparison_product_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """
-    Build the GraphState for the current request.
-
-    Previous state is restored first.
-
-    Current request data is then applied on top.
-
-    Frontend-authoritative selections override previous
-    selections only when explicitly supplied.
-    """
-
-    # =====================================================
-    # Start with restored state
-    # =====================================================
-
     state: dict[str, Any] = deepcopy(
         previous_state
     )
 
-    # =====================================================
-    # Current Checkout ID
-    # =====================================================
 
     if (
         checkout_id is not None
@@ -628,11 +476,7 @@ def _build_initial_state(
             checkout_id
         ).strip()
 
-    # =====================================================
-    # Current Support Evidence
-    # =====================================================
-    # The API/frontend may provide an already-uploaded evidence URL.
-    # The runner only transports it; it never interprets or validates it.
+
     if evidence_url is not None and str(evidence_url).strip():
         state["support_evidence_url"] = str(evidence_url).strip()
 
@@ -646,18 +490,15 @@ def _build_initial_state(
     if comparison_product_ids is not None:
         state["comparison_product_ids"] = list(comparison_product_ids)
 
-    # =====================================================
-    # Current User Input
-    # =====================================================
 
     state[
         "message"
     ] = message
 
-    # These are turn-scoped signals. A previous response may have been
-    # waiting for input, but the current turn must be processed.
+
     state["awaiting_user_input"] = False
     state["task_outcome"] = None
+    state["interrupt_status"] = None
 
     state[
         "session_id"
@@ -667,25 +508,11 @@ def _build_initial_state(
         "user_id"
     ] = user_id
 
-    # =====================================================
-    # Database
-    # =====================================================
-
-    state[
-        "db"
-    ] = db
-
-    # =====================================================
-    # Conversation History
-    # =====================================================
 
     state[
         "conversation_history"
     ] = conversation_history
 
-    # =====================================================
-    # Entity State
-    # =====================================================
 
     state[
         "entities"
@@ -696,15 +523,6 @@ def _build_initial_state(
         )
     )
 
-    # =====================================================
-    # Current Frontend Address Selection
-    # =====================================================
-    #
-    # None means the frontend did not provide a new selection.
-    #
-    # Therefore an existing address is not erased.
-    #
-    # =====================================================
 
     if selected_address_id is not None:
 
@@ -716,9 +534,6 @@ def _build_initial_state(
             "address_id"
         ] = selected_address_id
 
-    # =====================================================
-    # Current Frontend Payment Selection
-    # =====================================================
 
     if (
         payment_method is not None
@@ -739,17 +554,6 @@ def _build_initial_state(
             "selected_payment_method"
         ] = clean_payment_method
 
-    # =====================================================
-    # Current Request Tool State
-    # =====================================================
-    #
-    # A previous tool result is still available through
-    # execution_result.
-    #
-    # But the current request starts without pretending that
-    # a new tool has already executed.
-    #
-    # =====================================================
 
     state[
         "tool_name"
@@ -767,24 +571,11 @@ def _build_initial_state(
         "response"
     ] = None
 
-    # =====================================================
-    # Current Graph Metadata
-    # =====================================================
 
     state[
         "metadata"
     ] = {}
 
-    # =====================================================
-    # Phase 1 defaults
-    # =====================================================
-    #
-    # setdefault() is intentional.
-    #
-    # Existing state is preserved.
-    # New sessions receive sensible defaults.
-    #
-    # =====================================================
 
     state.setdefault(
         "active_task",
@@ -836,11 +627,7 @@ def _build_initial_state(
         {},
     )
 
-    # =====================================================
-    # Phase 13 multi-intent defaults
-    # =====================================================
-    # Do not synthesize intents or tasks in the runner. The intent/
-    # orchestration nodes must provide them; the runner only preserves them.
+
     state.setdefault("detected_intents", [])
     state.setdefault("multi_intent_queue", [])
     state.setdefault("active_intent", None)
@@ -851,10 +638,6 @@ def _build_initial_state(
     state.setdefault("active_intent_message", None)
     state.setdefault("multi_intent_error", None)
 
-
-    # =====================================================
-    # Phase 10 commerce-vertical defaults
-    # =====================================================
 
     state.setdefault(
         "commerce_vertical",
@@ -946,12 +729,6 @@ def _build_initial_state(
         {},
     )
 
-    # =====================================================
-    # Phase 12 onboarding defaults
-    # =====================================================
-    # Defaults are intentionally non-authoritative. Existing values from
-    # restored state are preserved, and IDs/statuses are never generated here.
-    # Backend services remain the source of truth for onboarding outcomes.
 
     for field in (
         "merchant_id",
@@ -996,28 +773,11 @@ def _build_initial_state(
     return state
 
 
-# =========================================================
-# Build Memory Metadata
-# =========================================================
-
-
 def _build_memory_metadata(
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    Convert final graph state into serializable short-term
-    conversation memory metadata.
-
-    Only conversational/serializable graph information is stored.
-
-    Database session objects are never persisted.
-    """
-
     metadata: dict[str, Any] = {}
 
-    # =====================================================
-    # Persist Graph State
-    # =====================================================
 
     for field in PERSISTED_STATE_FIELDS:
 
@@ -1028,16 +788,13 @@ def _build_memory_metadata(
             field
         )
 
-        # -------------------------------------------------
-        # Never persist DB sessions.
-        # -------------------------------------------------
 
         if field == "db":
             continue
 
         try:
-            # ToolResult is the canonical in-graph contract, but conversation
-            # memory must receive JSON-safe data.
+
+
             if isinstance(value, ToolResult):
                 metadata[
                     field
@@ -1051,14 +808,9 @@ def _build_memory_metadata(
 
         except Exception:
 
-            # A single unserializable optional field must not
-            # prevent the entire conversational state from
-            # being persisted.
+
             continue
 
-    # =====================================================
-    # Entity State
-    # =====================================================
 
     metadata[
         "entities"
@@ -1069,9 +821,6 @@ def _build_memory_metadata(
         )
     )
 
-    # =====================================================
-    # Missing Fields
-    # =====================================================
 
     metadata[
         "missing_fields"
@@ -1082,9 +831,6 @@ def _build_memory_metadata(
         )
     )
 
-    # =====================================================
-    # Next Missing
-    # =====================================================
 
     if (
         "next_missing"
@@ -1097,9 +843,6 @@ def _build_memory_metadata(
             "next_missing"
         )
 
-    # =====================================================
-    # Frontend Metadata
-    # =====================================================
 
     frontend_metadata = result.get(
         "metadata"
@@ -1119,35 +862,11 @@ def _build_memory_metadata(
     return metadata
 
 
-# =========================================================
-# Phase 1 Conversation-State Bookkeeping
-# =========================================================
-
-
 def _update_conversation_state(
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    Update short-term task state from the already-produced
-    graph result.
-
-    IMPORTANT:
-
-    This function does NOT run another intent classifier.
-
-    It only records the outcome of the graph so the next
-    HTTP turn can resume from the same conversational state.
-    """
-
-    # GraphState can contain request-scoped infrastructure objects such as
-    # a live SQLAlchemy Session.  Do not deepcopy the whole graph state.
-    # Copy only the top-level mapping; individual serializable values are
-    # copied when they are actually persisted or reused below.
     updated = dict(result)
 
-    # =====================================================
-    # Read Graph Output
-    # =====================================================
 
     intent = str(
         updated.get(
@@ -1207,15 +926,6 @@ def _update_conversation_state(
         "transaction_error"
     )
 
-    # =====================================================
-    # Active Task
-    # =====================================================
-    #
-    # The graph's current intent is authoritative.
-    #
-    # We do not independently classify the message here.
-    #
-    # =====================================================
 
     if (
         intent
@@ -1231,8 +941,7 @@ def _update_conversation_state(
         "end_conversation",
     }:
 
-        # Preserve an already active task unless the graph
-        # explicitly finished it.
+
         if (
             not updated.get(
                 "active_task"
@@ -1243,9 +952,6 @@ def _update_conversation_state(
                 "active_task"
             ] = None
 
-    # =====================================================
-    # Task Status
-    # =====================================================
 
     support_completed = bool(
         updated.get("support_resolved")
@@ -1307,16 +1013,6 @@ def _update_conversation_state(
             "task_status"
         ] = "idle"
 
-    # =====================================================
-    # Execution Result
-    # =====================================================
-    #
-    # This is the latest result from actual graph execution.
-    #
-    # It is not an LLM-generated replacement for backend
-    # authority.
-    #
-    # =====================================================
 
     try:
         updated[
@@ -1327,22 +1023,6 @@ def _update_conversation_state(
             "execution_result"
         ] = tool_result
 
-    # =====================================================
-    # Selected Product
-    # =====================================================
-    #
-    # Preserve only an explicitly resolved/selected product reference.
-    #
-    # IMPORTANT:
-    # product_name alone is NOT proof that a product was selected.
-    # In an ambiguous search, product_name may simply be the user's
-    # search query while product_search_results contains multiple
-    # candidates.
-    #
-    # Therefore the runner must never synthesize selected_product
-    # from product_id/product_name.
-    #
-    # =====================================================
 
     selected_product = updated.get(
         "selected_product"
@@ -1362,9 +1042,6 @@ def _update_conversation_state(
             "selected_product"
         ] = None
 
-    # =====================================================
-    # Keep Missing Fields Canonical
-    # =====================================================
 
     updated[
         "missing_fields"
@@ -1375,9 +1052,123 @@ def _update_conversation_state(
     return updated
 
 
-# =========================================================
-# Run Chat
-# =========================================================
+def _thread_config(
+    session_id: str,
+    user_id: int,
+    db: Session,
+) -> dict[str, Any]:
+    return {
+        "configurable": {
+            "thread_id": session_id,
+            "user_id": str(user_id),
+            "db": db,
+        }
+    }
+
+
+def _snapshot_interrupts(snapshot: Any) -> list[Any]:
+    tasks = getattr(snapshot, "tasks", None)
+    if not isinstance(tasks, (list, tuple)):
+        return []
+
+    interrupts: list[Any] = []
+    for task in tasks:
+        task_interrupts = getattr(task, "interrupts", None)
+        if isinstance(task_interrupts, (list, tuple)):
+            interrupts.extend(task_interrupts)
+    return interrupts
+
+
+def _snapshot_values(snapshot: Any) -> dict[str, Any]:
+    values = getattr(snapshot, "values", None)
+    return dict(values) if isinstance(values, dict) else {}
+
+
+def _get_checkpoint_snapshot(config: dict[str, Any]) -> Any | None:
+    if getattr(app, "checkpointer", None) is None:
+        return None
+
+    get_state = getattr(app, "get_state", None)
+    if not callable(get_state):
+        return None
+    return get_state(config)
+
+
+def _invoke_graph(
+    initial_state: dict[str, Any],
+    config: dict[str, Any],
+    resume_value: Any = None,
+) -> dict[str, Any]:
+    snapshot = _get_checkpoint_snapshot(config)
+    interrupts = _snapshot_interrupts(snapshot) if snapshot is not None else []
+
+    if interrupts:
+        from langgraph.types import Command
+
+        value = resume_value
+        if value is None:
+            value = initial_state.get("message")
+        resume_updates = {
+            "message": initial_state.get("message"),
+            "interrupt_status": None,
+        }
+        for field in (
+            "selected_address_id",
+            "address_id",
+            "payment_method",
+            "selected_payment_method",
+            "checkout_id",
+            "support_evidence_url",
+            "commerce_vertical",
+            "comparison_product_ids",
+        ):
+            if field in initial_state:
+                resume_updates[field] = initial_state[field]
+        result = app.invoke(
+            Command(update=resume_updates, resume=value),
+            config=config,
+        )
+    else:
+        result = app.invoke(initial_state, config=config)
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "BuyQK AI graph returned an invalid state."
+        )
+
+    return result
+
+
+def _is_interrupted(result: dict[str, Any]) -> bool:
+    if result.get("__interrupt__"):
+        return True
+
+    if result.get("interrupt_status") in {
+        "pending",
+        "waiting",
+        "interrupted",
+    }:
+        return True
+
+    return False
+
+
+def _normalize_tool_result(result: dict[str, Any]) -> dict[str, Any]:
+    tool_result = result.get("tool_result")
+    if tool_result is None:
+        return result
+
+    if isinstance(tool_result, ToolResult):
+        return result
+
+    if isinstance(tool_result, dict):
+        return result
+
+    raise RuntimeError(
+        "Graph produced an invalid tool_result. "
+        "Expected ToolResult or dict, got "
+        f"{type(tool_result).__name__}."
+    )
 
 
 def run_chat(
@@ -1391,155 +1182,35 @@ def run_chat(
     evidence_url: str | None = None,
     commerce_vertical: str | None = None,
     comparison_product_ids: list[int] | None = None,
+    resume_value: Any = None,
 ) -> dict[str, Any]:
-    """
-    Execute the BuyQK AI graph.
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message is required.")
 
-    ========================================================
-    INPUT
-    ========================================================
-
-    Current user message plus optional frontend-authoritative
-    checkout selections.
-
-    ========================================================
-    MEMORY
-    ========================================================
-
-    Previous short-term conversation context is loaded from
-    conversation_memory.
-
-    ========================================================
-    GRAPH
-    ========================================================
-
-    Context
-        ↓
-    Intent
-        ↓
-    Entity
-        ↓
-    Planner
-        ↓
-    Policy
-        ↓
-    Decision
-        ↓
-    Tool
-        ↓
-    Response
-
-    ========================================================
-    OUTPUT
-    ========================================================
-
-    Full resulting GraphState.
-
-    ========================================================
-    """
-
-    # =====================================================
-    # Validate Message
-    # =====================================================
-
-    if (
-        not isinstance(
-            message,
-            str,
-        )
-        or not message.strip()
-    ):
-
-        raise ValueError(
-            "message is required."
-        )
-
-    # =====================================================
-    # Validate Session
-    # =====================================================
-
-    if (
-        not isinstance(
-            session_id,
-            str,
-        )
-        or not session_id.strip()
-    ):
-
-        raise ValueError(
-            "session_id is required."
-        )
-
-    # =====================================================
-    # Validate User
-    # =====================================================
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required.")
 
     if user_id is None:
+        raise ValueError("user_id is required.")
 
-        raise ValueError(
-            "user_id is required."
-        )
-
-    # =====================================================
-    # Clean Input
-    # =====================================================
+    if db is None:
+        raise ValueError("db session is required.")
 
     clean_message = message.strip()
+    clean_session_id = session_id.strip()
 
-    clean_session_id = (
-        session_id.strip()
+    conversation_history = conversation_memory.get_recent_messages(
+        session_id=clean_session_id,
+        limit=MEMORY_MESSAGE_LIMIT,
     )
+    conversation_history = _safe_list(conversation_history)
 
-    # =====================================================
-    # Load Conversation History
-    # =====================================================
-    #
-    # IMPORTANT:
-    #
-    # Current user message is NOT saved before graph
-    # execution.
-    #
-    # Therefore the graph receives:
-    #
-    #     previous history
-    #             +
-    #     current message
-    #
-    # This prevents the current message from being duplicated
-    # inside the graph's conversation history.
-    #
-    # =====================================================
-
-    conversation_history = (
-        conversation_memory.get_recent_messages(
-            session_id=clean_session_id,
-            limit=MEMORY_MESSAGE_LIMIT,
-        )
-    )
-
-    conversation_history = _safe_list(
-        conversation_history
-    )
-
-    # =====================================================
-    # Restore Previous State
-    # =====================================================
-
-    previous_state = (
-        _restore_previous_state(
-            conversation_history
-        )
-    )
-
-    # =====================================================
-    # Build Current Graph State
-    # =====================================================
+    previous_state = _restore_previous_state(conversation_history)
 
     initial_state = _build_initial_state(
         message=clean_message,
         session_id=clean_session_id,
         user_id=user_id,
-        db=db,
         conversation_history=conversation_history,
         previous_state=previous_state,
         selected_address_id=selected_address_id,
@@ -1550,94 +1221,42 @@ def run_chat(
         comparison_product_ids=comparison_product_ids,
     )
 
-    # =====================================================
-    # Execute Graph
-    # =====================================================
-
-    result = app.invoke(
-        initial_state
+    config = _thread_config(
+        session_id=clean_session_id,
+        user_id=user_id,
+        db=db,
     )
 
-    # =====================================================
-    # Validate ToolResult Contract
-    # =====================================================
-
-    tool_result = (
-        result.get("tool_result")
-        if isinstance(result, dict)
-        else None
+    result = _invoke_graph(
+        initial_state=initial_state,
+        config=config,
+        resume_value=resume_value,
     )
+    result = _normalize_tool_result(result)
 
-    if (
-        tool_result is not None
-        and not isinstance(tool_result, ToolResult)
-    ):
-        raise RuntimeError(
-            "Graph produced an invalid tool_result. "
-            "Expected ToolResult, got "
-            f"{type(tool_result).__name__}."
+    interrupted = _is_interrupted(result)
+
+    if not interrupted:
+        result = _update_conversation_state(result)
+
+    response = result.get("response")
+    if not isinstance(response, str) or not response.strip():
+        if interrupted:
+            response = None
+        else:
+            raise RuntimeError(
+                "BuyQK AI graph completed without a response."
+            )
+    else:
+        response = response.strip()
+
+    memory_metadata = _build_memory_metadata(result)
+    memory_metadata["interrupt_pending"] = interrupted
+
+    if interrupted:
+        memory_metadata["interrupt_status"] = (
+            result.get("interrupt_status") or "pending"
         )
-
-    # =====================================================
-    # Validate Result
-    # =====================================================
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-
-        raise RuntimeError(
-            "BuyQK AI graph returned an invalid state."
-        )
-
-    # =====================================================
-    # Phase 1 Conversation-State Update
-    # =====================================================
-
-    result = _update_conversation_state(
-        result
-    )
-
-    # =====================================================
-    # Extract Response
-    # =====================================================
-
-    response = result.get(
-        "response"
-    )
-
-    if (
-        not isinstance(
-            response,
-            str,
-        )
-        or not response.strip()
-    ):
-
-        raise RuntimeError(
-            "BuyQK AI graph completed without a response."
-        )
-
-    response = response.strip()
-
-    # =====================================================
-    # Build Memory Metadata
-    # =====================================================
-
-    memory_metadata = (
-        _build_memory_metadata(
-            result
-        )
-    )
-
-    # =====================================================
-    # Save User Message
-    # =====================================================
-    #
-    # Only save after successful graph execution.
-    #
-    # =====================================================
 
     conversation_memory.add_message(
         session_id=clean_session_id,
@@ -1645,29 +1264,31 @@ def run_chat(
         content=clean_message,
     )
 
-    # =====================================================
-    # Save Assistant Message
-    # =====================================================
-    #
-    # The assistant message contains:
-    #
-    #     response
-    #     +
-    #     complete short-term state snapshot
-    #
-    # The next request restores this metadata.
-    #
-    # =====================================================
-
     conversation_memory.add_message(
         session_id=clean_session_id,
         role="assistant",
-        content=response,
+        content=response or "",
         metadata=memory_metadata,
     )
 
-    # =====================================================
-    # Return Graph State
-    # =====================================================
+    conversation_memory.save_graph_state(
+        session_id=clean_session_id,
+        state_dict=memory_metadata,
+    )
+    conversation_memory.touch_session(clean_session_id)
+
+    if interrupted:
+        result["interrupt_pending"] = True
+        result.setdefault("interrupt_status", "pending")
 
     return result
+
+
+__all__ = [
+    "run_chat",
+    "PERSISTED_STATE_FIELDS",
+    "_build_initial_state",
+    "_build_memory_metadata",
+    "_restore_previous_state",
+    "_update_conversation_state",
+]
